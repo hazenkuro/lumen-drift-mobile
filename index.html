@@ -52,11 +52,12 @@
     top: max(10px, env(safe-area-inset-top));
     transform: translateX(-50%);
     z-index: 10;
-    color: #94a3b8;
-    font: 13px sans-serif;
-    background: rgba(11, 16, 38, 0.6);
-    padding: 6px 12px;
+    color: #fbbf24;
+    font: bold 14px sans-serif;
+    background: rgba(11, 16, 38, 0.75);
+    padding: 8px 14px;
     border-radius: 999px;
+    border: 1px solid rgba(251, 191, 36, 0.6);
     pointer-events: none;
     white-space: nowrap;
   }
@@ -71,7 +72,7 @@
 <body>
 <canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, reach 1,200 points to open the Aurora Gate"></canvas>
 <p id="status" role="status" aria-live="polite"></p>
-<div id="rotate-hint">Putar HP ke landscape untuk layar penuh</div>
+<div id="rotate-hint">📱 Rotate to landscape — the field is much bigger sideways!</div>
 <button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
 <button id="btn-pause" class="touch-btn" type="button" aria-label="Pause">❚❚</button>
 <button id="btn-fullscreen" class="touch-btn" type="button" aria-label="Fullscreen">⛶</button>
@@ -105,29 +106,54 @@ const SHIP = {
   dashSpeed: 950,
   dashTime: 0.16,
   dashCooldown: 1.4,
-  invulnerableTime: 1.2,
+  // Mercy: 1.5 s of flashing invulnerability after every hit.
+  invulnerableTime: 1.5,
 };
+
+// Grace after resuming from a level-up choice (seconds of invulnerability
+// while the player re-orients on the busiest frame of the run).
+const UPGRADE_GRACE = 2;
 
 // Difficulty ramps one level every 200 points, up to level 5.
 const LEVEL_EVERY = 200;
 const LEVEL_MAX = 5;
 
 // Spawn pacing, in seconds between spawns at level 1; each level multiplies
-// the rate by SPAWN_GROWTH, so the field gets busier as the score climbs.
+// the rate by SPAWN_GROWTH, so the field gets busier as the score climbs —
+// but more slowly than before (0.88, not 0.82), and never past the caps.
 const SPAWN = {
   shardEvery: 0.55,
   mineEvery: 1.5,
   stormEvery: 2.4,
   shieldEvery: 14,
-  growth: 0.82,
+  growth: 0.88,
 };
+
+// Max concurrent threats per level (index = level - 1). The field can no
+// longer saturate: level 1 holds at most 8 mines + 2 storms.
+const SPAWN_CAPS = {
+  mine: [8, 10, 12, 14, 16],
+  storm: [2, 2, 3, 3, 4],
+};
+
+// Storms are gated early: at level 1 they spawn 3x slower, at level 2
+// 1.5x slower (index = level - 1) — almost no storms before level 2-3.
+const STORM_GATE = [3, 1.5, 1, 1, 1];
+
+// Nothing spawns within this many field units of the ship.
+const SAFE_SPAWN_RADIUS = 150;
+
+// Silent dynamic difficulty (never shown to the player): two hits within
+// this window spawn a mercy shield cell, at most once per cooldown.
+const DDA_HIT_WINDOW = 10;
+const DDA_MERCY_COOLDOWN = 20;
 
 // Drift speeds (pixels per second) at level 1; each level adds SPEED_GROWTH.
 const DRIFT = {
   mine: 55,
   storm: 190,
   shard: 40,
-  speedGrowth: 0.16,
+  speedGrowth: 0.12,
 };
 
 // Best score is kept in local storage under this key.
@@ -356,6 +382,7 @@ const EVENT_OVER = 8;
 const EVENT_WIN = 16;
 const EVENT_DASH = 32;
 const EVENT_LEVELUP = 64;
+const EVENT_NEARMISS = 128;
 
 function freshUpgrades() {
   const counts = {};
@@ -387,6 +414,7 @@ function createWorld(random) {
     maxHearts: HEARTS,
     upgrades: freshUpgrades(),
     shardsCollected: 0,
+    goldenCollected: 0,
     magnetRadius: 0,
     shardBonus: 0,
     pendingLevelUps: 0,
@@ -404,6 +432,17 @@ function createWorld(random) {
     gateProgress: 0,
     spawnTimers: { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 },
     flashes: 0,
+    // Juice state (Stage 4): floating score texts, the animated score,
+    // hit-stop freeze, screen shake, and the combo pop pulse.
+    floaters: [],
+    displayScore: 0,
+    hitStop: 0,
+    shakeTime: 0,
+    shakeMag: 0,
+    comboPulse: 0,
+    // Silent mercy bookkeeping: recent hit times (for the DDA shield).
+    hitTimes: [],
+    lastMercyAt: -999,
   };
 
   // Three parallax star layers, seeded once per world.
@@ -429,6 +468,11 @@ function createWorld(random) {
 
   function spawnRate(base) {
     return base * Math.pow(SPAWN.growth, state.level - 1);
+  }
+
+  // True when a candidate spawn point is clear of the ship.
+  function farFromShip(x, y) {
+    return Math.hypot(x - state.ship.x, y - state.ship.y) >= SAFE_SPAWN_RADIUS;
   }
 
   function burst(x, y, color, count, speed) {
@@ -457,35 +501,59 @@ function createWorld(random) {
       spin: random.range(0, Math.PI * 2),
       spinSpeed: random.range(1.5, 3.5),
       pulse: random.range(0, Math.PI * 2),
+      // Rare variable reward: ~1 in 30 shards is golden, worth 50 points.
+      golden: random.next() < 1 / 30,
     });
   }
 
+  // Returns false when no safe spot was found in 8 tries — the spawn is
+  // skipped instead of dropping a mine on the player.
   function spawnMine() {
-    const fromLeft = random.next() < 0.5;
-    state.mines.push({
-      x: fromLeft ? -24 : FIELD.width + 24,
-      y: random.range(60, FIELD.height - 60),
-      vx: (fromLeft ? 1 : -1) * DRIFT.mine * speedScale() * random.range(0.8, 1.3),
-      vy: random.range(-14, 14),
-      radius: random.range(15, 20),
-      spin: random.range(0, Math.PI * 2),
-      spinSpeed: random.range(0.6, 1.6),
-      pulse: random.range(0, Math.PI * 2),
-    });
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const fromLeft = random.next() < 0.5;
+      const x = fromLeft ? -24 : FIELD.width + 24;
+      const y = random.range(60, FIELD.height - 60);
+      if (!farFromShip(x, y)) continue;
+      state.mines.push({
+        x,
+        y,
+        vx: (fromLeft ? 1 : -1) * DRIFT.mine * speedScale() * random.range(0.8, 1.3),
+        vy: random.range(-14, 14),
+        radius: random.range(15, 20),
+        spin: random.range(0, Math.PI * 2),
+        spinSpeed: random.range(0.6, 1.6),
+        pulse: random.range(0, Math.PI * 2),
+        // Telegraph: age ramps 0 -> 1 over the first ~0.3 s; the renderer
+        // fades the mine in and draws a warning ring while it is young.
+        age: 0,
+        nearMissed: false,
+      });
+      return true;
+    }
+    return false;
   }
 
   function spawnStorm() {
-    const angle = random.range(Math.PI * 0.15, Math.PI * 0.85);
-    const fromTop = random.next() < 0.6;
-    state.storms.push({
-      x: random.range(40, FIELD.width - 40),
-      y: fromTop ? -24 : FIELD.height + 24,
-      vx: Math.cos(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25) * (random.next() < 0.5 ? -1 : 1),
-      vy: (fromTop ? 1 : -1) * Math.sin(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25),
-      radius: 9,
-      spin: random.range(0, Math.PI * 2),
-      spinSpeed: random.range(4, 7),
-    });
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const angle = random.range(Math.PI * 0.15, Math.PI * 0.85);
+      const fromTop = random.next() < 0.6;
+      const x = random.range(40, FIELD.width - 40);
+      const y = fromTop ? -24 : FIELD.height + 24;
+      if (!farFromShip(x, y)) continue;
+      state.storms.push({
+        x,
+        y,
+        vx: Math.cos(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25) * (random.next() < 0.5 ? -1 : 1),
+        vy: (fromTop ? 1 : -1) * Math.sin(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25),
+        radius: 9,
+        spin: random.range(0, Math.PI * 2),
+        spinSpeed: random.range(4, 7),
+        age: 0,
+        nearMissed: false,
+      });
+      return true;
+    }
+    return false;
   }
 
   function spawnShield() {
@@ -522,8 +590,17 @@ function createWorld(random) {
     state.trail = [];
     state.gateOpen = false;
     state.gateProgress = 0;
+    state.goldenCollected = 0;
     state.spawnTimers = { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 };
     state.flashes = 0;
+    state.floaters = [];
+    state.displayScore = 0;
+    state.hitStop = 0;
+    state.shakeTime = 0;
+    state.shakeMag = 0;
+    state.comboPulse = 0;
+    state.hitTimes = [];
+    state.lastMercyAt = -999;
   }
 
   // Advance the world one fixed step. `steer` is the normalised keyboard
@@ -546,20 +623,38 @@ function createWorld(random) {
     state.spawnTimers.storm -= dt;
     state.spawnTimers.shield -= dt;
     if (state.spawnTimers.shard <= 0) { spawnShard(); state.spawnTimers.shard = spawnRate(SPAWN.shardEvery); }
-    if (state.spawnTimers.mine <= 0) { spawnMine(); state.spawnTimers.mine = spawnRate(SPAWN.mineEvery); }
-    if (state.spawnTimers.storm <= 0) { spawnStorm(); state.spawnTimers.storm = spawnRate(SPAWN.stormEvery); }
+    // Spawn caps: the field never holds more than the per-level max.
+    if (state.spawnTimers.mine <= 0) {
+      if (state.mines.length < SPAWN_CAPS.mine[state.level - 1]) spawnMine();
+      state.spawnTimers.mine = spawnRate(SPAWN.mineEvery);
+    }
+    if (state.spawnTimers.storm <= 0) {
+      if (state.storms.length < SPAWN_CAPS.storm[state.level - 1]) spawnStorm();
+      // Storms are gated early (nearly none at level 1-2).
+      state.spawnTimers.storm = spawnRate(SPAWN.stormEvery) * STORM_GATE[state.level - 1];
+    }
     if (state.spawnTimers.shield <= 0 && !state.shield) { spawnShield(); state.spawnTimers.shield = SPAWN.shieldEvery; }
 
     // --- Ship steering ----------------------------------------------------
+    // Keyboard steers directly. With no keys, a held pointer steers:
+    // touch is RELATIVE (the ship follows the finger's delta from where
+    // it landed — relX/relY already carry direction and magnitude, with
+    // a dead zone applied in input.js), mouse stays ABSOLUTE (the ship
+    // chases the cursor, exactly as before).
     let ax = steer.x * SHIP.accel;
     let ay = steer.y * SHIP.accel;
     if ((steer.x === 0 && steer.y === 0) && pointer && pointer.active && pointer.down) {
-      const dx = pointer.x - ship.x;
-      const dy = pointer.y - ship.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist > 12) {
-        ax = (dx / dist) * SHIP.accel;
-        ay = (dy / dist) * SHIP.accel;
+      if (pointer.mode === 'relative') {
+        ax = pointer.relX * SHIP.accel;
+        ay = pointer.relY * SHIP.accel;
+      } else {
+        const dx = pointer.x - ship.x;
+        const dy = pointer.y - ship.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist > 12) {
+          ax = (dx / dist) * SHIP.accel;
+          ay = (dy / dist) * SHIP.accel;
+        }
       }
     }
     if (ship.dashTime > 0) {
@@ -635,11 +730,13 @@ function createWorld(random) {
       m.y += m.vy * dt;
       m.spin += m.spinSpeed * dt;
       m.pulse += dt;
+      m.age = (m.age ?? 0) + dt;
     }
     for (const s of state.storms) {
       s.x += s.vx * dt;
       s.y += s.vy * dt;
       s.spin += s.spinSpeed * dt;
+      s.age = (s.age ?? 0) + dt;
     }
     for (const s of state.shields) {
       s.y += s.vy * dt;
@@ -662,6 +759,34 @@ function createWorld(random) {
     state.particles = state.particles.filter((p) => p.life > 0);
     state.flashes = Math.max(0, state.flashes - dt * 3);
 
+    // --- Near misses ------------------------------------------------------
+    // A mine/storm that slips past within ~40 px of the hitbox without
+    // touching earns a one-time "CLOSE! +5" (never while invulnerable,
+    // so i-frames cannot be farmed).
+    if (ship.invulnerable <= 0) {
+      for (const list of [state.mines, state.storms]) {
+        for (const e of list) {
+          if (e.nearMissed) continue;
+          const d = Math.hypot(e.x - ship.x, e.y - ship.y);
+          const hitDist = SHIP.radius * 0.8 + e.radius * 0.85;
+          if (d >= hitDist && d < hitDist + 40) {
+            e.nearMissed = true;
+            state.score += 5;
+            state.gateProgress = Math.min(1, state.score / WIN_SCORE);
+            state.floaters.push({
+              x: e.x, y: e.y - 10, text: 'CLOSE! +5',
+              life: 0.9, maxLife: 0.9, color: '#a5f3fc',
+            });
+            events |= EVENT_NEARMISS;
+            if (state.score >= WIN_SCORE && !state.gateOpen) {
+              state.gateOpen = true;
+              events |= EVENT_WIN;
+            }
+          }
+        }
+      }
+    }
+
     // --- Pickups ----------------------------------------------------------
     const collect = (list, radius, onCollect) => {
       for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -677,11 +802,20 @@ function createWorld(random) {
       state.shardsCollected += 1;
       state.combo = Math.min(COMBO_MAX, 1 + Math.floor(state.comboCount / 3));
       state.bestCombo = Math.max(state.bestCombo, state.combo);
-      const gained = shardPointsFor(state) * state.combo;
+      // A golden shard pays a flat 50 (no combo multiplier) — the rare
+      // spike is the reward, not the multiplier.
+      const gained = e.golden ? 50 : shardPointsFor(state) * state.combo;
+      if (e.golden) state.goldenCollected = (state.goldenCollected || 0) + 1;
       state.score += gained;
       state.level = levelFor(state.score);
       state.gateProgress = Math.min(1, state.score / WIN_SCORE);
-      burst(e.x, e.y, '#fbbf24', 12, 200);
+      state.floaters.push({
+        x: e.x, y: e.y - 10,
+        text: e.golden ? 'GOLDEN +50' : `+${gained}`,
+        life: 0.9, maxLife: 0.9, color: e.golden ? '#fde047' : '#fbbf24',
+      });
+      state.comboPulse = 1;
+      burst(e.x, e.y, e.golden ? '#fde047' : '#fbbf24', e.golden ? 22 : 12, e.golden ? 320 : 200);
       events |= EVENT_PICKUP;
       if (state.score >= WIN_SCORE && !state.gateOpen) {
         state.gateOpen = true;
@@ -717,6 +851,11 @@ function createWorld(random) {
       state.combo = 0;
       state.comboCount = 0;
       state.flashes = 1;
+      // Juice: freeze ~0.06 s on the hit and jolt the field ~3 px.
+      state.hitStop = 0.06;
+      state.shakeTime = 0.1;
+      state.shakeMag = 3;
+      state.comboPulse = 0;
       burst(ship.x, ship.y, '#f472b6', 22, 320);
       if (state.shield) {
         state.shield = false;
@@ -727,13 +866,51 @@ function createWorld(random) {
         ship.invulnerable = SHIP.invulnerableTime;
         events |= EVENT_HIT;
         if (state.hearts <= 0) events |= EVENT_OVER;
+        // Silent mercy (DDA — never announced): two quick hits drop a
+        // shield cell near the ship so one mistake does not end the run.
+        state.hitTimes.push(state.time);
+        state.hitTimes = state.hitTimes.filter((t) => state.time - t <= DDA_HIT_WINDOW);
+        if (state.hitTimes.length >= 2 && !state.shield && state.shields.length === 0
+          && state.time - state.lastMercyAt > DDA_MERCY_COOLDOWN) {
+          state.lastMercyAt = state.time;
+          state.shields.push({
+            x: Math.max(60, Math.min(FIELD.width - 60, ship.x + 180)),
+            y: Math.max(60, Math.min(FIELD.height - 60, ship.y - 120)),
+            vy: 55,
+            radius: 13,
+            pulse: 0,
+          });
+        }
       }
+    }
+
+    // --- Juice decay + animated score -------------------------------------
+    // Floaters rise and fade; the combo pop and the shake decay; the
+    // displayed score counts up toward the real score instead of jumping.
+    for (const f of state.floaters) {
+      f.y -= 30 * dt;
+      f.life -= dt;
+    }
+    state.floaters = state.floaters.filter((f) => f.life > 0);
+    state.comboPulse = Math.max(0, state.comboPulse - dt * 3);
+    state.shakeTime = Math.max(0, state.shakeTime - dt);
+    if (state.displayScore !== state.score) {
+      const diff = state.score - state.displayScore;
+      const stepAmt = Math.max(1, Math.abs(diff) * Math.min(1, dt * 8));
+      state.displayScore += Math.sign(diff) * Math.min(Math.abs(diff), stepAmt);
+      if (Math.abs(state.score - state.displayScore) < 1) state.displayScore = state.score;
     }
 
     return events;
   }
 
-  return { state, reset, step, burst };
+  // Invulnerability for a few seconds (e.g. after resuming from a
+  // level-up); never shortens invulnerability already held.
+  function grantGrace(seconds) {
+    state.ship.invulnerable = Math.max(state.ship.invulnerable, seconds);
+  }
+
+  return { state, reset, step, burst, grantGrace };
 }
 
 // ---- src/skins.js ----
@@ -748,7 +925,7 @@ function createWorld(random) {
 const DEFAULT_SKIN_ID = 'cyan';
 
 // Unlock thresholds: a normal winning run collects roughly 60-120 shards,
-// so these are ~5, ~15 and ~30 runs in.
+// so these are ~5, ~15, ~30, ~50 and ~80 runs in.
 const SKINS = [
   {
     id: 'cyan', name: 'CYAN', unlock: 0,
@@ -765,6 +942,14 @@ const SKINS = [
   {
     id: 'aurora', name: 'AURORA', unlock: 3000,
     hull: '#059669', glow: '#34d399', flame: '#6ee7b7', flameGlow: '#34d399', trail: '#34d399',
+  },
+  {
+    id: 'solar', name: 'SOLAR', unlock: 5000,
+    hull: '#b45309', glow: '#fbbf24', flame: '#fde68a', flameGlow: '#f59e0b', trail: '#fbbf24',
+  },
+  {
+    id: 'nova', name: 'NOVA', unlock: 8000,
+    hull: '#be185d', glow: '#f472b6', flame: '#67e8f9', flameGlow: '#22d3ee', trail: '#f472b6',
   },
 ];
 
@@ -904,12 +1089,44 @@ function isTouchDevice() {
 function createInput(canvas) {
   const keys = new Set();
   const pressed = new Set();
-  const pointer = { x: 0, y: 0, down: false, active: false };
+  // The steering pointer, in field coordinates. Touch steers RELATIVE
+  // (a floating joystick: the ship follows the finger's delta from where
+  // it landed, so the thumb never covers the ship); mouse keeps the old
+  // absolute behaviour (the ship chases the cursor). `relX/relY` is the
+  // normalised joystick vector (-1..1, magnitude = how far the finger
+  // has dragged past the dead zone); `dragStartX/Y` is the joystick
+  // origin the renderer draws. `dragLocked` flips on once the finger has
+  // moved past the tap threshold — from then on this pointer is a drag,
+  // never a tap.
+  const pointer = {
+    x: 0, y: 0, down: false, active: false,
+    id: null, isTouch: false, mode: 'absolute',
+    relX: 0, relY: 0,
+    dragStartX: 0, dragStartY: 0, dragLocked: false,
+  };
+  // Relative-steering tuning (field units): moves inside the dead zone
+  // steer nothing; past it the vector grows to full deflection at
+  // DEAD_ZONE + REL_RANGE; past REL_RANGE it stays clamped.
+  const DEAD_ZONE = 10;
+  const REL_RANGE = 80;
+  const DRAG_LOCK_DIST = 12;
   // The most recent canvas press, in field coordinates, waiting to be
   // read once (upgrade-card and title skin-preview taps). DOM buttons
   // never set it: they are not children of the canvas and bindButton
   // stops their presses, so a DASH/pause tap can never pick a card.
   let tap = null;
+  // Upgrade-screen input gate (Stage 1 fix for the stale-tap bug): after
+  // armGate(), input is ignored until the lockout has elapsed AND the
+  // steering finger has been lifted. A tap stored during play can never
+  // auto-pick a card, because armGate() clears it and the gate swallows
+  // anything pressed while it is closed.
+  let gateUntil = 0;
+  let liftNeeded = false;
+
+  function nowMs() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
 
   function onKeyDown(event) {
     if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(event.code)) {
@@ -932,8 +1149,22 @@ function createInput(canvas) {
 
   function onPointerDown(event) {
     pointerPosition(event);
+    // Touches that start on the letterbox bars (outside the field) are
+    // ignored: they used to drag the ship to the edge and stick it there.
+    if (pointer.x < 0 || pointer.x > FIELD.width || pointer.y < 0 || pointer.y > FIELD.height) return;
+    // Multi-touch isolation: the first finger owns steering; a second
+    // finger on the canvas cannot reset the drag or trigger a tap/card.
+    if (pointer.down) return;
     pointer.down = true;
     pointer.active = true;
+    pointer.id = event.pointerId ?? null;
+    pointer.isTouch = event.pointerType === 'touch';
+    pointer.mode = pointer.isTouch ? 'relative' : 'absolute';
+    pointer.dragStartX = pointer.x;
+    pointer.dragStartY = pointer.y;
+    pointer.dragLocked = false;
+    pointer.relX = 0;
+    pointer.relY = 0;
     tap = { x: pointer.x, y: pointer.y };
     // A press confirms on menus. A mouse click also dashes in play;
     // a touch drag only steers — startGame() drains the queue on launch,
@@ -942,17 +1173,45 @@ function createInput(canvas) {
     if (event.pointerType !== 'touch') pressed.add(ACTION_DASH);
   }
 
-  function onPointerUp() {
+  function onPointerUp(event) {
+    // Only the steering finger's release ends the drag; another finger
+    // lifting must not stop steering. (Events without an id clear all.)
+    if (event && event.pointerId != null && pointer.id != null && event.pointerId !== pointer.id) return;
     pointer.down = false;
+    pointer.id = null;
+    pointer.relX = 0;
+    pointer.relY = 0;
+    pointer.dragLocked = false;
+    // The steering finger is up: a gated screen may accept input now.
+    liftNeeded = false;
   }
 
-  function onPointerCancel() {
-    pointer.down = false;
+  function onPointerCancel(event) {
+    onPointerUp(event);
   }
 
   function onPointerMove(event) {
     pointerPosition(event);
     pointer.active = true;
+    // Only the steering finger moves the joystick.
+    if (!pointer.down || (event.pointerId != null && pointer.id != null && event.pointerId !== pointer.id)) return;
+    if (pointer.mode !== 'relative') return;
+    const dx = pointer.x - pointer.dragStartX;
+    const dy = pointer.y - pointer.dragStartY;
+    const dist = Math.hypot(dx, dy);
+    if (dist > DRAG_LOCK_DIST && !pointer.dragLocked) {
+      // Drag-lock: this pointer is a drag now, never a tap.
+      pointer.dragLocked = true;
+      tap = null;
+    }
+    if (dist <= DEAD_ZONE) {
+      pointer.relX = 0;
+      pointer.relY = 0;
+      return;
+    }
+    const mag = Math.min(1, (dist - DEAD_ZONE) / REL_RANGE);
+    pointer.relX = (dx / dist) * mag;
+    pointer.relY = (dy / dist) * mag;
   }
 
   window.addEventListener('keydown', onKeyDown);
@@ -993,6 +1252,26 @@ function createInput(canvas) {
     // Drain one-shot presses (used when changing screens).
     clearPressed() {
       pressed.clear();
+    },
+    // Drop the stored tap without reading it. Call on EVERY screen
+    // transition, together with clearPressed(): a steering tap left over
+    // from play must never be read as a menu tap on the next screen.
+    clearTap() {
+      tap = null;
+    },
+    // Close the input gate for 400 ms and require the steering finger to
+    // be lifted first (when it is down now). Call when an overlay that
+    // takes taps appears (the LEVEL UP cards). `now` is injectable so
+    // tests can drive the clock.
+    armGate(now = nowMs()) {
+      gateUntil = now + 400;
+      liftNeeded = pointer.down;
+      tap = null;
+    },
+    // True when a gated screen may accept taps / pick keys again: the
+    // lockout has elapsed and no steering finger is still held down.
+    gateOpen(now = nowMs()) {
+      return now >= gateUntil && !liftNeeded;
     },
     // The last canvas tap (field coordinates), or null when none is
     // waiting. Reading it consumes it, so one tap picks at most once.
@@ -1075,11 +1354,18 @@ function createAudio() {
       ensure();
     },
     // A higher combo sings higher, and a little louder: the pitch climbs
-    // with the streak, so a good run sounds like a good run.
+    // with the streak, so a good run sounds like a good run. Each pickup
+    // also jitters ±5% so repeated pickups never sound identical.
     pickup(combo) {
-      const base = 660 + combo * 90;
+      const jitter = 0.95 + Math.random() * 0.1;
+      const base = (660 + combo * 90) * jitter;
       tone(base, 0, 0.12, 'sine', 0.1);
       tone(base * 1.5, 0.05, 0.14, 'sine', 0.09);
+    },
+    // Near-miss whoosh: a short high blip, distinct from a pickup.
+    close() {
+      tone(1560, 0, 0.09, 'sine', 0.08);
+      tone(2080, 0.04, 0.1, 'sine', 0.06);
     },
     dash() {
       play('dash', 'triangle', 0.1);
@@ -1109,6 +1395,198 @@ function createAudio() {
   };
 }
 
+// ---- src/progress.js ----
+// Lumen Drift — local progress: one versioned localStorage blob holding
+// the best score, local top-5 + run history, lifetime stats, the daily
+// streak and the daily missions. Everything is local (no server, no
+// account): a global leaderboard needs the CrazyGames SDK at Full Launch
+// and is out of scope. Loads are defensive — a corrupt or old save falls
+// back to a fresh one, seeded from the legacy best/shards keys.
+//
+// Missions reward shards toward ship skins; the streak bonus grows with
+// each consecutive day (day 7 is the milestone). Dates are local calendar
+// dates (YYYY-MM-DD), so a missed day breaks the streak.
+const SAVE_KEY = 'lumen-drift-save';
+const SAVE_VERSION = 1;
+
+// Daily missions: fixed set, progress is counted per run and banked when
+// the run ends. `stat` names the run-stat field they read.
+const MISSION_DEFS = [
+  { id: 'shards', name: 'Collect 50 shards', stat: 'shards', target: 50, reward: 25 },
+  { id: 'level', name: 'Reach level 3', stat: 'level', target: 3, reward: 25 },
+  { id: 'dash', name: 'Dash 10 times', stat: 'dashes', target: 10, reward: 50 },
+];
+
+function localDate(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function shiftDate(dateStr, days) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const date = new Date(y, m - 1, d + days);
+  return localDate(date);
+}
+
+function freshMissions(dateStr) {
+  return {
+    date: dateStr,
+    list: MISSION_DEFS.map((def) => ({
+      id: def.id, name: def.name, target: def.target, reward: def.reward,
+      progress: 0, done: false,
+    })),
+  };
+}
+
+function freshSave(today) {
+  return {
+    version: SAVE_VERSION,
+    best: 0,
+    top5: [],
+    history: [],
+    lifetime: { runs: 0, shards: 0, playSeconds: 0 },
+    streak: { lastDate: null, count: 0, visitedDays: [] },
+    missions: freshMissions(today),
+  };
+}
+
+function isSaveShape(save) {
+  return save && typeof save === 'object'
+    && save.version === SAVE_VERSION
+    && Array.isArray(save.top5) && Array.isArray(save.history)
+    && save.lifetime && typeof save.lifetime === 'object'
+    && save.streak && typeof save.streak === 'object'
+    && save.missions && Array.isArray(save.missions.list);
+}
+
+/**
+ * Load the save blob. A corrupt/old blob falls back to a fresh save, and
+ * the legacy best/shards keys seed it when no blob exists yet.
+ * `legacy` is { best, shards } read from the old keys (may be zeros).
+ */
+function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
+  let save = null;
+  try {
+    const raw = storage.getItem(SAVE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (isSaveShape(parsed)) save = parsed;
+    }
+  } catch {
+    save = null;
+  }
+  if (!save) {
+    save = freshSave(today);
+    save.best = Math.max(0, legacy.best || 0);
+    save.lifetime.shards = Math.max(0, legacy.shards || 0);
+    if (save.best > 0) {
+      save.top5 = [{ score: save.best, level: 1, bestCombo: 1, date: today }];
+    }
+  }
+  // Missions roll over to a fresh set on a new day.
+  if (save.missions.date !== today) save.missions = freshMissions(today);
+  return save;
+}
+
+function saveSave(storage, save) {
+  try {
+    storage.setItem(SAVE_KEY, JSON.stringify(save));
+  } catch {
+    // Storage can be off (private windows): progress lasts this visit.
+  }
+}
+
+/**
+ * Touch the daily streak for today. Returns { bonus, isNewDay, milestone,
+ * count }: the shard bonus for coming back (10 per streak day, capped at
+ * 100; day 7+ is the milestone). A missed day resets the count to 1.
+ */
+function touchStreak(save, today) {
+  if (save.streak.lastDate === today) {
+    return { bonus: 0, isNewDay: false, milestone: false, count: save.streak.count };
+  }
+  const yesterday = shiftDate(today, -1);
+  const continued = save.streak.lastDate === yesterday;
+  save.streak.count = continued ? save.streak.count + 1 : 1;
+  save.streak.lastDate = today;
+  if (!save.streak.visitedDays.includes(today)) {
+    save.streak.visitedDays.push(today);
+    save.streak.visitedDays = save.streak.visitedDays.slice(-14);
+  }
+  const bonus = Math.min(10 * save.streak.count, 100);
+  save.lifetime.shards += bonus;
+  return {
+    bonus,
+    isNewDay: true,
+    milestone: save.streak.count >= 7,
+    count: save.streak.count,
+  };
+}
+
+/**
+ * Record a finished run. `run` is { score, level, bestCombo, shards,
+ * dashes, upgrades, playSeconds, date }. Returns { rank, gapToFirst }:
+ * rank is the 1-based top-5 position (0 when the run did not make it),
+ * gapToFirst is the points to #1 (0 at #1).
+ */
+function recordRun(save, run) {
+  save.lifetime.runs += 1;
+  save.lifetime.shards += run.shards;
+  save.lifetime.playSeconds += run.playSeconds || 0;
+  if (run.score > save.best) save.best = run.score;
+  const entry = {
+    score: run.score, level: run.level, bestCombo: run.bestCombo, date: run.date,
+  };
+  save.top5.push(entry);
+  save.top5.sort((a, b) => b.score - a.score);
+  save.top5 = save.top5.slice(0, 5);
+  const rank = save.top5.indexOf(entry) + 1;
+  save.history.unshift({
+    score: run.score, level: run.level, bestCombo: run.bestCombo,
+    shards: run.shards, dashes: run.dashes, upgrades: run.upgrades || [],
+    date: run.date,
+  });
+  save.history = save.history.slice(0, 20);
+  const gapToFirst = save.top5.length ? save.top5[0].score - run.score : 0;
+  return { rank, gapToFirst };
+}
+
+/**
+ * Bank the run's stats into today's missions. Returns the missions that
+ * were just completed (each pays its shard reward immediately).
+ */
+function updateMissions(save, run) {
+  const completed = [];
+  for (const mission of save.missions.list) {
+    if (mission.done) continue;
+    const def = MISSION_DEFS.find((d) => d.id === mission.id);
+    if (!def) continue;
+    mission.progress = Math.min(def.target, Math.max(mission.progress, run[def.stat] || 0));
+    if (mission.progress >= def.target) {
+      mission.done = true;
+      save.lifetime.shards += mission.reward;
+      completed.push({ id: mission.id, name: mission.name, reward: mission.reward });
+    }
+  }
+  return completed;
+}
+
+/** The 7-day calendar ending today: [{ date, visited, isToday }]. */
+function streakCalendar(save, today) {
+  const days = [];
+  for (let i = 6; i >= 0; i -= 1) {
+    const date = shiftDate(today, -i);
+    days.push({
+      date,
+      visited: save.streak.visitedDays.includes(date),
+      isToday: i === 0,
+    });
+  }
+  return days;
+}
+
 // ---- src/render.js ----
 // Lumen Drift — the renderer. One canvas, one palette, everything drawn
 // with vector shapes and glows: a deep indigo sky, three parallax star
@@ -1128,6 +1606,17 @@ const SCREEN_PAUSED = 'paused';
 const SCREEN_OVER = 'over';
 const SCREEN_WIN = 'win';
 const SCREEN_UPGRADE = 'upgrade';
+const SCREEN_STATS = 'stats';
+
+// Title-screen skin arrows (◀ ▶) beside the ship preview: tapping an
+// arrow cycles skins — tapping the preview itself no longer does, so a
+// launch tap can never change the skin by accident.
+const SKIN_ARROW_LEFT = { x: 380, y: 560, w: 36, h: 56 };
+const SKIN_ARROW_RIGHT = { x: 524, y: 560, w: 36, h: 56 };
+// Title-screen button that opens the stats / top-5 screen.
+const STATS_BUTTON_RECT = { x: 1060, y: 30, w: 190, h: 44 };
+// The deliberate restart button on the game-over / win screens.
+const PLAY_AGAIN_RECT = { x: 510, y: 480, w: 260, h: 56 };
 
 // The title-screen ship preview the player taps to cycle skins
 // (field coordinates; the preview ship is drawn at its centre).
@@ -1198,13 +1687,16 @@ function drawNebula(ctx, width, height) {
   }
 }
 
-function drawShard(ctx, x, y, spin, pulse) {
+function drawShard(ctx, x, y, spin, pulse, golden = false) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(spin);
   const twinkle = 0.75 + 0.25 * Math.sin(pulse * 3);
-  glow(ctx, GOLD, 14);
-  ctx.fillStyle = GOLD;
+  // A golden shard is bigger, brighter, and spins with a wider glow.
+  const scale = golden ? 1.45 : 1;
+  ctx.scale(scale, scale);
+  glow(ctx, golden ? '#fde047' : GOLD, golden ? 24 : 14);
+  ctx.fillStyle = golden ? '#fde047' : GOLD;
   ctx.globalAlpha = twinkle;
   ctx.beginPath();
   ctx.moveTo(0, -11);
@@ -1225,8 +1717,21 @@ function drawShard(ctx, x, y, spin, pulse) {
   ctx.restore();
 }
 
-function drawMine(ctx, x, y, radius, spin, pulse) {
+function drawMine(ctx, x, y, radius, spin, pulse, age = 1) {
+  // Telegraph: a fresh mine fades in over ~0.3 s with a shrinking
+  // warning ring, so nothing appears at full strength without warning.
+  const fade = Math.min(1, 0.3 + (age ?? 1) / 0.3);
   ctx.save();
+  ctx.globalAlpha = fade;
+  if ((age ?? 1) < 0.5) {
+    ctx.strokeStyle = MAGENTA;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = (0.5 - age) * 1.2;
+    ctx.beginPath();
+    ctx.arc(x, y, radius + (0.5 - age) * 70, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = fade;
+  }
   ctx.translate(x, y);
   ctx.rotate(spin);
   const throb = 1 + 0.08 * Math.sin(pulse * 4);
@@ -1259,8 +1764,19 @@ function drawMine(ctx, x, y, radius, spin, pulse) {
   ctx.restore();
 }
 
-function drawStorm(ctx, x, y, spin) {
+function drawStorm(ctx, x, y, spin, age = 1) {
+  const fade = Math.min(1, 0.3 + (age ?? 1) / 0.3);
   ctx.save();
+  ctx.globalAlpha = fade;
+  if ((age ?? 1) < 0.5) {
+    ctx.strokeStyle = '#a78bfa';
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = (0.5 - age) * 1.2;
+    ctx.beginPath();
+    ctx.arc(x, y, 13 + (0.5 - age) * 70, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = fade;
+  }
   ctx.translate(x, y);
   ctx.rotate(spin);
   glow(ctx, '#a78bfa', 14);
@@ -1393,27 +1909,52 @@ function drawGate(ctx, state, width, height) {
   ctx.fillText(progress >= 1 ? 'GATE OPEN' : `GATE ${Math.round(progress * 100)}%`, cx, cy);
 }
 
+function drawJoystick(ctx, pointer) {
+  // Floating joystick: a ring where the steering finger landed, a knob
+  // where it has dragged to. Drawn in field coordinates, under the HUD.
+  const ox = pointer.dragStartX;
+  const oy = pointer.dragStartY;
+  ctx.save();
+  ctx.globalAlpha = 0.35;
+  ctx.strokeStyle = CYAN;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(ox, oy, 55, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = 0.55;
+  ctx.fillStyle = CYAN;
+  ctx.beginPath();
+  ctx.arc(ox + pointer.relX * 55, oy + pointer.relY * 55, 18, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawHud(ctx, state, best, width) {
   const pad = 18;
   ctx.textBaseline = 'alphabetic';
-  // Score, big and gold.
+  // Score, big and gold — counted up smoothly (displayScore), not jumped.
   ctx.textAlign = 'left';
   glow(ctx, GOLD, 10);
   ctx.fillStyle = GOLD;
-  ctx.font = 'bold 34px sans-serif';
-  ctx.fillText(String(state.score), pad, 44);
+  ctx.font = 'bold 40px sans-serif';
+  ctx.fillText(String(Math.round(state.displayScore ?? state.score)), pad, 48);
   noGlow(ctx);
   ctx.fillStyle = '#e2e8f0';
-  ctx.font = '14px sans-serif';
-  ctx.fillText(`BEST ${Math.max(best, state.score)}`, pad, 66);
-  // Combo badge.
+  ctx.font = '16px sans-serif';
+  ctx.fillText(`BEST ${Math.max(best, state.score)}`, pad, 72);
+  // Combo badge: it pops bigger and jitters as the combo pulse rises.
   if (state.combo > 1) {
+    const pulse = state.comboPulse ?? 0;
+    ctx.save();
+    ctx.translate(pad + (Math.random() * 4 - 2) * pulse, 104);
+    ctx.scale(1 + 0.25 * pulse, 1 + 0.25 * pulse);
     ctx.textAlign = 'left';
     glow(ctx, MAGENTA, 12);
     ctx.fillStyle = MAGENTA;
-    ctx.font = 'bold 22px sans-serif';
-    ctx.fillText(`COMBO x${state.combo}`, pad, 96);
+    ctx.font = 'bold 26px sans-serif';
+    ctx.fillText(`COMBO x${state.combo}`, 0, 0);
     noGlow(ctx);
+    ctx.restore();
   }
   // Hearts, top right — one slot per max heart (upgrades can add to 5).
   const maxHearts = state.maxHearts ?? HEARTS;
@@ -1439,7 +1980,7 @@ function drawHud(ctx, state, best, width) {
   // Level and dash, top centre-right.
   ctx.textAlign = 'right';
   ctx.fillStyle = '#e2e8f0';
-  ctx.font = 'bold 17px sans-serif';
+  ctx.font = 'bold 19px sans-serif';
   ctx.fillText(`LEVEL ${state.level}`, width - pad, 66);
   const dashReady = state.ship.dashCooldown <= 0;
   const dashBase = effectiveDashCooldown(state);
@@ -1456,21 +1997,21 @@ function drawHud(ctx, state, best, width) {
     ctx.font = 'bold 14px sans-serif';
     ctx.fillText('SHIELD UP', width - pad, 120);
   }
-  // Progress bar to the Aurora Gate, bottom centre.
+  // Progress bar to the Aurora Gate, bottom centre — lifted off the edge.
   const barWidth = 420;
   const barX = (width - barWidth) / 2;
-  const barY = 688;
+  const barY = 682;
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
-  ctx.font = 'bold 13px sans-serif';
+  ctx.font = 'bold 15px sans-serif';
   ctx.fillText(`AURORA GATE  ${state.score} / ${WIN_SCORE}`, width / 2, barY - 8);
   ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
-  ctx.fillRect(barX, barY, barWidth, 10);
+  ctx.fillRect(barX, barY, barWidth, 12);
   const gateGradient = ctx.createLinearGradient(barX, 0, barX + barWidth, 0);
   gateGradient.addColorStop(0, CYAN);
   gateGradient.addColorStop(1, GREEN);
   ctx.fillStyle = gateGradient;
-  ctx.fillRect(barX, barY, barWidth * state.gateProgress, 10);
+  ctx.fillRect(barX, barY, barWidth * state.gateProgress, 12);
 }
 
 function panel(ctx, width, height) {
@@ -1505,9 +2046,20 @@ function wrapText(ctx, text, maxWidth) {
   return lines;
 }
 
-function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeShards = 0) {
+function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeShards = 0, extra = {}) {
   panel(ctx, width, height);
   drawGate(ctx, state, width, height);
+  // Top-scores button, top right.
+  ctx.save();
+  ctx.strokeStyle = GOLD;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(STATS_BUTTON_RECT.x, STATS_BUTTON_RECT.y, STATS_BUTTON_RECT.w, STATS_BUTTON_RECT.h);
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 17px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('★ TOP SCORES  [T]', STATS_BUTTON_RECT.x + STATS_BUTTON_RECT.w / 2, STATS_BUTTON_RECT.y + 23);
+  ctx.restore();
   bigTitle(ctx, 'LUMEN DRIFT', 250, width, CYAN, 72);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fbbf24';
@@ -1523,10 +2075,23 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   ctx.fillText('Level up to choose upgrades. Star shards unlock new ship skins.', width / 2, 450);
   ctx.font = 'bold 22px sans-serif';
   ctx.fillText(Math.floor(state.time * 2) % 2 === 0 ? '▶  PRESS ENTER OR TAP TO LAUNCH' : 'PRESS ENTER OR TAP TO LAUNCH', width / 2, 490);
+  // Daily streak: why coming back tomorrow matters.
+  const save = extra.save ?? null;
+  const streakInfo = extra.streakInfo ?? null;
+  if (save && save.streak.count > 0) {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText(
+      streakInfo && streakInfo.isNewDay
+        ? `🔥 ${save.streak.count}-DAY STREAK — +${streakInfo.bonus} shards today!`
+        : `🔥 ${save.streak.count}-DAY STREAK — come back tomorrow for +${Math.min(10 * (save.streak.count + 1), 100)} shards`,
+      width / 2, 518,
+    );
+  }
   if (best > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 18px sans-serif';
-    ctx.fillText(`BEST SCORE  ${best}`, width / 2, 535);
+    ctx.fillText(`BEST SCORE  ${best}`, width / 2, 542);
   }
   // Ship skin selector: a preview of the ship in the selected skin,
   // its name, and progress to the next unlock. Tap the preview (or
@@ -1537,6 +2102,30 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     shield: false,
   };
   drawShip(ctx, preview, skin);
+  // ◀ ▶ arrow buttons: the only way to change skins (a tap on the ship
+  // preview itself does nothing, so it can never eat a launch tap).
+  for (const [rect, dir] of [[SKIN_ARROW_LEFT, -1], [SKIN_ARROW_RIGHT, 1]]) {
+    ctx.save();
+    ctx.strokeStyle = CYAN;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = CYAN;
+    ctx.beginPath();
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + rect.h / 2;
+    if (dir < 0) {
+      ctx.moveTo(cx + 8, cy - 12);
+      ctx.lineTo(cx - 8, cy);
+      ctx.lineTo(cx + 8, cy + 12);
+    } else {
+      ctx.moveTo(cx - 8, cy - 12);
+      ctx.lineTo(cx + 8, cy);
+      ctx.lineTo(cx - 8, cy + 12);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
   ctx.textAlign = 'left';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 20px sans-serif';
@@ -1551,14 +2140,118 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     540, 610,
   );
   ctx.textAlign = 'center';
+  // Today's missions, one compact line.
+  if (save && save.missions.list.length) {
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '15px sans-serif';
+    ctx.fillText(
+      `TODAY  ${save.missions.list.map((m) => `${m.done ? '✓' : '○'} ${m.name} ${m.progress}/${m.target}`).join('   ')}`,
+      width / 2, 642,
+    );
+  }
   ctx.fillStyle = '#94a3b8';
   ctx.font = '15px sans-serif';
-  ctx.fillText('A neon arcade game — no downloads, no sign-up, just drift.', width / 2, 662);
+  ctx.fillText('A neon arcade game — no downloads, no sign-up, just drift.', width / 2, 672);
 }
 
-function drawUpgrade(ctx, state, offers, width, height) {
+function drawStats(ctx, save, width, height) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'TOP SCORES', 120, width, GOLD, 48);
+  ctx.textAlign = 'center';
+  if (!save) {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('No runs recorded yet — go drift!', width / 2, 300);
+  } else {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 22px sans-serif';
+    if (save.top5.length === 0) {
+      ctx.fillText('No runs yet — your best runs will live here.', width / 2, 200);
+    } else {
+      save.top5.forEach((entry, i) => {
+        ctx.fillStyle = i === 0 ? GOLD : '#e2e8f0';
+        ctx.font = i === 0 ? 'bold 24px sans-serif' : '20px sans-serif';
+        ctx.fillText(
+          `#${i + 1}   ${entry.score}   —   LEVEL ${entry.level}   •   COMBO x${Math.max(1, entry.bestCombo)}   •   ${entry.date}`,
+          width / 2, 200 + i * 38,
+        );
+      });
+    }
+    // Lifetime stats.
+    const mins = Math.floor(save.lifetime.playSeconds / 60);
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '19px sans-serif';
+    ctx.fillText(
+      `RUNS ${save.lifetime.runs}   •   LIFETIME SHARDS ${save.lifetime.shards}   •   PLAY TIME ${mins}m   •   BEST ${save.best}`,
+      width / 2, 430,
+    );
+    // 7-day streak calendar.
+    const days = streakCalendar(save, localDate());
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText(`🔥 ${save.streak.count}-DAY STREAK`, width / 2, 480);
+    const boxW = 44;
+    const gap = 10;
+    const totalW = 7 * boxW + 6 * gap;
+    let bx = (width - totalW) / 2;
+    for (const day of days) {
+      ctx.strokeStyle = day.isToday ? CYAN : 'rgba(148, 163, 184, 0.5)';
+      ctx.lineWidth = day.isToday ? 3 : 2;
+      ctx.strokeRect(bx, 500, boxW, boxW);
+      if (day.visited) {
+        ctx.fillStyle = GOLD;
+        ctx.font = 'bold 22px sans-serif';
+        ctx.fillText('✓', bx + boxW / 2, 522);
+      }
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px sans-serif';
+      ctx.fillText(day.date.slice(5), bx + boxW / 2, 560);
+      bx += boxW + gap;
+    }
+    // Today's missions.
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '19px sans-serif';
+    save.missions.list.forEach((m, i) => {
+      ctx.fillText(
+        `${m.done ? '✓' : '○'} ${m.name} — ${m.progress}/${m.target}   (+${m.reward} shards)`,
+        width / 2, 600 + i * 28,
+      );
+    });
+  }
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '17px sans-serif';
+  ctx.fillText('Press T or tap to go back', width / 2, 680);
+}
+
+function drawPlayAgain(ctx) {
+  const r = PLAY_AGAIN_RECT;
+  ctx.save();
+  ctx.fillStyle = GOLD;
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = INK;
+  ctx.font = 'bold 24px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('▶  PLAY AGAIN', r.x + r.w / 2, r.y + r.h / 2 + 1);
+  ctx.restore();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '17px sans-serif';
+  ctx.fillText('or press R', r.x + r.w / 2, r.y + r.h + 28);
+}
+
+function drawUpgrade(ctx, state, offers, width, height, age = 0) {
   // The frozen play field stays visible underneath.
   panel(ctx, width, height);
+  // Level-up celebration: a gold flash that fades over the first 0.25 s,
+  // while the cards slide up into place.
+  const p = Math.min(1, age / 0.25);
+  const ease = 1 - (1 - p) * (1 - p);
+  if (p < 1) {
+    ctx.fillStyle = `rgba(251, 191, 36, ${(1 - p) * 0.18})`;
+    ctx.fillRect(0, 0, width, height);
+  }
   bigTitle(ctx, 'LEVEL UP!', 165, width, GOLD, 56);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
@@ -1569,6 +2262,9 @@ function drawUpgrade(ctx, state, offers, width, height) {
     const card = cards[i];
     const up = card.upgrade;
     const count = (state.upgrades && state.upgrades[up.id]) || 0;
+    ctx.save();
+    ctx.globalAlpha = 0.25 + 0.75 * ease;
+    ctx.translate(0, (1 - ease) * 40);
     ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
     ctx.fillRect(card.x, card.y, card.w, card.h);
     ctx.strokeStyle = CYAN;
@@ -1618,6 +2314,7 @@ function drawUpgrade(ctx, state, offers, width, height) {
       ctx.fillStyle = '#94a3b8';
       ctx.fillText(`Picked ${count}× so far`, card.x + card.w / 2, card.y + 200);
     }
+    ctx.restore();
   }
   ctx.fillStyle = '#a5f3fc';
   ctx.font = '19px sans-serif';
@@ -1633,24 +2330,50 @@ function drawPaused(ctx, width, height) {
   ctx.fillText('Press P to keep drifting, or R to restart.', width / 2, 370);
 }
 
-function drawOver(ctx, state, best, width, height) {
+function drawOver(ctx, state, best, width, height, summary = null) {
   panel(ctx, width, height);
-  bigTitle(ctx, 'THE STORM TOOK YOU', 250, width, MAGENTA, 54);
+  bigTitle(ctx, 'THE STORM TOOK YOU', 220, width, MAGENTA, 54);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 26px sans-serif';
-  ctx.fillText(`SCORE  ${state.score}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 330);
+  ctx.fillText(`SCORE  ${state.score}    •    LEVEL ${state.level}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 300);
+  let y = 348;
   if (state.score >= best && state.score > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 22px sans-serif';
-    ctx.fillText('★ NEW BEST SCORE ★', width / 2, 375);
+    ctx.fillText('★ NEW BEST SCORE ★', width / 2, y);
+    y += 40;
   }
-  ctx.fillStyle = '#a5f3fc';
-  ctx.font = 'bold 22px sans-serif';
-  ctx.fillText('Press R or tap to drift again', width / 2, 450);
+  if (summary && summary.rank > 0) {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText(
+      summary.rank === 1
+        ? '#1 ON TOP SCORES — a new top score!'
+        : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
+      width / 2, y,
+    );
+    y += 40;
+  }
+  // Near-miss line (Zeigarnik): how close the gate was.
+  if (state.score >= 800 && state.score < WIN_SCORE) {
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText(`You died at ${state.score} — just ${WIN_SCORE - state.score} more to the gate!`, width / 2, y);
+    y += 40;
+  }
+  if (summary && summary.completed.length) {
+    ctx.fillStyle = '#34d399';
+    ctx.font = 'bold 20px sans-serif';
+    for (const m of summary.completed) {
+      ctx.fillText(`MISSION COMPLETE: ${m.name}  +${m.reward} shards`, width / 2, y);
+      y += 32;
+    }
+  }
+  drawPlayAgain(ctx);
 }
 
-function drawWin(ctx, state, best, width, height) {
+function drawWin(ctx, state, best, width, height, summary = null) {
   panel(ctx, width, height);
   drawGate(ctx, state, width, height);
   bigTitle(ctx, 'AURORA GATE OPEN!', 250, width, GREEN, 56);
@@ -1661,9 +2384,27 @@ function drawWin(ctx, state, best, width, height) {
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 24px sans-serif';
   ctx.fillText(`SCORE  ${state.score}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 370);
-  ctx.fillStyle = '#a5f3fc';
-  ctx.font = 'bold 22px sans-serif';
-  ctx.fillText('Press R or tap to drift again', width / 2, 450);
+  let y = 415;
+  if (summary && summary.rank > 0) {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText(
+      summary.rank === 1
+        ? '#1 ON TOP SCORES — a new top score!'
+        : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
+      width / 2, y,
+    );
+    y += 40;
+  }
+  if (summary && summary.completed.length) {
+    ctx.fillStyle = '#34d399';
+    ctx.font = 'bold 20px sans-serif';
+    for (const m of summary.completed) {
+      ctx.fillText(`MISSION COMPLETE: ${m.name}  +${m.reward} shards`, width / 2, y);
+      y += 32;
+    }
+  }
+  drawPlayAgain(ctx);
 }
 
 function createRenderer(canvas) {
@@ -1689,6 +2430,11 @@ function createRenderer(canvas) {
     const skin = extra.skin ?? SKINS[0];
     const offers = extra.offers ?? [];
     const lifetimeShards = extra.lifetimeShards ?? 0;
+    const pointer = extra.pointer ?? null;
+    const upgradeAge = extra.upgradeAge ?? 0;
+    const save = extra.save ?? null;
+    const streakInfo = extra.streakInfo ?? null;
+    const summary = extra.summary ?? null;
     const { width, height, dpr } = resize();
     // Work in CSS pixels; the backing store is denser on hi-DPI screens.
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1713,6 +2459,13 @@ function createRenderer(canvas) {
     ctx.save();
     ctx.translate(ox, oy);
     ctx.scale(scale, scale);
+    // Hit shake: the field jolts ~3 px for 0.1 s. The HUD and overlays
+    // are drawn after the matching restore(), so they stay steady.
+    ctx.save();
+    if (state.shakeTime > 0) {
+      const mag = (state.shakeMag || 3) * Math.max(0, state.shakeTime / 0.1);
+      ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
+    }
     drawStars(ctx, state);
 
     if (screen === SCREEN_TITLE) {
@@ -1741,19 +2494,34 @@ function createRenderer(canvas) {
     ctx.globalAlpha = 1;
 
     if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_OVER || screen === SCREEN_WIN || screen === SCREEN_UPGRADE) {
-      for (const s of state.shards) drawShard(ctx, s.x, s.y, s.spin, s.pulse);
+      for (const s of state.shards) drawShard(ctx, s.x, s.y, s.spin, s.pulse, s.golden);
       for (const s of state.shields) drawShieldCell(ctx, s.x, s.y, s.pulse);
-      for (const m of state.mines) drawMine(ctx, m.x, m.y, m.radius, m.spin, m.pulse);
-      for (const s of state.storms) drawStorm(ctx, s.x, s.y, s.spin);
+      for (const m of state.mines) drawMine(ctx, m.x, m.y, m.radius, m.spin, m.pulse, m.age);
+      for (const s of state.storms) drawStorm(ctx, s.x, s.y, s.spin, s.age);
       if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawShip(ctx, state, skin);
     }
+    if (screen === SCREEN_PLAY && pointer && pointer.down && pointer.mode === 'relative') {
+      drawJoystick(ctx, pointer);
+    }
+    // Floating score texts ("+10", "CLOSE! +5") rise and fade.
+    for (const f of state.floaters ?? []) {
+      ctx.globalAlpha = Math.max(0, f.life / f.maxLife);
+      ctx.fillStyle = f.color;
+      ctx.font = 'bold 20px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
 
     if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width);
-    if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards);
+    if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
     if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
-    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height);
-    if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height);
-    if (screen === SCREEN_UPGRADE) drawUpgrade(ctx, state, offers, FIELD.width, FIELD.height);
+    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary);
+    if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height, summary);
+    if (screen === SCREEN_STATS) drawStats(ctx, save, FIELD.width, FIELD.height);
+    if (screen === SCREEN_UPGRADE) drawUpgrade(ctx, state, offers, FIELD.width, FIELD.height, upgradeAge);
     ctx.restore();
     noGlow(ctx);
   }
@@ -1948,12 +2716,27 @@ function runGame() {
   }
   document.addEventListener('fullscreenchange', syncFullscreenButton);
   let screen = SCREEN_TITLE;
-  let best = readBest();
-  let lifetimeShards = loadLifetimeShards(window.localStorage);
+  // Local progress: one versioned save blob (best, top-5, history,
+  // lifetime stats, streak, missions), seeded from the legacy keys.
+  const today = localDate();
+  let save = loadSave(window.localStorage, today, {
+    best: readBest(),
+    shards: loadLifetimeShards(window.localStorage),
+  });
+  const streakInfo = touchStreak(save, today);
+  saveSave(window.localStorage, save);
+  let best = save.best;
+  let lifetimeShards = save.lifetime.shards;
   let skinId = loadSkinId(window.localStorage, lifetimeShards);
+  // The last run's summary (top-5 rank, missions) for the game-over screen.
+  let lastSummary = null;
+  // Per-run stats for missions and the run history.
+  let runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
   let offers = [];
   let accumulator = 0;
   let last = performance.now();
+  // Seconds since the LEVEL UP cards appeared (drives their animation).
+  let upgradeAge = 0;
 
   // Debug hook for testing the win path: one shard from the gate.
   if (params.get('debug') === 'win') {
@@ -1969,7 +2752,9 @@ function runGame() {
   function startGame() {
     world.reset();
     screen = SCREEN_PLAY;
+    runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
     input.clearPressed();
+    input.clearTap();
     audio.unlock();
     audio.click();
     announce('Lumen Drift started. Collect star shards, dodge the mines.');
@@ -1977,18 +2762,35 @@ function runGame() {
 
   function endGame(won) {
     screen = won ? SCREEN_WIN : SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    // Lifetime shards persist across runs and unlock ship skins.
-    lifetimeShards += world.state.shardsCollected;
+    input.clearPressed();
+    input.clearTap();
+    // Bank the run into the local save: top-5, history, lifetime stats,
+    // and today's missions (which pay their shard rewards immediately).
+    const run = {
+      score: world.state.score,
+      level: world.state.level,
+      bestCombo: world.state.bestCombo,
+      shards: world.state.shardsCollected,
+      dashes: runStats.dashes,
+      upgrades: Object.entries(world.state.upgrades)
+        .filter(([, n]) => n > 0).map(([id]) => id),
+      playSeconds: Math.round(runStats.playSeconds),
+      date: today,
+    };
+    const result = recordRun(save, run);
+    const completed = updateMissions(save, run);
+    saveSave(window.localStorage, save);
+    best = save.best;
+    lifetimeShards = save.lifetime.shards;
+    // The legacy best/shards keys stay in sync for older readers.
+    saveBest(best);
     saveLifetimeShards(window.localStorage, lifetimeShards);
+    lastSummary = { rank: result.rank, gapToFirst: result.gapToFirst, completed };
     if (won) audio.win();
     else audio.over();
     announce(won
-      ? `You win! Aurora Gate open with ${world.state.score} points.`
-      : `Game over. Score ${world.state.score}. Press R to drift again.`);
+      ? `You win! Aurora Gate open with ${world.state.score} points. Press R or tap PLAY AGAIN.`
+      : `Game over. Score ${world.state.score}. Press R or tap PLAY AGAIN.`);
   }
 
   // Cycle the ship skin through the skins already unlocked (title only).
@@ -2013,6 +2815,12 @@ function runGame() {
       && tap.y <= SKIN_PREVIEW_RECT.y + SKIN_PREVIEW_RECT.h;
   }
 
+  function inRect(tap, rect) {
+    return tap
+      && tap.x >= rect.x && tap.x <= rect.x + rect.w
+      && tap.y >= rect.y && tap.y <= rect.y + rect.h;
+  }
+
   // A level rose: stop the world and offer one upgrade per level risen.
   function enterUpgrade() {
     offers = drawUpgrades(world.state, () => Math.random());
@@ -2022,7 +2830,10 @@ function runGame() {
     }
     screen = SCREEN_UPGRADE;
     accumulator = 0;
+    upgradeAge = 0;
     input.clearPressed();
+    input.clearTap();
+    input.armGate();
     audio.levelup();
     announce(`Level ${world.state.level}! Choose an upgrade: ${
       offers.map((up, i) => `${i + 1} ${up.name}`).join(', ')
@@ -2042,14 +2853,21 @@ function runGame() {
         screen = SCREEN_PLAY;
         accumulator = 0;
         input.clearPressed();
+        input.clearTap();
         return;
       }
       announce(`Upgrade picked: ${up.name}. Choose another!`);
+      upgradeAge = 0;
+      input.clearPressed();
+      input.clearTap();
+      input.armGate();
       return;
     }
     screen = SCREEN_PLAY;
     accumulator = 0;
     input.clearPressed();
+    input.clearTap();
+    world.grantGrace(UPGRADE_GRACE);
     announce(`Upgrade picked: ${up.name} — ${up.desc} Back to the drift!`);
   }
 
@@ -2069,80 +2887,138 @@ function runGame() {
     if (screen === SCREEN_TITLE) {
       // The title floats over a live drifting field.
       world.step(STEP, { x: 0, y: 0 }, null, false);
-      // Skin selector: ←/→ (or A/D) cycles unlocked skins; tapping the
-      // ship preview does the same. A preview tap must not also launch.
+      // Skin selector: ←/→ (or A/D) cycles unlocked skins; the ◀ ▶ arrow
+      // buttons do the same on touch. A tap on the ship preview itself
+      // does nothing now, so a launch tap can never change the skin.
       const tap = input.takeTap();
-      if (inSkinPreview(tap)) {
+      if (inRect(tap, SKIN_ARROW_LEFT)) {
+        cycleSkin(-1);
+        input.clearPressed();
+      } else if (inRect(tap, SKIN_ARROW_RIGHT)) {
         cycleSkin(1);
+        input.clearPressed();
+      } else if (inRect(tap, STATS_BUTTON_RECT)) {
+        screen = SCREEN_STATS;
+        input.clearPressed();
+        input.clearTap();
+        announce('Top scores. Press T or tap to go back.');
+      } else if (inSkinPreview(tap)) {
         input.clearPressed();
       } else if (input.consume('ArrowLeft') || input.consume('KeyA')) {
         cycleSkin(-1);
       } else if (input.consume('ArrowRight') || input.consume('KeyD')) {
         cycleSkin(1);
+      } else if (input.consume('KeyT')) {
+        screen = SCREEN_STATS;
+        input.clearPressed();
+        input.clearTap();
+        announce('Top scores. Press T or tap to go back.');
       } else if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) {
         startGame();
+      }
+    } else if (screen === SCREEN_STATS) {
+      // Any tap (or T / Esc) goes back to the title.
+      input.takeTap();
+      if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_PAUSE) || input.consume('KeyT')) {
+        screen = SCREEN_TITLE;
+        input.clearPressed();
+        input.clearTap();
+        announce('Lumen Drift. Press Enter or click to launch.');
       }
     } else if (screen === SCREEN_PLAY) {
       if (input.consume(ACTION_PAUSE)) {
         screen = SCREEN_PAUSED;
         announce('Paused. Press P to resume.');
+      } else if (world.state.hitStop > 0) {
+        // Hit-stop: the world freezes for ~0.06 s after a hit while the
+        // frame still renders — the impact reads instead of blurring past.
+        world.state.hitStop -= elapsed;
       } else {
         const dash = input.consume(ACTION_DASH);
+        runStats.playSeconds += elapsed;
         accumulator += elapsed;
         while (accumulator >= STEP) {
           accumulator -= STEP;
           const events = world.step(STEP, input.steer(), input.pointer(), dash);
           if (events & EVENT_PICKUP) audio.pickup(world.state.combo);
-          if (events & EVENT_DASH) audio.dash();
+          if (events & EVENT_NEARMISS) audio.close();
+          if (events & EVENT_DASH) { audio.dash(); runStats.dashes += 1; }
           if (events & EVENT_SHIELD) audio.shield();
           if (events & EVENT_HIT) audio.hit();
           if (events & EVENT_WIN) { endGame(true); break; }
           if (events & EVENT_OVER) { endGame(false); break; }
         }
+        runStats.maxLevel = Math.max(runStats.maxLevel, world.state.level);
         // A level rose and the run is still going: pause the action and
         // offer the upgrade choice. (Win/over above already changed the
         // screen, so this only fires while still playing.)
         if (screen === SCREEN_PLAY && world.state.pendingLevelUps > 0) enterUpgrade();
       }
     } else if (screen === SCREEN_UPGRADE) {
+      upgradeAge += elapsed;
       // The world is frozen: no stepping, no accumulator build-up.
       // Pick with 1/2/3 or by tapping a card. Other presses are drained
       // so a pause/DASH tap here cannot leak into play on resume.
-      let picked = -1;
-      if (input.consume(ACTION_PICK_1)) picked = 0;
-      else if (input.consume(ACTION_PICK_2)) picked = 1;
-      else if (input.consume(ACTION_PICK_3)) picked = 2;
-      else {
-        const tap = input.takeTap();
-        if (tap) {
-          const cards = layoutUpgradeCards(offers);
-          picked = cards.findIndex((card) =>
-            tap.x >= card.x && tap.x <= card.x + card.w
-            && tap.y >= card.y && tap.y <= card.y + card.h);
+      // While the input gate is closed (first 400 ms after the cards
+      // appear, or the steering finger is still down), swallow every
+      // tap and pick key — this is what stops the stale-tap auto-pick.
+      if (!input.gateOpen()) {
+        input.takeTap();
+        input.clearPressed();
+      } else {
+        let picked = -1;
+        if (input.consume(ACTION_PICK_1)) picked = 0;
+        else if (input.consume(ACTION_PICK_2)) picked = 1;
+        else if (input.consume(ACTION_PICK_3)) picked = 2;
+        else {
+          const tap = input.takeTap();
+          if (tap) {
+            const cards = layoutUpgradeCards(offers);
+            picked = cards.findIndex((card) =>
+              tap.x >= card.x && tap.x <= card.x + card.w
+              && tap.y >= card.y && tap.y <= card.y + card.h);
+          }
         }
+        if (picked >= 0 && picked < offers.length) applyPick(picked);
+        input.clearPressed();
       }
-      if (picked >= 0 && picked < offers.length) applyPick(picked);
-      input.clearPressed();
     } else if (screen === SCREEN_PAUSED) {
       if (input.consume(ACTION_PAUSE) || input.consume(ACTION_CONFIRM)) {
         screen = SCREEN_PLAY;
         input.clearPressed();
+        input.clearTap();
         announce('Resumed.');
       } else if (input.consume(ACTION_RESTART)) {
         startGame();
       }
     } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
-      if (input.consume(ACTION_RESTART) || input.consume(ACTION_CONFIRM)) startGame();
+      // Deliberate restart only: the PLAY AGAIN button, or the R key.
+      // A tap anywhere else no longer restarts — the player gets to read
+      // the score, the rank and the near-miss line first.
+      const tap = input.takeTap();
+      if (input.consume(ACTION_RESTART)) {
+        startGame();
+      } else if (inRect(tap, PLAY_AGAIN_RECT)) {
+        input.clearPressed();
+        startGame();
+      }
     }
 
     renderer.draw(world.state, screen, best, {
       skin: skinById(skinId),
       offers: screen === SCREEN_UPGRADE ? offers : [],
       lifetimeShards,
+      pointer: input.pointer(),
+      upgradeAge,
+      save,
+      streakInfo,
+      summary: lastSummary,
     });
   }
 
-  announce('Lumen Drift. Press Enter or click to launch.');
+  announce(streakInfo.isNewDay
+    ? `Lumen Drift. Day ${save.streak.count} streak — ${streakInfo.bonus} bonus shards! Press Enter or click to launch.`
+    : 'Lumen Drift. Press Enter or click to launch.');
   requestAnimationFrame(frame);
 }
 
