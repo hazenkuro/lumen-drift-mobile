@@ -37,6 +37,13 @@
     width: 48px; height: 48px;
     font-size: 18px;
   }
+  #btn-fullscreen {
+    right: max(78px, calc(env(safe-area-inset-right) + 60px));
+    top: max(14px, env(safe-area-inset-top));
+    width: 48px; height: 48px;
+    font-size: 18px;
+  }
+  #btn-fullscreen.on { background: rgba(34, 211, 238, 0.35); }
   /* Nudge portrait phone players toward landscape, where the field is big. */
   #rotate-hint {
     display: none;
@@ -67,9 +74,9 @@
 <div id="rotate-hint">Putar HP ke landscape untuk layar penuh</div>
 <button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
 <button id="btn-pause" class="touch-btn" type="button" aria-label="Pause">❚❚</button>
+<button id="btn-fullscreen" class="touch-btn" type="button" aria-label="Fullscreen">⛶</button>
 <script type="module">
-
-// ===== config.js (inlined) =====
+// ---- src/config.js ----
 // Lumen Drift — tuning constants. One place holds every number that shapes
 // how the game feels, so balancing is editing values here, never hunting
 // through the world or the renderer.
@@ -126,8 +133,7 @@ const DRIFT = {
 // Best score is kept in local storage under this key.
 const BEST_KEY = 'lumen-drift-best';
 
-
-// ===== random.js (inlined) =====
+// ---- src/random.js ----
 // Lumen Drift — a small seeded random generator (mulberry32). The game uses
 // it for every spawn, drift angle and star placement, so `?seed=N` replays
 // the exact same storm and every screenshot is reproducible. A seed of 0
@@ -159,274 +165,7 @@ function createRandom(seed) {
   };
 }
 
-
-// ===== audio.js (inlined) =====
-// Lumen Drift — all sound is synthesised with WebAudio: short oscillator
-// bleeps shaped by a gain envelope. No audio files, no network, and nothing
-// plays until the player first interacts (browsers require a gesture).
-const NOTE = {
-  pickup: [880, 1320],
-  dash: [220, 440],
-  hit: [160, 90],
-  shield: [520, 780, 1040],
-  win: [523, 659, 784, 1047],
-  over: [392, 311, 233],
-  click: [660],
-};
-
-function createAudio() {
-  let context = null;
-  let muted = false;
-
-  // Lazily create the context on first use, inside a user gesture.
-  function ensure() {
-    if (context === null) {
-      const AudioContext = window.AudioContext ?? window.webkitAudioContext;
-      if (!AudioContext) return null;
-      context = new AudioContext();
-    }
-    if (context.state === 'suspended') void context.resume();
-    return context;
-  }
-
-  // Play one note: a sine/triangle blip that rises or falls in pitch.
-  function tone(freq, when, duration, type, volume) {
-    const ctx = ensure();
-    if (ctx === null || muted) return;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(freq, ctx.currentTime + when);
-    gain.gain.setValueAtTime(0.0001, ctx.currentTime + when);
-    gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + when + 0.015);
-    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + when + duration);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(ctx.currentTime + when);
-    osc.stop(ctx.currentTime + when + duration + 0.05);
-  }
-
-  function play(name, type = 'sine', volume = 0.12) {
-    const notes = NOTE[name];
-    if (!notes) return;
-    notes.forEach((freq, index) => {
-      tone(freq, index * 0.07, 0.16, type, volume);
-    });
-  }
-
-  return {
-    // Unlock audio from a gesture (start click / key press).
-    unlock() {
-      ensure();
-    },
-    // A higher combo sings higher, and a little louder: the pitch climbs
-    // with the streak, so a good run sounds like a good run.
-    pickup(combo) {
-      const base = 660 + combo * 90;
-      tone(base, 0, 0.12, 'sine', 0.1);
-      tone(base * 1.5, 0.05, 0.14, 'sine', 0.09);
-    },
-    dash() {
-      play('dash', 'triangle', 0.1);
-    },
-    hit() {
-      play('hit', 'sawtooth', 0.14);
-    },
-    shield() {
-      play('shield', 'sine', 0.11);
-    },
-    win() {
-      play('win', 'sine', 0.13);
-    },
-    over() {
-      play('over', 'triangle', 0.13);
-    },
-    click() {
-      play('click', 'sine', 0.07);
-    },
-    toggleMute() {
-      muted = !muted;
-      return muted;
-    },
-  };
-}
-
-
-// ===== view.js (inlined) =====
-// Lumen Drift — the one mapping between the world (1280x720) and the screen.
-// The renderer AND the pointer input both use this, so what you see is where
-// the game thinks things are.
-//
-// The field is scaled UNIFORMLY and letterboxed: one factor for both axes,
-// centred, so a circle in the world is a circle on screen, the ship's drawn
-// position is its collision position, and a touch lands where the finger is.
-//
-// (The old code scaled X and Y separately — scale vs scaleY — and drew the
-// ship with the X factor on both axes, so on any screen that is not exactly
-// 16:9 the ship appeared somewhere else than where it collided.)
-
-
-/** Uniform scale + letterbox offsets for a CSS-pixel box. */
-function viewTransform(cssWidth, cssHeight) {
-  const scale = Math.min(cssWidth / FIELD.width, cssHeight / FIELD.height);
-  const ox = (cssWidth - FIELD.width * scale) / 2;
-  const oy = (cssHeight - FIELD.height * scale) / 2;
-  return { scale, ox, oy };
-}
-
-/** A client (pointer) position, in CSS pixels, converted to world units. */
-function toWorld(clientX, clientY, rect) {
-  const t = viewTransform(rect.width, rect.height);
-  return {
-    x: (clientX - rect.left - t.ox) / t.scale,
-    y: (clientY - rect.top - t.oy) / t.scale,
-  };
-}
-
-/** A world position converted to CSS-pixel screen coordinates. */
-function toScreen(worldX, worldY, cssWidth, cssHeight) {
-  const t = viewTransform(cssWidth, cssHeight);
-  return { x: t.ox + worldX * t.scale, y: t.oy + worldY * t.scale };
-}
-
-
-// ===== input.js (inlined) =====
-// Lumen Drift — keyboard, mouse and touch input. Arrows/WASD steer, Space
-// or a click dashes, P pauses, R restarts, M mutes, Enter/click confirms.
-// The pointer also steers: holding the mouse down — or dragging a finger —
-// pulls the skiff toward it, in world coordinates (view.js), so the ship
-// goes where the finger actually points on any screen shape.
-//
-// On touch, a drag only steers: it never dashes (every touch used to dash,
-// which made the game unplayable on phones). Dashing on touch is the
-// on-screen DASH button, bound through bindButton(). Input is polled each
-// frame, and one-shot actions (dash, pause, restart) are edge-triggered so
-// holding a key does not repeat them.
-
-
-const ACTION_CONFIRM = 'confirm';
-const ACTION_PAUSE = 'pause';
-const ACTION_RESTART = 'restart';
-const ACTION_MUTE = 'mute';
-const ACTION_DASH = 'dash';
-
-const KEY_ACTIONS = {
-  Enter: ACTION_CONFIRM,
-  Space: ACTION_DASH,
-  KeyP: ACTION_PAUSE,
-  Escape: ACTION_PAUSE,
-  KeyR: ACTION_RESTART,
-  KeyM: ACTION_MUTE,
-};
-
-function isTouchDevice() {
-  return (typeof window !== 'undefined' && window.matchMedia
-    && window.matchMedia('(pointer: coarse)').matches)
-    || (typeof window !== 'undefined' && 'ontouchstart' in window);
-}
-
-function createInput(canvas) {
-  const keys = new Set();
-  const pressed = new Set();
-  const pointer = { x: 0, y: 0, down: false, active: false };
-
-  function onKeyDown(event) {
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(event.code)) {
-      event.preventDefault();
-    }
-    if (!event.repeat) pressed.add(KEY_ACTIONS[event.code] ?? event.code);
-    keys.add(event.code);
-  }
-
-  function onKeyUp(event) {
-    keys.delete(event.code);
-  }
-
-  function pointerPosition(event) {
-    const rect = canvas.getBoundingClientRect();
-    const world = toWorld(event.clientX, event.clientY, rect);
-    pointer.x = world.x;
-    pointer.y = world.y;
-  }
-
-  function onPointerDown(event) {
-    pointerPosition(event);
-    pointer.down = true;
-    pointer.active = true;
-    // A press confirms on menus. A mouse click also dashes in play;
-    // a touch drag only steers — startGame() drains the queue on launch,
-    // so a launch press never dashes by accident.
-    pressed.add(ACTION_CONFIRM);
-    if (event.pointerType !== 'touch') pressed.add(ACTION_DASH);
-  }
-
-  function onPointerUp() {
-    pointer.down = false;
-  }
-
-  function onPointerCancel() {
-    pointer.down = false;
-  }
-
-  function onPointerMove(event) {
-    pointerPosition(event);
-    pointer.active = true;
-  }
-
-  window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
-  canvas.addEventListener('pointerdown', onPointerDown);
-  window.addEventListener('pointerup', onPointerUp);
-  window.addEventListener('pointercancel', onPointerCancel);
-  canvas.addEventListener('pointermove', onPointerMove);
-
-  return {
-    // Steering vector from keys, normalised (-1..1 on each axis).
-    steer() {
-      let x = 0;
-      let y = 0;
-      if (keys.has('ArrowLeft') || keys.has('KeyA')) x -= 1;
-      if (keys.has('ArrowRight') || keys.has('KeyD')) x += 1;
-      if (keys.has('ArrowUp') || keys.has('KeyW')) y -= 1;
-      if (keys.has('ArrowDown') || keys.has('KeyS')) y += 1;
-      if (x !== 0 && y !== 0) {
-        const inv = 1 / Math.hypot(x, y);
-        x *= inv;
-        y *= inv;
-      }
-      return { x, y };
-    },
-    // Where the pointer is (world units), and whether it is steering now.
-    pointer() {
-      return pointer;
-    },
-    // True once for each press of the named action since the last poll.
-    consume(action) {
-      if (pressed.has(action)) {
-        pressed.delete(action);
-        return true;
-      }
-      return false;
-    },
-    // Drain one-shot presses (used when changing screens).
-    clearPressed() {
-      pressed.clear();
-    },
-    // Wire an on-screen button (e.g. the touch DASH / pause buttons) to
-    // a one-shot action. The button swallows the press so the canvas
-    // never also steers or dashes from it.
-    bindButton(element, action) {
-      element.addEventListener('pointerdown', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        pressed.add(action);
-      });
-    },
-  };
-}
-
-
-// ===== world.js (inlined) =====
+// ---- src/world.js ----
 // Lumen Drift — the world: the skiff, the storm field, and the rules.
 // Everything the game simulates lives in one plain state object so the
 // renderer, the screenshots and the tests all read the same truth.
@@ -436,7 +175,6 @@ function createInput(canvas) {
 // Picking up shards in a row without a hit raises the combo x1..x5; a hit
 // resets it. Every 200 points the level rises (1..5): spawns quicken and
 // everything drifts faster. At 1,200 points the Aurora Gate opens: win.
-
 
 const KIND_SHARD = 'shard';
 const KIND_MINE = 'mine';
@@ -785,8 +523,271 @@ function createWorld(random) {
   return { state, reset, step, burst };
 }
 
+// ---- src/view.js ----
+// Lumen Drift — the one mapping between the world (1280x720) and the screen.
+// The renderer AND the pointer input both use this, so what you see is where
+// the game thinks things are.
+//
+// The field is scaled UNIFORMLY and letterboxed: one factor for both axes,
+// centred, so a circle in the world is a circle on screen, the ship's drawn
+// position is its collision position, and a touch lands where the finger is.
+//
+// (The old code scaled X and Y separately — scale vs scaleY — and drew the
+// ship with the X factor on both axes, so on any screen that is not exactly
+// 16:9 the ship appeared somewhere else than where it collided.)
 
-// ===== render.js (inlined) =====
+/** Uniform scale + letterbox offsets for a CSS-pixel box. */
+function viewTransform(cssWidth, cssHeight) {
+  const scale = Math.min(cssWidth / FIELD.width, cssHeight / FIELD.height);
+  const ox = (cssWidth - FIELD.width * scale) / 2;
+  const oy = (cssHeight - FIELD.height * scale) / 2;
+  return { scale, ox, oy };
+}
+
+/** A client (pointer) position, in CSS pixels, converted to world units. */
+function toWorld(clientX, clientY, rect) {
+  const t = viewTransform(rect.width, rect.height);
+  return {
+    x: (clientX - rect.left - t.ox) / t.scale,
+    y: (clientY - rect.top - t.oy) / t.scale,
+  };
+}
+
+/** A world position converted to CSS-pixel screen coordinates. */
+function toScreen(worldX, worldY, cssWidth, cssHeight) {
+  const t = viewTransform(cssWidth, cssHeight);
+  return { x: t.ox + worldX * t.scale, y: t.oy + worldY * t.scale };
+}
+
+// ---- src/input.js ----
+// Lumen Drift — keyboard, mouse and touch input. Arrows/WASD steer, Space
+// or a click dashes, P pauses, R restarts, M mutes, F toggles fullscreen,
+// Enter/click confirms.
+// The pointer also steers: holding the mouse down — or dragging a finger —
+// pulls the skiff toward it, in world coordinates (view.js), so the ship
+// goes where the finger actually points on any screen shape.
+//
+// On touch, a drag only steers: it never dashes (every touch used to dash,
+// which made the game unplayable on phones). Dashing on touch is the
+// on-screen DASH button, bound through bindButton(). Input is polled each
+// frame, and one-shot actions (dash, pause, restart) are edge-triggered so
+// holding a key does not repeat them.
+
+const ACTION_CONFIRM = 'confirm';
+const ACTION_PAUSE = 'pause';
+const ACTION_RESTART = 'restart';
+const ACTION_MUTE = 'mute';
+const ACTION_DASH = 'dash';
+const ACTION_FULLSCREEN = 'fullscreen';
+
+const KEY_ACTIONS = {
+  Enter: ACTION_CONFIRM,
+  Space: ACTION_DASH,
+  KeyP: ACTION_PAUSE,
+  Escape: ACTION_PAUSE,
+  KeyR: ACTION_RESTART,
+  KeyM: ACTION_MUTE,
+  KeyF: ACTION_FULLSCREEN,
+};
+
+function isTouchDevice() {
+  return (typeof window !== 'undefined' && window.matchMedia
+    && window.matchMedia('(pointer: coarse)').matches)
+    || (typeof window !== 'undefined' && 'ontouchstart' in window);
+}
+
+function createInput(canvas) {
+  const keys = new Set();
+  const pressed = new Set();
+  const pointer = { x: 0, y: 0, down: false, active: false };
+
+  function onKeyDown(event) {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(event.code)) {
+      event.preventDefault();
+    }
+    if (!event.repeat) pressed.add(KEY_ACTIONS[event.code] ?? event.code);
+    keys.add(event.code);
+  }
+
+  function onKeyUp(event) {
+    keys.delete(event.code);
+  }
+
+  function pointerPosition(event) {
+    const rect = canvas.getBoundingClientRect();
+    const world = toWorld(event.clientX, event.clientY, rect);
+    pointer.x = world.x;
+    pointer.y = world.y;
+  }
+
+  function onPointerDown(event) {
+    pointerPosition(event);
+    pointer.down = true;
+    pointer.active = true;
+    // A press confirms on menus. A mouse click also dashes in play;
+    // a touch drag only steers — startGame() drains the queue on launch,
+    // so a launch press never dashes by accident.
+    pressed.add(ACTION_CONFIRM);
+    if (event.pointerType !== 'touch') pressed.add(ACTION_DASH);
+  }
+
+  function onPointerUp() {
+    pointer.down = false;
+  }
+
+  function onPointerCancel() {
+    pointer.down = false;
+  }
+
+  function onPointerMove(event) {
+    pointerPosition(event);
+    pointer.active = true;
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerCancel);
+  canvas.addEventListener('pointermove', onPointerMove);
+
+  return {
+    // Steering vector from keys, normalised (-1..1 on each axis).
+    steer() {
+      let x = 0;
+      let y = 0;
+      if (keys.has('ArrowLeft') || keys.has('KeyA')) x -= 1;
+      if (keys.has('ArrowRight') || keys.has('KeyD')) x += 1;
+      if (keys.has('ArrowUp') || keys.has('KeyW')) y -= 1;
+      if (keys.has('ArrowDown') || keys.has('KeyS')) y += 1;
+      if (x !== 0 && y !== 0) {
+        const inv = 1 / Math.hypot(x, y);
+        x *= inv;
+        y *= inv;
+      }
+      return { x, y };
+    },
+    // Where the pointer is (world units), and whether it is steering now.
+    pointer() {
+      return pointer;
+    },
+    // True once for each press of the named action since the last poll.
+    consume(action) {
+      if (pressed.has(action)) {
+        pressed.delete(action);
+        return true;
+      }
+      return false;
+    },
+    // Drain one-shot presses (used when changing screens).
+    clearPressed() {
+      pressed.clear();
+    },
+    // Wire an on-screen button (e.g. the touch DASH / pause buttons) to
+    // a one-shot action. The button swallows the press so the canvas
+    // never also steers or dashes from it.
+    bindButton(element, action) {
+      element.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        pressed.add(action);
+      });
+    },
+  };
+}
+
+// ---- src/audio.js ----
+// Lumen Drift — all sound is synthesised with WebAudio: short oscillator
+// bleeps shaped by a gain envelope. No audio files, no network, and nothing
+// plays until the player first interacts (browsers require a gesture).
+const NOTE = {
+  pickup: [880, 1320],
+  dash: [220, 440],
+  hit: [160, 90],
+  shield: [520, 780, 1040],
+  win: [523, 659, 784, 1047],
+  over: [392, 311, 233],
+  click: [660],
+};
+
+function createAudio() {
+  let context = null;
+  let muted = false;
+
+  // Lazily create the context on first use, inside a user gesture.
+  function ensure() {
+    if (context === null) {
+      const AudioContext = window.AudioContext ?? window.webkitAudioContext;
+      if (!AudioContext) return null;
+      context = new AudioContext();
+    }
+    if (context.state === 'suspended') void context.resume();
+    return context;
+  }
+
+  // Play one note: a sine/triangle blip that rises or falls in pitch.
+  function tone(freq, when, duration, type, volume) {
+    const ctx = ensure();
+    if (ctx === null || muted) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime + when);
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime + when);
+    gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + when + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + when + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(ctx.currentTime + when);
+    osc.stop(ctx.currentTime + when + duration + 0.05);
+  }
+
+  function play(name, type = 'sine', volume = 0.12) {
+    const notes = NOTE[name];
+    if (!notes) return;
+    notes.forEach((freq, index) => {
+      tone(freq, index * 0.07, 0.16, type, volume);
+    });
+  }
+
+  return {
+    // Unlock audio from a gesture (start click / key press).
+    unlock() {
+      ensure();
+    },
+    // A higher combo sings higher, and a little louder: the pitch climbs
+    // with the streak, so a good run sounds like a good run.
+    pickup(combo) {
+      const base = 660 + combo * 90;
+      tone(base, 0, 0.12, 'sine', 0.1);
+      tone(base * 1.5, 0.05, 0.14, 'sine', 0.09);
+    },
+    dash() {
+      play('dash', 'triangle', 0.1);
+    },
+    hit() {
+      play('hit', 'sawtooth', 0.14);
+    },
+    shield() {
+      play('shield', 'sine', 0.11);
+    },
+    win() {
+      play('win', 'sine', 0.13);
+    },
+    over() {
+      play('over', 'triangle', 0.13);
+    },
+    click() {
+      play('click', 'sine', 0.07);
+    },
+    toggleMute() {
+      muted = !muted;
+      return muted;
+    },
+  };
+}
+
+// ---- src/render.js ----
 // Lumen Drift — the renderer. One canvas, one palette, everything drawn
 // with vector shapes and glows: a deep indigo sky, three parallax star
 // layers, a neon cyan/magenta/gold palette, particle bursts, and big
@@ -798,8 +799,6 @@ function createWorld(random) {
 // (viewTransform) — every entity, the ship, the HUD and the overlays live
 // in field coordinates under that transform, so the drawn position of
 // everything is its simulated position, on any screen shape.
-
-
 
 const SCREEN_TITLE = 'title';
 const SCREEN_PLAY = 'play';
@@ -1154,7 +1153,7 @@ function drawTitle(ctx, state, best, width, height) {
   ctx.font = '19px sans-serif';
   ctx.fillText('Arrows / WASD, mouse or drag to steer  •  SPACE, click or DASH to dash', width / 2, 360);
   ctx.fillText('Collect star shards to reach 1,200 and open the Aurora Gate.', width / 2, 390);
-  ctx.fillText('Dodge void mines and storm shards — 3 hull hearts. P pauses.', width / 2, 420);
+  ctx.fillText('Dodge void mines and storm shards — 3 hull hearts. P pauses, F fullscreen.', width / 2, 420);
   ctx.fillStyle = '#a5f3fc';
   ctx.font = 'bold 22px sans-serif';
   ctx.fillText(Math.floor(state.time * 2) % 2 === 0 ? '▶  PRESS ENTER OR TAP TO LAUNCH' : 'PRESS ENTER OR TAP TO LAUNCH', width / 2, 490);
@@ -1301,8 +1300,7 @@ function createRenderer(canvas) {
   return { draw };
 }
 
-
-// ===== shots.js (inlined) =====
+// ---- src/shots.js ----
 // Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win.
 // Each scene plays the real rules forward from a fresh world for a fixed
 // number of steps, steered by a simple autopilot (chase the nearest shard,
@@ -1313,9 +1311,6 @@ function createRenderer(canvas) {
 // - play: a busy mid-game — score ~340, combo x3, 2 hearts left.
 // - end: the autopilot flies carelessly and the storm takes the skiff.
 // - win: the gate opens at 1,200 points.
-
-
-
 
 const START_SECONDS = 6;
 const PLAY_TARGET = 340;
@@ -1410,8 +1405,7 @@ function stageShot(name, world) {
   return { screen: SCREEN_TITLE, best: 0 };
 }
 
-
-// ===== main.js (inlined) =====
+// ---- src/main.js ----
 // Lumen Drift — boot and the one loop. Input is read every frame, the world
 // advances in fixed 1/60 s steps (several in a slow frame, none in a fast
 // one), and the renderer paints what is there. The game moves between five
@@ -1421,13 +1415,6 @@ function stageShot(name, world) {
 // &seed=N) stages that scene instead of running the loop, paints it twice
 // and sets window.__shotReady for a screenshot. ?debug=win starts a live
 // game one shard away from the Aurora Gate, for testing the win path.
-
-
-
-
-
-
-
 
 /** The longest frame the loop catches up on; a longer stall is dropped. */
 const MAX_FRAME = 0.25;
@@ -1478,6 +1465,27 @@ function runGame() {
   if (dashBtn) input.bindButton(dashBtn, ACTION_DASH);
   const pauseBtn = document.getElementById('btn-pause');
   if (pauseBtn) input.bindButton(pauseBtn, ACTION_PAUSE);
+  // Fullscreen: the F key or the on-screen button. The button hides
+  // itself where the browser cannot fullscreen the page (e.g. iPhone
+  // Safari); the game plays the same either way.
+  const fsBtn = document.getElementById('btn-fullscreen');
+  const fsSupported = typeof document.documentElement.requestFullscreen === 'function';
+  if (fsBtn && !fsSupported) fsBtn.style.display = 'none';
+  if (fsBtn && fsSupported) input.bindButton(fsBtn, ACTION_FULLSCREEN);
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+  }
+  function syncFullscreenButton() {
+    if (!fsBtn) return;
+    const on = !!document.fullscreenElement;
+    fsBtn.classList.toggle('on', on);
+    fsBtn.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Fullscreen');
+  }
+  document.addEventListener('fullscreenchange', syncFullscreenButton);
   let screen = SCREEN_TITLE;
   let best = readBest();
   let accumulator = 0;
@@ -1526,6 +1534,8 @@ function runGame() {
       const muted = audio.toggleMute();
       announce(muted ? 'Sound muted.' : 'Sound on.');
     }
+
+    if (input.consume(ACTION_FULLSCREEN)) toggleFullscreen();
 
     if (screen === SCREEN_TITLE) {
       // The title floats over a live drifting field.
@@ -1578,7 +1588,6 @@ window.__lumen = {
 
 if (shot) runShot(shot);
 else runGame();
-
 </script>
 </body>
 </html>
