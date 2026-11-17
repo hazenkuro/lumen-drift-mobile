@@ -1,0 +1,1584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Lumen Drift — a neon arcade game</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1026; overscroll-behavior: none; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* Read aloud, never shown: the status line screen readers announce. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  /* On-screen touch buttons: hidden on desktop, shown on touch devices. */
+  .touch-btn {
+    display: none;
+    position: fixed;
+    z-index: 10;
+    border: 2px solid rgba(34, 211, 238, 0.8);
+    background: rgba(11, 16, 38, 0.55);
+    color: #a5f3fc;
+    font: bold 16px sans-serif;
+    border-radius: 999px;
+    touch-action: none;
+    cursor: pointer;
+  }
+  .touch-btn:active { background: rgba(34, 211, 238, 0.35); }
+  #btn-dash {
+    right: max(18px, env(safe-area-inset-right));
+    bottom: max(18px, env(safe-area-inset-bottom));
+    width: 84px; height: 84px;
+    font-size: 17px;
+    letter-spacing: 1px;
+  }
+  #btn-pause {
+    right: max(18px, env(safe-area-inset-right));
+    top: max(14px, env(safe-area-inset-top));
+    width: 48px; height: 48px;
+    font-size: 18px;
+  }
+  /* Nudge portrait phone players toward landscape, where the field is big. */
+  #rotate-hint {
+    display: none;
+    position: fixed;
+    left: 50%;
+    top: max(10px, env(safe-area-inset-top));
+    transform: translateX(-50%);
+    z-index: 10;
+    color: #94a3b8;
+    font: 13px sans-serif;
+    background: rgba(11, 16, 38, 0.6);
+    padding: 6px 12px;
+    border-radius: 999px;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  @media (pointer: coarse) {
+    .touch-btn { display: block; }
+  }
+  @media (pointer: coarse) and (orientation: portrait) {
+    #rotate-hint { display: block; }
+  }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, reach 1,200 points to open the Aurora Gate"></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<div id="rotate-hint">Putar HP ke landscape untuk layar penuh</div>
+<button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
+<button id="btn-pause" class="touch-btn" type="button" aria-label="Pause">❚❚</button>
+<script type="module">
+
+// ===== config.js (inlined) =====
+// Lumen Drift — tuning constants. One place holds every number that shapes
+// how the game feels, so balancing is editing values here, never hunting
+// through the world or the renderer.
+const FIELD = { width: 1280, height: 720 };
+
+// Fixed simulation step: the world advances in 1/60 s slices.
+const STEP = 1 / 60;
+
+// The goal: reach this score and the Aurora Gate opens.
+const WIN_SCORE = 1200;
+const HEARTS = 3;
+
+// Star shards: base points, and the combo ladder (consecutive pickups with
+// no hit multiply the base; every 3 pickups steps the combo up one rung).
+// Combo caps at x5.
+const SHARD_POINTS = 10;
+const COMBO_MAX = 5;
+
+// The skiff: how fast it flies, how hard the dash kicks, how long the dash
+// lasts and how long the player waits before dashing again.
+const SHIP = {
+  radius: 16,
+  accel: 2600,
+  maxSpeed: 420,
+  drag: 2.6,
+  dashSpeed: 950,
+  dashTime: 0.16,
+  dashCooldown: 1.4,
+  invulnerableTime: 1.2,
+};
+
+// Difficulty ramps one level every 200 points, up to level 5.
+const LEVEL_EVERY = 200;
+const LEVEL_MAX = 5;
+
+// Spawn pacing, in seconds between spawns at level 1; each level multiplies
+// the rate by SPAWN_GROWTH, so the field gets busier as the score climbs.
+const SPAWN = {
+  shardEvery: 0.55,
+  mineEvery: 1.5,
+  stormEvery: 2.4,
+  shieldEvery: 14,
+  growth: 0.82,
+};
+
+// Drift speeds (pixels per second) at level 1; each level adds SPEED_GROWTH.
+const DRIFT = {
+  mine: 55,
+  storm: 190,
+  shard: 40,
+  speedGrowth: 0.16,
+};
+
+// Best score is kept in local storage under this key.
+const BEST_KEY = 'lumen-drift-best';
+
+
+// ===== random.js (inlined) =====
+// Lumen Drift — a small seeded random generator (mulberry32). The game uses
+// it for every spawn, drift angle and star placement, so `?seed=N` replays
+// the exact same storm and every screenshot is reproducible. A seed of 0
+// is replaced with a fixed fallback so the generator never sits at zero.
+function createRandom(seed) {
+  let state = (seed >>> 0) || 0x9e3779b9;
+  function next() {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  return {
+    // A float in [0, 1).
+    next,
+    // A float in [min, max).
+    range(min, max) {
+      return min + (max - min) * next();
+    },
+    // An integer in [min, max] inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    // One element of an array, picked at random.
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+  };
+}
+
+
+// ===== audio.js (inlined) =====
+// Lumen Drift — all sound is synthesised with WebAudio: short oscillator
+// bleeps shaped by a gain envelope. No audio files, no network, and nothing
+// plays until the player first interacts (browsers require a gesture).
+const NOTE = {
+  pickup: [880, 1320],
+  dash: [220, 440],
+  hit: [160, 90],
+  shield: [520, 780, 1040],
+  win: [523, 659, 784, 1047],
+  over: [392, 311, 233],
+  click: [660],
+};
+
+function createAudio() {
+  let context = null;
+  let muted = false;
+
+  // Lazily create the context on first use, inside a user gesture.
+  function ensure() {
+    if (context === null) {
+      const AudioContext = window.AudioContext ?? window.webkitAudioContext;
+      if (!AudioContext) return null;
+      context = new AudioContext();
+    }
+    if (context.state === 'suspended') void context.resume();
+    return context;
+  }
+
+  // Play one note: a sine/triangle blip that rises or falls in pitch.
+  function tone(freq, when, duration, type, volume) {
+    const ctx = ensure();
+    if (ctx === null || muted) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime + when);
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime + when);
+    gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + when + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + when + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(ctx.currentTime + when);
+    osc.stop(ctx.currentTime + when + duration + 0.05);
+  }
+
+  function play(name, type = 'sine', volume = 0.12) {
+    const notes = NOTE[name];
+    if (!notes) return;
+    notes.forEach((freq, index) => {
+      tone(freq, index * 0.07, 0.16, type, volume);
+    });
+  }
+
+  return {
+    // Unlock audio from a gesture (start click / key press).
+    unlock() {
+      ensure();
+    },
+    // A higher combo sings higher, and a little louder: the pitch climbs
+    // with the streak, so a good run sounds like a good run.
+    pickup(combo) {
+      const base = 660 + combo * 90;
+      tone(base, 0, 0.12, 'sine', 0.1);
+      tone(base * 1.5, 0.05, 0.14, 'sine', 0.09);
+    },
+    dash() {
+      play('dash', 'triangle', 0.1);
+    },
+    hit() {
+      play('hit', 'sawtooth', 0.14);
+    },
+    shield() {
+      play('shield', 'sine', 0.11);
+    },
+    win() {
+      play('win', 'sine', 0.13);
+    },
+    over() {
+      play('over', 'triangle', 0.13);
+    },
+    click() {
+      play('click', 'sine', 0.07);
+    },
+    toggleMute() {
+      muted = !muted;
+      return muted;
+    },
+  };
+}
+
+
+// ===== view.js (inlined) =====
+// Lumen Drift — the one mapping between the world (1280x720) and the screen.
+// The renderer AND the pointer input both use this, so what you see is where
+// the game thinks things are.
+//
+// The field is scaled UNIFORMLY and letterboxed: one factor for both axes,
+// centred, so a circle in the world is a circle on screen, the ship's drawn
+// position is its collision position, and a touch lands where the finger is.
+//
+// (The old code scaled X and Y separately — scale vs scaleY — and drew the
+// ship with the X factor on both axes, so on any screen that is not exactly
+// 16:9 the ship appeared somewhere else than where it collided.)
+
+
+/** Uniform scale + letterbox offsets for a CSS-pixel box. */
+function viewTransform(cssWidth, cssHeight) {
+  const scale = Math.min(cssWidth / FIELD.width, cssHeight / FIELD.height);
+  const ox = (cssWidth - FIELD.width * scale) / 2;
+  const oy = (cssHeight - FIELD.height * scale) / 2;
+  return { scale, ox, oy };
+}
+
+/** A client (pointer) position, in CSS pixels, converted to world units. */
+function toWorld(clientX, clientY, rect) {
+  const t = viewTransform(rect.width, rect.height);
+  return {
+    x: (clientX - rect.left - t.ox) / t.scale,
+    y: (clientY - rect.top - t.oy) / t.scale,
+  };
+}
+
+/** A world position converted to CSS-pixel screen coordinates. */
+function toScreen(worldX, worldY, cssWidth, cssHeight) {
+  const t = viewTransform(cssWidth, cssHeight);
+  return { x: t.ox + worldX * t.scale, y: t.oy + worldY * t.scale };
+}
+
+
+// ===== input.js (inlined) =====
+// Lumen Drift — keyboard, mouse and touch input. Arrows/WASD steer, Space
+// or a click dashes, P pauses, R restarts, M mutes, Enter/click confirms.
+// The pointer also steers: holding the mouse down — or dragging a finger —
+// pulls the skiff toward it, in world coordinates (view.js), so the ship
+// goes where the finger actually points on any screen shape.
+//
+// On touch, a drag only steers: it never dashes (every touch used to dash,
+// which made the game unplayable on phones). Dashing on touch is the
+// on-screen DASH button, bound through bindButton(). Input is polled each
+// frame, and one-shot actions (dash, pause, restart) are edge-triggered so
+// holding a key does not repeat them.
+
+
+const ACTION_CONFIRM = 'confirm';
+const ACTION_PAUSE = 'pause';
+const ACTION_RESTART = 'restart';
+const ACTION_MUTE = 'mute';
+const ACTION_DASH = 'dash';
+
+const KEY_ACTIONS = {
+  Enter: ACTION_CONFIRM,
+  Space: ACTION_DASH,
+  KeyP: ACTION_PAUSE,
+  Escape: ACTION_PAUSE,
+  KeyR: ACTION_RESTART,
+  KeyM: ACTION_MUTE,
+};
+
+function isTouchDevice() {
+  return (typeof window !== 'undefined' && window.matchMedia
+    && window.matchMedia('(pointer: coarse)').matches)
+    || (typeof window !== 'undefined' && 'ontouchstart' in window);
+}
+
+function createInput(canvas) {
+  const keys = new Set();
+  const pressed = new Set();
+  const pointer = { x: 0, y: 0, down: false, active: false };
+
+  function onKeyDown(event) {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(event.code)) {
+      event.preventDefault();
+    }
+    if (!event.repeat) pressed.add(KEY_ACTIONS[event.code] ?? event.code);
+    keys.add(event.code);
+  }
+
+  function onKeyUp(event) {
+    keys.delete(event.code);
+  }
+
+  function pointerPosition(event) {
+    const rect = canvas.getBoundingClientRect();
+    const world = toWorld(event.clientX, event.clientY, rect);
+    pointer.x = world.x;
+    pointer.y = world.y;
+  }
+
+  function onPointerDown(event) {
+    pointerPosition(event);
+    pointer.down = true;
+    pointer.active = true;
+    // A press confirms on menus. A mouse click also dashes in play;
+    // a touch drag only steers — startGame() drains the queue on launch,
+    // so a launch press never dashes by accident.
+    pressed.add(ACTION_CONFIRM);
+    if (event.pointerType !== 'touch') pressed.add(ACTION_DASH);
+  }
+
+  function onPointerUp() {
+    pointer.down = false;
+  }
+
+  function onPointerCancel() {
+    pointer.down = false;
+  }
+
+  function onPointerMove(event) {
+    pointerPosition(event);
+    pointer.active = true;
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('pointerdown', onPointerDown);
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerCancel);
+  canvas.addEventListener('pointermove', onPointerMove);
+
+  return {
+    // Steering vector from keys, normalised (-1..1 on each axis).
+    steer() {
+      let x = 0;
+      let y = 0;
+      if (keys.has('ArrowLeft') || keys.has('KeyA')) x -= 1;
+      if (keys.has('ArrowRight') || keys.has('KeyD')) x += 1;
+      if (keys.has('ArrowUp') || keys.has('KeyW')) y -= 1;
+      if (keys.has('ArrowDown') || keys.has('KeyS')) y += 1;
+      if (x !== 0 && y !== 0) {
+        const inv = 1 / Math.hypot(x, y);
+        x *= inv;
+        y *= inv;
+      }
+      return { x, y };
+    },
+    // Where the pointer is (world units), and whether it is steering now.
+    pointer() {
+      return pointer;
+    },
+    // True once for each press of the named action since the last poll.
+    consume(action) {
+      if (pressed.has(action)) {
+        pressed.delete(action);
+        return true;
+      }
+      return false;
+    },
+    // Drain one-shot presses (used when changing screens).
+    clearPressed() {
+      pressed.clear();
+    },
+    // Wire an on-screen button (e.g. the touch DASH / pause buttons) to
+    // a one-shot action. The button swallows the press so the canvas
+    // never also steers or dashes from it.
+    bindButton(element, action) {
+      element.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        pressed.add(action);
+      });
+    },
+  };
+}
+
+
+// ===== world.js (inlined) =====
+// Lumen Drift — the world: the skiff, the storm field, and the rules.
+// Everything the game simulates lives in one plain state object so the
+// renderer, the screenshots and the tests all read the same truth.
+//
+// Entities: star shards (collect for points), void mines (slow, spiky,
+// drifting), storm shards (fast, sharp), shield cells (one free hit).
+// Picking up shards in a row without a hit raises the combo x1..x5; a hit
+// resets it. Every 200 points the level rises (1..5): spawns quicken and
+// everything drifts faster. At 1,200 points the Aurora Gate opens: win.
+
+
+const KIND_SHARD = 'shard';
+const KIND_MINE = 'mine';
+const KIND_STORM = 'storm';
+const KIND_SHIELD = 'shield';
+
+const EVENT_NONE = 0;
+const EVENT_PICKUP = 1;
+const EVENT_HIT = 2;
+const EVENT_SHIELD = 4;
+const EVENT_OVER = 8;
+const EVENT_WIN = 16;
+const EVENT_DASH = 32;
+
+function makeShip() {
+  return {
+    x: FIELD.width / 2,
+    y: FIELD.height * 0.62,
+    vx: 0,
+    vy: 0,
+    angle: -Math.PI / 2,
+    dashTime: 0,
+    dashCooldown: 0,
+    invulnerable: 0,
+  };
+}
+
+function createWorld(random) {
+  const state = {
+    time: 0,
+    score: 0,
+    bestCombo: 0,
+    combo: 0,
+    comboCount: 0,
+    hearts: HEARTS,
+    level: 1,
+    shield: false,
+    ship: makeShip(),
+    shards: [],
+    mines: [],
+    storms: [],
+    shields: [],
+    particles: [],
+    trail: [],
+    stars: [],
+    gateOpen: false,
+    gateProgress: 0,
+    spawnTimers: { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 },
+    flashes: 0,
+  };
+
+  // Three parallax star layers, seeded once per world.
+  for (let layer = 0; layer < 3; layer += 1) {
+    for (let i = 0; i < 42 - layer * 10; i += 1) {
+      state.stars.push({
+        x: random.range(0, FIELD.width),
+        y: random.range(0, FIELD.height),
+        layer,
+        size: random.range(0.6, 1.4 + layer * 0.5),
+        twinkle: random.range(0, Math.PI * 2),
+      });
+    }
+  }
+
+  function levelFor(score) {
+    return Math.min(LEVEL_MAX, 1 + Math.floor(score / LEVEL_EVERY));
+  }
+
+  function speedScale() {
+    return 1 + (state.level - 1) * DRIFT.speedGrowth;
+  }
+
+  function spawnRate(base) {
+    return base * Math.pow(SPAWN.growth, state.level - 1);
+  }
+
+  function burst(x, y, color, count, speed) {
+    for (let i = 0; i < count; i += 1) {
+      const angle = random.range(0, Math.PI * 2);
+      const v = random.range(speed * 0.3, speed);
+      state.particles.push({
+        x, y,
+        vx: Math.cos(angle) * v,
+        vy: Math.sin(angle) * v,
+        life: random.range(0.3, 0.8),
+        maxLife: 0.8,
+        size: random.range(1.5, 4),
+        color,
+      });
+    }
+  }
+
+  function spawnShard() {
+    state.shards.push({
+      x: random.range(40, FIELD.width - 40),
+      y: -20,
+      vy: DRIFT.shard * speedScale() * random.range(0.7, 1.4),
+      vx: random.range(-18, 18),
+      radius: 10,
+      spin: random.range(0, Math.PI * 2),
+      spinSpeed: random.range(1.5, 3.5),
+      pulse: random.range(0, Math.PI * 2),
+    });
+  }
+
+  function spawnMine() {
+    const fromLeft = random.next() < 0.5;
+    state.mines.push({
+      x: fromLeft ? -24 : FIELD.width + 24,
+      y: random.range(60, FIELD.height - 60),
+      vx: (fromLeft ? 1 : -1) * DRIFT.mine * speedScale() * random.range(0.8, 1.3),
+      vy: random.range(-14, 14),
+      radius: random.range(15, 20),
+      spin: random.range(0, Math.PI * 2),
+      spinSpeed: random.range(0.6, 1.6),
+      pulse: random.range(0, Math.PI * 2),
+    });
+  }
+
+  function spawnStorm() {
+    const angle = random.range(Math.PI * 0.15, Math.PI * 0.85);
+    const fromTop = random.next() < 0.6;
+    state.storms.push({
+      x: random.range(40, FIELD.width - 40),
+      y: fromTop ? -24 : FIELD.height + 24,
+      vx: Math.cos(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25) * (random.next() < 0.5 ? -1 : 1),
+      vy: (fromTop ? 1 : -1) * Math.sin(angle) * DRIFT.storm * speedScale() * random.range(0.85, 1.25),
+      radius: 9,
+      spin: random.range(0, Math.PI * 2),
+      spinSpeed: random.range(4, 7),
+    });
+  }
+
+  function spawnShield() {
+    state.shields.push({
+      x: random.range(60, FIELD.width - 60),
+      y: -20,
+      vy: 55,
+      radius: 13,
+      pulse: random.range(0, Math.PI * 2),
+    });
+  }
+
+  function reset() {
+    state.time = 0;
+    state.score = 0;
+    state.bestCombo = 0;
+    state.combo = 0;
+    state.comboCount = 0;
+    state.hearts = HEARTS;
+    state.level = 1;
+    state.shield = false;
+    state.ship = makeShip();
+    state.shards = [];
+    state.mines = [];
+    state.storms = [];
+    state.shields = [];
+    state.particles = [];
+    state.trail = [];
+    state.gateOpen = false;
+    state.gateProgress = 0;
+    state.spawnTimers = { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 };
+    state.flashes = 0;
+  }
+
+  // Advance the world one fixed step. `steer` is the normalised keyboard
+  // vector, `pointer` the mouse target (or null), `dash` a dash request.
+  // Returns a bitmask of events that happened this step.
+  function step(dt, steer, pointer, dash) {
+    let events = EVENT_NONE;
+    state.time += dt;
+    state.level = levelFor(state.score);
+    const ship = state.ship;
+
+    // --- Spawning ---------------------------------------------------------
+    state.spawnTimers.shard -= dt;
+    state.spawnTimers.mine -= dt;
+    state.spawnTimers.storm -= dt;
+    state.spawnTimers.shield -= dt;
+    if (state.spawnTimers.shard <= 0) { spawnShard(); state.spawnTimers.shard = spawnRate(SPAWN.shardEvery); }
+    if (state.spawnTimers.mine <= 0) { spawnMine(); state.spawnTimers.mine = spawnRate(SPAWN.mineEvery); }
+    if (state.spawnTimers.storm <= 0) { spawnStorm(); state.spawnTimers.storm = spawnRate(SPAWN.stormEvery); }
+    if (state.spawnTimers.shield <= 0 && !state.shield) { spawnShield(); state.spawnTimers.shield = SPAWN.shieldEvery; }
+
+    // --- Ship steering ----------------------------------------------------
+    let ax = steer.x * SHIP.accel;
+    let ay = steer.y * SHIP.accel;
+    if ((steer.x === 0 && steer.y === 0) && pointer && pointer.active && pointer.down) {
+      const dx = pointer.x - ship.x;
+      const dy = pointer.y - ship.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 12) {
+        ax = (dx / dist) * SHIP.accel;
+        ay = (dy / dist) * SHIP.accel;
+      }
+    }
+    if (ship.dashTime > 0) {
+      ship.dashTime -= dt;
+    } else {
+      ship.vx += ax * dt;
+      ship.vy += ay * dt;
+      const drag = Math.max(0, 1 - SHIP.drag * dt);
+      ship.vx *= drag;
+      ship.vy *= drag;
+      const speed = Math.hypot(ship.vx, ship.vy);
+      if (speed > SHIP.maxSpeed) {
+        ship.vx = (ship.vx / speed) * SHIP.maxSpeed;
+        ship.vy = (ship.vy / speed) * SHIP.maxSpeed;
+      }
+    }
+    if (dash && ship.dashCooldown <= 0 && ship.dashTime <= 0) {
+      let dx = steer.x;
+      let dy = steer.y;
+      if (dx === 0 && dy === 0) {
+        dx = Math.cos(ship.angle);
+        dy = Math.sin(ship.angle);
+      }
+      const len = Math.hypot(dx, dy) || 1;
+      ship.vx = (dx / len) * SHIP.dashSpeed;
+      ship.vy = (dy / len) * SHIP.dashSpeed;
+      ship.dashTime = SHIP.dashTime;
+      ship.dashCooldown = SHIP.dashCooldown;
+      ship.invulnerable = Math.max(ship.invulnerable, SHIP.dashTime + 0.08);
+      events |= EVENT_DASH;
+      burst(ship.x, ship.y, '#22d3ee', 10, 160);
+    }
+    ship.dashCooldown = Math.max(0, ship.dashCooldown - dt);
+    ship.invulnerable = Math.max(0, ship.invulnerable - dt);
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+    ship.x = Math.max(SHIP.radius, Math.min(FIELD.width - SHIP.radius, ship.x));
+    ship.y = Math.max(SHIP.radius, Math.min(FIELD.height - SHIP.radius, ship.y));
+    if (Math.hypot(ship.vx, ship.vy) > 40) {
+      ship.angle = Math.atan2(ship.vy, ship.vx);
+    }
+
+    // Engine trail: a fading ribbon behind the skiff.
+    state.trail.push({ x: ship.x, y: ship.y, life: 0.35, maxLife: 0.35 });
+    if (state.trail.length > 26) state.trail.shift();
+    for (const dot of state.trail) dot.life -= dt;
+    state.trail = state.trail.filter((dot) => dot.life > 0);
+
+    // --- Entities drift ---------------------------------------------------
+    for (const s of state.shards) {
+      s.y += s.vy * dt;
+      s.x += s.vx * dt + Math.sin(state.time * 2 + s.pulse) * 12 * dt;
+      s.spin += s.spinSpeed * dt;
+      s.pulse += dt;
+    }
+    for (const m of state.mines) {
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+      m.spin += m.spinSpeed * dt;
+      m.pulse += dt;
+    }
+    for (const s of state.storms) {
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.spin += s.spinSpeed * dt;
+    }
+    for (const s of state.shields) {
+      s.y += s.vy * dt;
+      s.pulse += dt;
+    }
+    const offscreen = (e) => e.y > FIELD.height + 40 || e.y < -60 || e.x < -60 || e.x > FIELD.width + 60;
+    state.shards = state.shards.filter((e) => !offscreen(e));
+    state.mines = state.mines.filter((e) => !offscreen(e));
+    state.storms = state.storms.filter((e) => !offscreen(e));
+    state.shields = state.shields.filter((e) => !offscreen(e));
+
+    // --- Particles --------------------------------------------------------
+    for (const p of state.particles) {
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vx *= 0.98;
+      p.vy *= 0.98;
+      p.life -= dt;
+    }
+    state.particles = state.particles.filter((p) => p.life > 0);
+    state.flashes = Math.max(0, state.flashes - dt * 3);
+
+    // --- Pickups ----------------------------------------------------------
+    const collect = (list, radius, onCollect) => {
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const e = list[i];
+        if (Math.hypot(e.x - ship.x, e.y - ship.y) < radius + e.radius) {
+          list.splice(i, 1);
+          onCollect(e);
+        }
+      }
+    };
+    collect(state.shards, SHIP.radius, (e) => {
+      state.comboCount += 1;
+      state.combo = Math.min(COMBO_MAX, 1 + Math.floor(state.comboCount / 3));
+      state.bestCombo = Math.max(state.bestCombo, state.combo);
+      const gained = SHARD_POINTS * state.combo;
+      state.score += gained;
+      state.level = levelFor(state.score);
+      state.gateProgress = Math.min(1, state.score / WIN_SCORE);
+      burst(e.x, e.y, '#fbbf24', 12, 200);
+      events |= EVENT_PICKUP;
+      if (state.score >= WIN_SCORE && !state.gateOpen) {
+        state.gateOpen = true;
+        events |= EVENT_WIN;
+      }
+    });
+    collect(state.shields, SHIP.radius, (e) => {
+      state.shield = true;
+      burst(e.x, e.y, '#34d399', 14, 180);
+      events |= EVENT_SHIELD;
+    });
+
+    // --- Hits -------------------------------------------------------------
+    const hitBy = (list) => {
+      if (ship.invulnerable > 0) return false;
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const e = list[i];
+        if (Math.hypot(e.x - ship.x, e.y - ship.y) < SHIP.radius * 0.8 + e.radius * 0.85) {
+          list.splice(i, 1);
+          return true;
+        }
+      }
+      return false;
+    };
+    const hit = hitBy(state.mines) || hitBy(state.storms);
+    if (hit) {
+      state.combo = 0;
+      state.comboCount = 0;
+      state.flashes = 1;
+      burst(ship.x, ship.y, '#f472b6', 22, 320);
+      if (state.shield) {
+        state.shield = false;
+        ship.invulnerable = SHIP.invulnerableTime;
+        events |= EVENT_SHIELD;
+      } else {
+        state.hearts -= 1;
+        ship.invulnerable = SHIP.invulnerableTime;
+        events |= EVENT_HIT;
+        if (state.hearts <= 0) events |= EVENT_OVER;
+      }
+    }
+
+    return events;
+  }
+
+  return { state, reset, step, burst };
+}
+
+
+// ===== render.js (inlined) =====
+// Lumen Drift — the renderer. One canvas, one palette, everything drawn
+// with vector shapes and glows: a deep indigo sky, three parallax star
+// layers, a neon cyan/magenta/gold palette, particle bursts, and big
+// readable text. The same draw() paints live play and the staged
+// screenshot scenes; only the screen label changes what overlays appear.
+//
+// COORDINATES: the world is 1280x720. draw() fills the whole screen with
+// the sky, then draws the field letterboxed with ONE uniform scale
+// (viewTransform) — every entity, the ship, the HUD and the overlays live
+// in field coordinates under that transform, so the drawn position of
+// everything is its simulated position, on any screen shape.
+
+
+
+const SCREEN_TITLE = 'title';
+const SCREEN_PLAY = 'play';
+const SCREEN_PAUSED = 'paused';
+const SCREEN_OVER = 'over';
+const SCREEN_WIN = 'win';
+
+const CYAN = '#22d3ee';
+const MAGENTA = '#f472b6';
+const GOLD = '#fbbf24';
+const GREEN = '#34d399';
+const INK = '#0b1026';
+
+function glow(ctx, color, blur) {
+  ctx.shadowColor = color;
+  ctx.shadowBlur = blur;
+}
+
+function noGlow(ctx) {
+  ctx.shadowBlur = 0;
+}
+
+function drawStars(ctx, state) {
+  for (const star of state.stars) {
+    const depth = 0.25 + star.layer * 0.35;
+    const x = ((star.x - state.time * 8 * depth) % FIELD.width + FIELD.width) % FIELD.width;
+    const y = star.y;
+    const alpha = 0.35 + 0.65 * Math.abs(Math.sin(state.time * 1.5 + star.twinkle));
+    ctx.globalAlpha = alpha * (0.5 + star.layer * 0.25);
+    ctx.fillStyle = star.layer === 2 ? '#e0f2fe' : '#a5f3fc';
+    ctx.beginPath();
+    ctx.arc(x, y, star.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawNebula(ctx, width, height) {
+  const blobs = [
+    { x: 0.18, y: 0.22, r: 0.34, color: 'rgba(124, 58, 237, 0.20)' },
+    { x: 0.85, y: 0.75, r: 0.38, color: 'rgba(219, 39, 119, 0.14)' },
+    { x: 0.72, y: 0.12, r: 0.28, color: 'rgba(34, 211, 238, 0.10)' },
+  ];
+  for (const blob of blobs) {
+    const gradient = ctx.createRadialGradient(
+      blob.x * width, blob.y * height, 0,
+      blob.x * width, blob.y * height, blob.r * width,
+    );
+    gradient.addColorStop(0, blob.color);
+    gradient.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+  }
+}
+
+function drawShard(ctx, x, y, spin, pulse) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(spin);
+  const twinkle = 0.75 + 0.25 * Math.sin(pulse * 3);
+  glow(ctx, GOLD, 14);
+  ctx.fillStyle = GOLD;
+  ctx.globalAlpha = twinkle;
+  ctx.beginPath();
+  ctx.moveTo(0, -11);
+  ctx.lineTo(4, -4);
+  ctx.lineTo(11, 0);
+  ctx.lineTo(4, 4);
+  ctx.lineTo(0, 11);
+  ctx.lineTo(-4, 4);
+  ctx.lineTo(-11, 0);
+  ctx.lineTo(-4, -4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#fffbeb';
+  ctx.beginPath();
+  ctx.arc(0, 0, 3.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawMine(ctx, x, y, radius, spin, pulse) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(spin);
+  const throb = 1 + 0.08 * Math.sin(pulse * 4);
+  glow(ctx, MAGENTA, 16);
+  ctx.fillStyle = '#3b0764';
+  ctx.strokeStyle = MAGENTA;
+  ctx.lineWidth = 2;
+  // Eight spikes around a dark core.
+  ctx.beginPath();
+  for (let i = 0; i < 8; i += 1) {
+    const angle = (i / 8) * Math.PI * 2;
+    const outer = radius * 1.35 * throb;
+    const inner = radius * 0.7;
+    const tipX = Math.cos(angle) * outer;
+    const tipY = Math.sin(angle) * outer;
+    const baseAngle = angle + Math.PI / 8;
+    const baseX = Math.cos(baseAngle) * inner;
+    const baseY = Math.sin(baseAngle) * inner;
+    if (i === 0) ctx.moveTo(tipX, tipY);
+    else ctx.lineTo(tipX, tipY);
+    ctx.lineTo(baseX, baseY);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#f472b6';
+  ctx.beginPath();
+  ctx.arc(0, 0, radius * 0.34, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawStorm(ctx, x, y, spin) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(spin);
+  glow(ctx, '#a78bfa', 14);
+  ctx.fillStyle = '#c4b5fd';
+  ctx.beginPath();
+  ctx.moveTo(0, -13);
+  ctx.lineTo(5, -2);
+  ctx.lineTo(13, 0);
+  ctx.lineTo(5, 3);
+  ctx.lineTo(0, 13);
+  ctx.lineTo(-5, 3);
+  ctx.lineTo(-13, 0);
+  ctx.lineTo(-5, -2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#ede9fe';
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawShieldCell(ctx, x, y, pulse) {
+  ctx.save();
+  ctx.translate(x, y);
+  const bob = Math.sin(pulse * 2) * 3;
+  ctx.translate(0, bob);
+  glow(ctx, GREEN, 16);
+  ctx.strokeStyle = GREEN;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(0, 0, 13, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(52, 211, 153, 0.25)';
+  ctx.fill();
+  ctx.fillStyle = GREEN;
+  ctx.font = 'bold 15px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('+', 0, 1);
+  ctx.restore();
+}
+
+function drawShip(ctx, state) {
+  const ship = state.ship;
+  const blink = ship.invulnerable > 0 && Math.floor(state.time * 14) % 2 === 0;
+  ctx.save();
+  // Drawn at the ship's simulated position, in field units: this is the
+  // same point the collision checks in world.js use.
+  ctx.translate(ship.x, ship.y);
+  ctx.rotate(ship.angle);
+  if (blink) ctx.globalAlpha = 0.35;
+  // Engine flame.
+  const flame = 14 + Math.sin(state.time * 30) * 5 + Math.hypot(ship.vx, ship.vy) * 0.02;
+  glow(ctx, '#fb923c', 12);
+  ctx.fillStyle = '#f97316';
+  ctx.beginPath();
+  ctx.moveTo(-12, -5);
+  ctx.lineTo(-12 - flame, 0);
+  ctx.lineTo(-12, 5);
+  ctx.closePath();
+  ctx.fill();
+  // Hull: a swept light-skiff.
+  glow(ctx, CYAN, 18);
+  ctx.fillStyle = '#0891b2';
+  ctx.strokeStyle = CYAN;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(22, 0);
+  ctx.lineTo(-10, -13);
+  ctx.lineTo(-16, -5);
+  ctx.lineTo(-16, 5);
+  ctx.lineTo(-10, 13);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Cockpit.
+  ctx.fillStyle = '#ecfeff';
+  ctx.beginPath();
+  ctx.arc(6, 0, 4.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  // Shield ring when a shield is held.
+  if (state.shield) {
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    ctx.globalAlpha = 0.6 + 0.3 * Math.sin(state.time * 5);
+    glow(ctx, GREEN, 14);
+    ctx.strokeStyle = GREEN;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, SHIP.radius + 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawGate(ctx, state, width, height) {
+  // The Aurora Gate: a glowing ring that opens as the score approaches
+  // 1,200, then shines wide open on the win screen. It sits high on the
+  // screen (centre at 20% of the height) so it never covers the title
+  // text below it.
+  const cx = width / 2;
+  const cy = height * 0.20;
+  const progress = state.gateOpen ? 1 : state.gateProgress;
+  const radius = 36 + progress * 44;
+  const gradient = ctx.createRadialGradient(cx, cy, radius * 0.2, cx, cy, radius * 1.6);
+  gradient.addColorStop(0, `rgba(52, 211, 153, ${0.10 + progress * 0.35})`);
+  gradient.addColorStop(0.6, `rgba(34, 211, 238, ${0.08 + progress * 0.22})`);
+  gradient.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(cx - radius * 1.8, cy - radius * 1.8, radius * 3.6, radius * 3.6);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(state.time * 0.4);
+  glow(ctx, progress >= 1 ? GREEN : CYAN, 22);
+  ctx.strokeStyle = progress >= 1 ? GREEN : CYAN;
+  ctx.lineWidth = 3;
+  ctx.setLineDash([14, 10]);
+  ctx.beginPath();
+  ctx.arc(0, 0, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+  ctx.fillStyle = progress >= 1 ? GREEN : '#a5f3fc';
+  ctx.font = `bold ${progress >= 1 ? 20 : 15}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(progress >= 1 ? 'GATE OPEN' : `GATE ${Math.round(progress * 100)}%`, cx, cy);
+}
+
+function drawHud(ctx, state, best, width) {
+  const pad = 18;
+  ctx.textBaseline = 'alphabetic';
+  // Score, big and gold.
+  ctx.textAlign = 'left';
+  glow(ctx, GOLD, 10);
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 34px sans-serif';
+  ctx.fillText(String(state.score), pad, 44);
+  noGlow(ctx);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '14px sans-serif';
+  ctx.fillText(`BEST ${Math.max(best, state.score)}`, pad, 66);
+  // Combo badge.
+  if (state.combo > 1) {
+    ctx.textAlign = 'left';
+    glow(ctx, MAGENTA, 12);
+    ctx.fillStyle = MAGENTA;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText(`COMBO x${state.combo}`, pad, 96);
+    noGlow(ctx);
+  }
+  // Hearts, top right.
+  ctx.textAlign = 'right';
+  for (let i = 0; i < HEARTS; i += 1) {
+    const x = width - pad - i * 34;
+    const y = 32;
+    ctx.save();
+    ctx.translate(x, y);
+    if (i < state.hearts) {
+      glow(ctx, '#fb7185', 12);
+      ctx.fillStyle = '#fb7185';
+    } else {
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.35)';
+    }
+    ctx.beginPath();
+    ctx.moveTo(0, 8);
+    ctx.bezierCurveTo(-12, -4, -6, -12, 0, -5);
+    ctx.bezierCurveTo(6, -12, 12, -4, 0, 8);
+    ctx.fill();
+    ctx.restore();
+  }
+  // Level and dash, top centre-right.
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 17px sans-serif';
+  ctx.fillText(`LEVEL ${state.level}`, width - pad, 66);
+  const dashReady = state.ship.dashCooldown <= 0;
+  const dashFrac = dashReady ? 1 : 1 - state.ship.dashCooldown / SHIP.dashCooldown;
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.5)';
+  ctx.fillRect(width - pad - 110, 76, 110, 8);
+  ctx.fillStyle = dashReady ? CYAN : '#64748b';
+  ctx.fillRect(width - pad - 110, 76, 110 * dashFrac, 8);
+  ctx.fillStyle = dashReady ? CYAN : '#94a3b8';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(dashReady ? 'DASH READY' : 'DASH…', width - pad, 100);
+  if (state.shield) {
+    ctx.fillStyle = GREEN;
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText('SHIELD UP', width - pad, 120);
+  }
+  // Progress bar to the Aurora Gate, bottom centre.
+  const barWidth = 420;
+  const barX = (width - barWidth) / 2;
+  const barY = 688;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.fillText(`AURORA GATE  ${state.score} / ${WIN_SCORE}`, width / 2, barY - 8);
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.fillRect(barX, barY, barWidth, 10);
+  const gateGradient = ctx.createLinearGradient(barX, 0, barX + barWidth, 0);
+  gateGradient.addColorStop(0, CYAN);
+  gateGradient.addColorStop(1, GREEN);
+  ctx.fillStyle = gateGradient;
+  ctx.fillRect(barX, barY, barWidth * state.gateProgress, 10);
+}
+
+function panel(ctx, width, height) {
+  ctx.fillStyle = 'rgba(11, 16, 38, 0.72)';
+  ctx.fillRect(0, 0, width, height);
+}
+
+function bigTitle(ctx, text, y, width, color, size) {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  glow(ctx, color, 26);
+  ctx.fillStyle = color;
+  ctx.font = `bold ${size}px sans-serif`;
+  ctx.fillText(text, width / 2, y);
+  noGlow(ctx);
+}
+
+function drawTitle(ctx, state, best, width, height) {
+  panel(ctx, width, height);
+  drawGate(ctx, state, width, height);
+  bigTitle(ctx, 'LUMEN DRIFT', 250, width, CYAN, 72);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fbbf24';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText('Ride the solar storm. Gather the light.', width / 2, 305);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '19px sans-serif';
+  ctx.fillText('Arrows / WASD, mouse or drag to steer  •  SPACE, click or DASH to dash', width / 2, 360);
+  ctx.fillText('Collect star shards to reach 1,200 and open the Aurora Gate.', width / 2, 390);
+  ctx.fillText('Dodge void mines and storm shards — 3 hull hearts. P pauses.', width / 2, 420);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText(Math.floor(state.time * 2) % 2 === 0 ? '▶  PRESS ENTER OR TAP TO LAUNCH' : 'PRESS ENTER OR TAP TO LAUNCH', width / 2, 490);
+  if (best > 0) {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText(`BEST SCORE  ${best}`, width / 2, 540);
+  }
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '15px sans-serif';
+  ctx.fillText('A neon arcade game — no downloads, no sign-up, just drift.', width / 2, 640);
+}
+
+function drawPaused(ctx, width, height) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'PAUSED', 300, width, CYAN, 56);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '20px sans-serif';
+  ctx.fillText('Press P to keep drifting, or R to restart.', width / 2, 370);
+}
+
+function drawOver(ctx, state, best, width, height) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'THE STORM TOOK YOU', 250, width, MAGENTA, 54);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillText(`SCORE  ${state.score}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 330);
+  if (state.score >= best && state.score > 0) {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('★ NEW BEST SCORE ★', width / 2, 375);
+  }
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText('Press R or tap to drift again', width / 2, 450);
+}
+
+function drawWin(ctx, state, best, width, height) {
+  panel(ctx, width, height);
+  drawGate(ctx, state, width, height);
+  bigTitle(ctx, 'AURORA GATE OPEN!', 250, width, GREEN, 56);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fef9c3';
+  ctx.font = 'bold 26px sans-serif';
+  ctx.fillText(`You gathered ${WIN_SCORE} light and rode the storm home.`, width / 2, 320);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText(`SCORE  ${state.score}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 370);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText('Press R or tap to drift again', width / 2, 450);
+}
+
+function createRenderer(canvas) {
+  const ctx = canvas.getContext('2d');
+
+  // CSS-pixel size of the canvas box, plus the device pixel ratio used
+  // for a crisp backing store on phones (capped at 3 for speed).
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(320, Math.floor(rect.width));
+    const height = Math.max(240, Math.floor(rect.height));
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const backingWidth = Math.floor(width * dpr);
+    const backingHeight = Math.floor(height * dpr);
+    if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
+      canvas.width = backingWidth;
+      canvas.height = backingHeight;
+    }
+    return { width, height, dpr };
+  }
+
+  function draw(state, screen, best) {
+    const { width, height, dpr } = resize();
+    // Work in CSS pixels; the backing store is denser on hi-DPI screens.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Deep indigo sky, full screen (it also fills the letterbox bars).
+    const sky = ctx.createLinearGradient(0, 0, 0, height);
+    sky.addColorStop(0, '#0b1026');
+    sky.addColorStop(0.55, '#141b3d');
+    sky.addColorStop(1, '#1e1b4b');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, width, height);
+    drawNebula(ctx, width, height);
+
+    // Hit flash, full screen.
+    if (state.flashes > 0) {
+      ctx.fillStyle = `rgba(244, 114, 182, ${state.flashes * 0.25})`;
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    // The field, letterboxed with one uniform scale: everything below is
+    // drawn in field coordinates, so drawn position == simulated position.
+    const { scale, ox, oy } = viewTransform(width, height);
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
+    drawStars(ctx, state);
+
+    if (screen === SCREEN_TITLE) {
+      drawGate(ctx, state, FIELD.width, FIELD.height);
+    }
+
+    // Particles, under the entities.
+    for (const p of state.particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Trail ribbon.
+    for (let i = 0; i < state.trail.length; i += 1) {
+      const dot = state.trail[i];
+      ctx.globalAlpha = (dot.life / dot.maxLife) * 0.5 * (i / state.trail.length);
+      ctx.fillStyle = CYAN;
+      ctx.beginPath();
+      ctx.arc(dot.x, dot.y, 3 + 3 * (i / state.trail.length), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_OVER || screen === SCREEN_WIN) {
+      for (const s of state.shards) drawShard(ctx, s.x, s.y, s.spin, s.pulse);
+      for (const s of state.shields) drawShieldCell(ctx, s.x, s.y, s.pulse);
+      for (const m of state.mines) drawMine(ctx, m.x, m.y, m.radius, m.spin, m.pulse);
+      for (const s of state.storms) drawStorm(ctx, s.x, s.y, s.spin);
+      if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) drawShip(ctx, state);
+    }
+
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED) drawHud(ctx, state, best, FIELD.width);
+    if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height);
+    if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
+    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height);
+    if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height);
+    ctx.restore();
+    noGlow(ctx);
+  }
+
+  return { draw };
+}
+
+
+// ===== shots.js (inlined) =====
+// Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win.
+// Each scene plays the real rules forward from a fresh world for a fixed
+// number of steps, steered by a simple autopilot (chase the nearest shard,
+// keep clear of mines and storm shards), so the frame is what a real game
+// looks like and the same seed always gives the same frame.
+//
+// - start: the title screen over a live, drifting field.
+// - play: a busy mid-game — score ~340, combo x3, 2 hearts left.
+// - end: the autopilot flies carelessly and the storm takes the skiff.
+// - win: the gate opens at 1,200 points.
+
+
+
+
+const START_SECONDS = 6;
+const PLAY_TARGET = 340;
+const END_LIMIT_SECONDS = 600;
+
+/** Steer toward `target` while dodging the nearest hazard in the way. */
+function autopilot(state, careless) {
+  const ship = state.ship;
+  // Nearest shard to chase.
+  let shard = null;
+  let shardDist = Infinity;
+  for (const s of state.shards) {
+    const d = Math.hypot(s.x - ship.x, s.y - ship.y);
+    if (d < shardDist) { shardDist = d; shard = s; }
+  }
+  let tx = shard ? shard.x : state.ship.x;
+  let ty = shard ? shard.y : state.ship.y;
+  // Dodge: if a mine or storm is close and ahead, veer away from it.
+  const horizon = careless ? 60 : 130;
+  for (const list of [state.mines, state.storms]) {
+    for (const e of list) {
+      const d = Math.hypot(e.x - ship.x, e.y - ship.y);
+      if (d < horizon) {
+        const away = Math.atan2(ship.y - e.y, ship.x - e.x);
+        tx = ship.x + Math.cos(away) * 160;
+        ty = ship.y + Math.sin(away) * 160;
+      }
+    }
+  }
+  const dx = tx - ship.x;
+  const dy = ty - ship.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 10) return { x: 0, y: 0 };
+  return { x: dx / dist, y: dy / dist };
+}
+
+/** Set `world` to the named scene and return the screen to draw over it. */
+function stageShot(name, world) {
+  world.reset();
+  const state = world.state;
+  if (name === 'win') {
+    // Play forward until the gate opens, then let the victory settle.
+    for (let i = 0; i < 60 * 240; i += 1) {
+      const events = world.step(STEP, autopilot(state, false), null, false);
+      if (events & EVENT_WIN) break;
+    }
+    state.score = Math.max(state.score, WIN_SCORE);
+    state.gateOpen = true;
+    state.gateProgress = 1;
+    for (let i = 0; i < 30; i += 1) world.step(STEP, { x: 0, y: 0 }, null, false);
+    return { screen: SCREEN_WIN, best: state.score };
+  }
+  if (name === 'play') {
+    for (let i = 0; i < 60 * 240; i += 1) {
+      world.step(STEP, autopilot(state, false), null, false);
+      if (state.score >= PLAY_TARGET) break;
+    }
+    // Let the field settle for a moment, then stage the exact HUD the
+    // brief asks for: ~340 points, combo x3, two hearts. The autopilot
+    // keeps the skiff alive; the numbers below are the scene's floor.
+    for (let i = 0; i < 12; i += 1) world.step(STEP, autopilot(state, false), null, false);
+    state.score = PLAY_TARGET;
+    state.combo = 3;
+    state.comboCount = 6;
+    state.bestCombo = Math.max(3, state.bestCombo);
+    state.hearts = 2;
+    state.gateProgress = Math.min(1, state.score / WIN_SCORE);
+    return { screen: SCREEN_PLAY, best: state.score };
+  }
+  if (name === 'end') {
+    // A reckless pilot: it wanders the middle of the field, never chases
+    // a shard and never dodges, so the storm catches it early with a
+    // modest score — a real game over, not a high-score run cut short.
+    for (let i = 0; i < END_LIMIT_SECONDS / STEP; i += 1) {
+      const wander = {
+        x: Math.sin(state.time * 0.7) * 0.4,
+        y: Math.cos(state.time * 0.5) * 0.3,
+      };
+      const events = world.step(STEP, wander, null, false);
+      if (events & EVENT_OVER) break;
+    }
+    // Guarantee the game-over frame: if the reckless pilot survived the
+    // whole limit (it should not), drain the hearts directly.
+    if (state.hearts > 0) state.hearts = 0;
+    for (let i = 0; i < 20; i += 1) world.step(STEP, { x: 0, y: 0 }, null, false);
+    return { screen: SCREEN_OVER, best: state.score };
+  }
+  // start (and any unknown name): a live field behind the title.
+  for (let i = 0; i < START_SECONDS / STEP; i += 1) {
+    world.step(STEP, { x: 0, y: 0 }, null, false);
+  }
+  return { screen: SCREEN_TITLE, best: 0 };
+}
+
+
+// ===== main.js (inlined) =====
+// Lumen Drift — boot and the one loop. Input is read every frame, the world
+// advances in fixed 1/60 s steps (several in a slow frame, none in a fast
+// one), and the renderer paints what is there. The game moves between five
+// screens: title, play, paused, game over and win.
+//
+// ?seed=N fixes the storm's pattern. ?shot=start|play|end|win (with
+// &seed=N) stages that scene instead of running the loop, paints it twice
+// and sets window.__shotReady for a screenshot. ?debug=win starts a live
+// game one shard away from the Aurora Gate, for testing the win path.
+
+
+
+
+
+
+
+
+/** The longest frame the loop catches up on; a longer stall is dropped. */
+const MAX_FRAME = 0.25;
+
+const params = new URLSearchParams(window.location.search);
+const shot = params.get('shot');
+const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+
+const canvas = document.getElementById('game');
+const status = document.getElementById('status');
+const world = createWorld(createRandom(seed));
+const renderer = createRenderer(canvas);
+const audio = createAudio();
+
+function readBest() {
+  try {
+    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveBest(value) {
+  try {
+    window.localStorage.setItem(BEST_KEY, String(value));
+  } catch {
+    // Storage can be off (private windows): the best then lasts this visit.
+  }
+}
+
+function runShot(name) {
+  const scene = stageShot(name, world);
+  let painted = 0;
+  function paint() {
+    renderer.draw(world.state, scene.screen, scene.best);
+    painted += 1;
+    if (painted < 2) requestAnimationFrame(paint);
+    else window.__shotReady = true;
+  }
+  requestAnimationFrame(paint);
+}
+
+function runGame() {
+  const input = createInput(canvas);
+  // On-screen touch buttons (shown only on touch devices by CSS).
+  const dashBtn = document.getElementById('btn-dash');
+  if (dashBtn) input.bindButton(dashBtn, ACTION_DASH);
+  const pauseBtn = document.getElementById('btn-pause');
+  if (pauseBtn) input.bindButton(pauseBtn, ACTION_PAUSE);
+  let screen = SCREEN_TITLE;
+  let best = readBest();
+  let accumulator = 0;
+  let last = performance.now();
+
+  // Debug hook for testing the win path: one shard from the gate.
+  if (params.get('debug') === 'win') {
+    world.state.score = WIN_SCORE - 10;
+    world.state.gateProgress = (WIN_SCORE - 10) / WIN_SCORE;
+    screen = SCREEN_PLAY;
+  }
+
+  function announce(text) {
+    status.textContent = text;
+  }
+
+  function startGame() {
+    world.reset();
+    screen = SCREEN_PLAY;
+    input.clearPressed();
+    audio.unlock();
+    audio.click();
+    announce('Lumen Drift started. Collect star shards, dodge the mines.');
+  }
+
+  function endGame(won) {
+    screen = won ? SCREEN_WIN : SCREEN_OVER;
+    if (world.state.score > best) {
+      best = world.state.score;
+      saveBest(best);
+    }
+    if (won) audio.win();
+    else audio.over();
+    announce(won
+      ? `You win! Aurora Gate open with ${world.state.score} points.`
+      : `Game over. Score ${world.state.score}. Press R to drift again.`);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    window.__lumen.screenName = screen;
+    const elapsed = Math.min(MAX_FRAME, (now - last) / 1000);
+    last = now;
+
+    if (input.consume(ACTION_MUTE)) {
+      const muted = audio.toggleMute();
+      announce(muted ? 'Sound muted.' : 'Sound on.');
+    }
+
+    if (screen === SCREEN_TITLE) {
+      // The title floats over a live drifting field.
+      world.step(STEP, { x: 0, y: 0 }, null, false);
+      if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) startGame();
+    } else if (screen === SCREEN_PLAY) {
+      if (input.consume(ACTION_PAUSE)) {
+        screen = SCREEN_PAUSED;
+        announce('Paused. Press P to resume.');
+      } else {
+        const dash = input.consume(ACTION_DASH);
+        accumulator += elapsed;
+        while (accumulator >= STEP) {
+          accumulator -= STEP;
+          const events = world.step(STEP, input.steer(), input.pointer(), dash);
+          if (events & EVENT_PICKUP) audio.pickup(world.state.combo);
+          if (events & EVENT_DASH) audio.dash();
+          if (events & EVENT_SHIELD) audio.shield();
+          if (events & EVENT_HIT) audio.hit();
+          if (events & EVENT_WIN) { endGame(true); break; }
+          if (events & EVENT_OVER) { endGame(false); break; }
+        }
+      }
+    } else if (screen === SCREEN_PAUSED) {
+      if (input.consume(ACTION_PAUSE) || input.consume(ACTION_CONFIRM)) {
+        screen = SCREEN_PLAY;
+        input.clearPressed();
+        announce('Resumed.');
+      } else if (input.consume(ACTION_RESTART)) {
+        startGame();
+      }
+    } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
+      if (input.consume(ACTION_RESTART) || input.consume(ACTION_CONFIRM)) startGame();
+    }
+
+    renderer.draw(world.state, screen, best);
+  }
+
+  announce('Lumen Drift. Press Enter or click to launch.');
+  requestAnimationFrame(frame);
+}
+
+// Expose the live state for automated play-testing (harmless in play).
+// `screen` is a window global, so the current screen lives under
+// `screenName` instead; the frame loop below keeps it up to date.
+window.__lumen = {
+  state: world.state,
+  screenName: SCREEN_TITLE,
+};
+
+if (shot) runShot(shot);
+else runGame();
+
+</script>
+</body>
+</html>
