@@ -165,6 +165,14 @@ const ENDLESS_STORM_CAP_MAX = 6;
 const ENDLESS_RATE_LEVEL_MAX = 9;
 const ENDLESS_SPEED_MAX = 2.0;
 
+// Shard magnet tuning (see upgrades.js): the innate pull radius is ~1.5x
+// the ship's width, so the magnet forgives a near-miss on aim instead of
+// vacuuming the field. Pull accelerates toward the ship and tops out
+// faster than the ship itself, so a shard streaks in on a short arc.
+const MAGNET_BASE_RADIUS = 48;
+const MAGNET_PULL_ACCEL = 1400;
+const MAGNET_PULL_MAX_SPEED = 560;
+
 // Best score is kept in local storage under this key.
 const BEST_KEY = 'lumen-drift-best';
 // Lifetime star shards (all runs) and the chosen ship skin.
@@ -228,8 +236,14 @@ const UPGRADE_GOLDEN = 'golden';
 const MAX_HEARTS = 5;
 // Dash cooldown never drops below this, however many SWIFT DASH stacks.
 const DASH_COOLDOWN_FLOOR = 0.6;
-// Magnet pull radius per stack (index = stacks held; 0 = no magnet).
-const MAGNET_RADII = [0, 160, 240, 320];
+// Magnet pull radius per stack (index = stacks held). The innate radius
+// (0 stacks) is MAGNET_BASE_RADIUS: ~1.5x the ship's width, so the magnet
+// forgives a near-miss on aim. Each stack adds ~+30-35% — the Vampire
+// Survivors-proven +25%/rank step, rounded so the radius stays a whole
+// number of field units. A maxed magnet (3 stacks) reaches 144 px: a
+// visible help, never a vacuum. Compare the old values (160/240/320),
+// which pulled shards in from across the screen.
+const MAGNET_RADII = [48, 80, 112, 144];
 // Extra points per shard, per GOLDEN SHARDS stack.
 const GOLDEN_POINTS = 5;
 
@@ -333,9 +347,11 @@ function magnetRadiusFor(state) {
   return MAGNET_RADII[stacksOf(state, UPGRADE_MAGNET)] || 0;
 }
 
-/** Hangar magnet: +80 pickup radius per TRACTOR MAGNET level. */
+/** Hangar magnet: +30 pickup radius per TRACTOR MAGNET level (was +80 —
+the old step vacuumed the field; the new step keeps the magnet a choice,
+not a given). */
 function hangarMagnetRadius(state) {
-  return 80 * (state.hangar?.magnet ?? 0);
+  return 30 * (state.hangar?.magnet ?? 0);
 }
 
 // --- Picking ---------------------------------------------------------------
@@ -433,7 +449,12 @@ function createWorld(random, hangarLevels = {}) {
     upgrades: freshUpgrades(),
     shardsCollected: 0,
     goldenCollected: 0,
+    nearMisses: 0,
     magnetRadius: 0,
+    // Seconds left of the faint ring that visualises the magnet radius
+    // once, right after it grows (a new SHARD MAGNET stack).
+    magnetFlash: 0,
+    prevMagnetRadius: null,
     shardBonus: 0,
     pendingLevelUps: 0,
     level: 1,
@@ -548,6 +569,10 @@ function createWorld(random, hangarLevels = {}) {
       pulse: random.range(0, Math.PI * 2),
       // Rare variable reward: ~1 in 30 shards is golden, worth 50 points.
       golden: random.next() < 1 / 30,
+      // Magnet pull velocity (world units/s); the magnet block below
+      // accelerates it toward the ship, the drift loop applies it.
+      pvx: 0,
+      pvy: 0,
     });
   }
 
@@ -623,7 +648,10 @@ function createWorld(random, hangarLevels = {}) {
     state.maxHearts = HEARTS + (state.hangar.hull || 0);
     state.upgrades = freshUpgrades();
     state.shardsCollected = 0;
+    state.nearMisses = 0;
     state.magnetRadius = 0;
+    state.magnetFlash = 0;
+    state.prevMagnetRadius = null;
     state.shardBonus = 0;
     state.pendingLevelUps = 0;
     state.level = 1;
@@ -666,6 +694,16 @@ function createWorld(random, hangarLevels = {}) {
     // magnet plus the in-run SHARD MAGNET stacks.
     state.magnetRadius = hangarMagnetRadius(state) + magnetRadiusFor(state);
     state.shardBonus = shardPointsFor(state) - SHARD_POINTS;
+    // The magnet ring flashes once when the radius grows mid-run (a new
+    // SHARD MAGNET stack) — it teaches the radius, then hides. The first
+    // step of a run seeds the previous radius instead of flashing.
+    if (state.prevMagnetRadius === null) {
+      state.prevMagnetRadius = state.magnetRadius;
+    } else if (state.magnetRadius > state.prevMagnetRadius) {
+      state.magnetFlash = 1.5;
+      state.prevMagnetRadius = state.magnetRadius;
+    }
+    state.magnetFlash = Math.max(0, state.magnetFlash - dt);
     const ship = state.ship;
 
     // --- Spawning ---------------------------------------------------------
@@ -757,23 +795,35 @@ function createWorld(random, hangarLevels = {}) {
     state.trail = state.trail.filter((dot) => dot.life > 0);
 
     // --- Entities drift ---------------------------------------------------
-    // SHARD MAGNET: shards inside the magnet radius are pulled toward the
-    // skiff (320 px/s, never overshooting it) before they drift on.
+    // SHARD MAGNET: shards inside the magnet radius accelerate toward the
+    // skiff (up to MAGNET_PULL_MAX_SPEED, faster than the ship) instead
+    // of teleporting at a constant speed — a short streaking arc, not a
+    // vacuum. The pull velocity fades fast outside the radius, so a shard
+    // that slips past keeps its drift. Mines are never pulled.
     if (state.magnetRadius > 0) {
       for (const s of state.shards) {
         const dx = ship.x - s.x;
         const dy = ship.y - s.y;
         const dist = Math.hypot(dx, dy);
         if (dist > 1 && dist < state.magnetRadius) {
-          const pull = Math.min(dist, 320 * dt);
-          s.x += (dx / dist) * pull;
-          s.y += (dy / dist) * pull;
+          s.pvx = (s.pvx ?? 0) + (dx / dist) * MAGNET_PULL_ACCEL * dt;
+          s.pvy = (s.pvy ?? 0) + (dy / dist) * MAGNET_PULL_ACCEL * dt;
+          const pv = Math.hypot(s.pvx, s.pvy);
+          if (pv > MAGNET_PULL_MAX_SPEED) {
+            s.pvx = (s.pvx / pv) * MAGNET_PULL_MAX_SPEED;
+            s.pvy = (s.pvy / pv) * MAGNET_PULL_MAX_SPEED;
+          }
+        } else {
+          s.pvx = (s.pvx ?? 0) * 0.8;
+          s.pvy = (s.pvy ?? 0) * 0.8;
         }
       }
     }
     for (const s of state.shards) {
       s.y += s.vy * dt;
       s.x += s.vx * dt + Math.sin(state.time * 2 + s.pulse) * 12 * dt;
+      s.x += (s.pvx ?? 0) * dt;
+      s.y += (s.pvy ?? 0) * dt;
       s.spin += s.spinSpeed * dt;
       s.pulse += dt;
     }
@@ -823,6 +873,7 @@ function createWorld(random, hangarLevels = {}) {
           const hitDist = SHIP.radius * 0.8 + e.radius * 0.85;
           if (d >= hitDist && d < hitDist + 40) {
             e.nearMissed = true;
+            state.nearMisses += 1;
             state.score += 5;
             state.gateProgress = Math.min(1, state.score / WIN_SCORE);
             state.floaters.push({
@@ -991,31 +1042,34 @@ function createWorld(random, hangarLevels = {}) {
 
 const DEFAULT_SKIN_ID = 'cyan';
 
-// Unlock thresholds: a normal winning run collects roughly 60-120 shards,
-// so these are ~5, ~15, ~30, ~50 and ~80 runs in.
+// Unlock thresholds: the first skin (EMBER) is earnable on day 1-2
+// (~2-3 good runs), so the first trophy lands fast; later skins space
+// out by gates, days and score milestones. Skins are milestone trophies,
+// not shop filler — the next one is always visible-but-locked as the
+// home-screen goal.
 const SKINS = [
   {
     id: 'cyan', name: 'CYAN', unlock: 0,
     hull: '#0891b2', glow: '#22d3ee', flame: '#f97316', flameGlow: '#fb923c', trail: '#22d3ee',
   },
   {
-    id: 'ember', name: 'EMBER', unlock: 500,
+    id: 'ember', name: 'EMBER', unlock: 200,
     hull: '#c2410c', glow: '#fb923c', flame: '#fbbf24', flameGlow: '#fb923c', trail: '#fb923c',
   },
   {
-    id: 'violet', name: 'VIOLET', unlock: 1500,
+    id: 'violet', name: 'VIOLET', unlock: 1000,
     hull: '#6d28d9', glow: '#a78bfa', flame: '#e879f9', flameGlow: '#c084fc', trail: '#a78bfa',
   },
   {
-    id: 'aurora', name: 'AURORA', unlock: 3000,
+    id: 'aurora', name: 'AURORA', unlock: 2500,
     hull: '#059669', glow: '#34d399', flame: '#6ee7b7', flameGlow: '#34d399', trail: '#34d399',
   },
   {
-    id: 'solar', name: 'SOLAR', unlock: 5000,
+    id: 'solar', name: 'SOLAR', unlock: 4500,
     hull: '#b45309', glow: '#fbbf24', flame: '#fde68a', flameGlow: '#f59e0b', trail: '#fbbf24',
   },
   {
-    id: 'nova', name: 'NOVA', unlock: 8000,
+    id: 'nova', name: 'NOVA', unlock: 7500,
     hull: '#be185d', glow: '#f472b6', flame: '#67e8f9', flameGlow: '#22d3ee', trail: '#f472b6',
   },
 ];
@@ -1459,6 +1513,14 @@ function createAudio() {
       muted = !muted;
       return muted;
     },
+    // The settings panel drives these (muted is persisted in the save).
+    setMuted(value) {
+      muted = !!value;
+      return muted;
+    },
+    isMuted() {
+      return muted;
+    },
   };
 }
 
@@ -1470,18 +1532,51 @@ function createAudio() {
 // and is out of scope. Loads are defensive — a corrupt or old save falls
 // back to a fresh one, seeded from the legacy best/shards keys.
 //
-// Missions reward shards toward ship skins; the streak bonus grows with
-// each consecutive day (day 7 is the milestone). Dates are local calendar
-// dates (YYYY-MM-DD), so a missed day breaks the streak.
+// Daily rewards: a 7-day escalating calendar (day 7 is the big one). The
+// streak NEVER resets to zero on one missed day — one free miss per
+// 7-day cycle (a streak-freeze) keeps it alive; only two missed days in
+// a row restart the count at 1. The reward is claimed from the calendar
+// panel (shown on day-2 opens, or from the flame badge) — it is never
+// silently auto-granted, so the calendar is the reason to open tomorrow.
+//
+// Missions: three a day, one per tier (easy / medium / hard), picked
+// deterministically by date from a pool — completable in one session,
+// rewards above the passive earn rate, finishing all three pays a bonus
+// chest (+100 shards), and one mission can be rerolled per day.
 const SAVE_KEY = 'lumen-drift-save';
-const SAVE_VERSION = 2;
+const SAVE_VERSION = 3;
 
-// Daily missions: fixed set, progress is counted per run and banked when
-// the run ends. `stat` names the run-stat field they read.
+// Daily-reward calendar: shards per cycle day (day 7 is visibly best).
+const DAILY_REWARDS = [10, 15, 20, 30, 40, 50, 100];
+// Bonus chest for completing all three daily missions.
+const ALL_MISSIONS_BONUS = 100;
+// One mission reroll per day.
+const DAILY_REROLLS = 1;
+
+// Daily missions, one per tier each day. `stat` names the run-stat field
+// they read; every mission is a single-run achievement, so progress is
+// the best run of the day.
+const MISSION_POOLS = {
+  easy: [
+    { id: 'shards30', name: 'Collect 30 shards', stat: 'shards', target: 30, reward: 25, tier: 'easy' },
+    { id: 'score300', name: 'Score 300 in one run', stat: 'score', target: 300, reward: 25, tier: 'easy' },
+    { id: 'dash5', name: 'Dash 5 times', stat: 'dashes', target: 5, reward: 25, tier: 'easy' },
+  ],
+  medium: [
+    { id: 'shards50', name: 'Collect 50 shards', stat: 'shards', target: 50, reward: 40, tier: 'medium' },
+    { id: 'level3', name: 'Reach level 3', stat: 'level', target: 3, reward: 40, tier: 'medium' },
+    { id: 'near3', name: 'Score 3 near-misses', stat: 'nearMisses', target: 3, reward: 40, tier: 'medium' },
+  ],
+  hard: [
+    { id: 'dash10', name: 'Dash 10 times', stat: 'dashes', target: 10, reward: 75, tier: 'hard' },
+    { id: 'survive90', name: 'Survive 90 seconds', stat: 'playSeconds', target: 90, reward: 75, tier: 'hard' },
+    { id: 'level5', name: 'Reach level 5', stat: 'level', target: 5, reward: 75, tier: 'hard' },
+  ],
+};
+
+/** Every mission definition, flat (all tiers). */
 const MISSION_DEFS = [
-  { id: 'shards', name: 'Collect 50 shards', stat: 'shards', target: 50, reward: 25 },
-  { id: 'level', name: 'Reach level 3', stat: 'level', target: 3, reward: 25 },
-  { id: 'dash', name: 'Dash 10 times', stat: 'dashes', target: 10, reward: 50 },
+  ...MISSION_POOLS.easy, ...MISSION_POOLS.medium, ...MISSION_POOLS.hard,
 ];
 
 function localDate(date = new Date()) {
@@ -1497,13 +1592,31 @@ function shiftDate(dateStr, days) {
   return localDate(date);
 }
 
+// Small deterministic hash of a string (for the daily mission pick).
+function hashStr(text) {
+  let h = 0;
+  for (let i = 0; i < text.length; i += 1) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+/** One mission per tier for the given date, deterministic across loads. */
+function pickMissionsFor(dateStr) {
+  const h = hashStr(dateStr);
+  return ['easy', 'medium', 'hard'].map((tier, i) => {
+    const pool = MISSION_POOLS[tier];
+    return pool[(h + i * 7) % pool.length];
+  });
+}
+
 function freshMissions(dateStr) {
   return {
     date: dateStr,
-    list: MISSION_DEFS.map((def) => ({
+    list: pickMissionsFor(dateStr).map((def) => ({
       id: def.id, name: def.name, target: def.target, reward: def.reward,
-      progress: 0, done: false,
+      tier: def.tier, progress: 0, done: false,
     })),
+    rerollsUsed: 0,
+    allBonusPaid: false,
   };
 }
 
@@ -1523,14 +1636,36 @@ function freshSave(today) {
     // True once the player has beaten the Aurora Gate: endless mode is
     // offered on every win screen after that.
     endlessUnlocked: false,
-    streak: { lastDate: null, count: 0, visitedDays: [] },
+    // freeMissUsed: the streak-freeze — one missed day per 7-day cycle
+    // is forgiven instead of breaking the streak.
+    streak: { lastDate: null, count: 0, visitedDays: [], freeMissUsed: false },
+    // The daily reward is CLAIMED from the calendar panel, never
+    // auto-granted: pendingReward/pendingDate hold today's unclaimed
+    // reward, lastClaimDate the last day it was claimed.
+    dailyReward: { lastClaimDate: null, pendingReward: 0, pendingDate: null },
     missions: freshMissions(today),
+    // One-time teaching cues already shown (first-run steering/dash).
+    ftue: { dashCueShown: false },
+    // Player settings (persisted).
+    settings: { muted: false, reduceShake: false },
   };
 }
 
-function isSaveShape(save) {
+function isSaveShapeV3(save) {
   return save && typeof save === 'object'
-    && save.version === SAVE_VERSION
+    && save.version === 3
+    && Array.isArray(save.top5) && Array.isArray(save.history)
+    && save.lifetime && typeof save.lifetime === 'object'
+    && typeof save.shardBalance === 'number'
+    && save.hangar && typeof save.hangar === 'object'
+    && typeof save.endlessUnlocked === 'boolean'
+    && save.streak && typeof save.streak === 'object'
+    && save.missions && Array.isArray(save.missions.list);
+}
+
+function isSaveShapeV2(save) {
+  return save && typeof save === 'object'
+    && save.version === 2
     && Array.isArray(save.top5) && Array.isArray(save.history)
     && save.lifetime && typeof save.lifetime === 'object'
     && typeof save.shardBalance === 'number'
@@ -1554,13 +1689,81 @@ function isSaveShapeV1(save) {
  * Migrate a v1 save to v2. Nothing earned is lost: the spendable purse
  * starts at the full lifetime total (every shard the player ever earned
  * is theirs to spend), the hangar starts empty, endless starts locked.
+ * (The loader chains this into migrateSaveV2toV3, so a v1 blob ends up
+ * at the current version.)
  */
 function migrateSave(save) {
-  const migrated = { ...save, version: SAVE_VERSION };
+  const migrated = { ...save, version: 2 };
   migrated.hangar = { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0 };
   migrated.shardBalance = Math.max(0, save.lifetime.shards || 0);
   migrated.endlessUnlocked = false;
   return migrated;
+}
+
+// Old v2 mission ids -> their v3 tiered equivalents (same stat/target).
+const MISSION_ID_MAP = { shards: 'shards50', level: 'level3', dash: 'dash10' };
+
+/**
+ * Migrate a v2 save to v3. Nothing earned is lost: the streak, best,
+ * top-5, hangar and shard counters carry over untouched. Today's
+ * missions translate to their tiered equivalents with progress kept
+ * (a fresh tiered set is picked tomorrow); the daily reward starts
+ * unclaimed for today, and the streak-freeze starts unused.
+ */
+function migrateSaveV2toV3(save) {
+  const migrated = { ...save, version: SAVE_VERSION };
+  migrated.streak = {
+    lastDate: save.streak.lastDate ?? null,
+    count: save.streak.count ?? 0,
+    visitedDays: Array.isArray(save.streak.visitedDays) ? save.streak.visitedDays : [],
+    freeMissUsed: false,
+  };
+  migrated.dailyReward = { lastClaimDate: null, pendingReward: 0, pendingDate: null };
+  const oldList = Array.isArray(save.missions?.list) ? save.missions.list : [];
+  const translated = oldList.map((m) => {
+    const def = MISSION_DEFS.find((d) => d.id === (MISSION_ID_MAP[m.id] || m.id));
+    if (!def) return null;
+    return {
+      id: def.id, name: def.name, target: def.target, reward: def.reward,
+      tier: def.tier, progress: Math.min(def.target, m.progress || 0), done: !!m.done,
+    };
+  }).filter(Boolean);
+  // A v2 day always had exactly 3 missions; if any failed to translate,
+  // fill the missing tiers from today's deterministic pick.
+  const haveTiers = new Set(translated.map((m) => m.tier));
+  for (const def of pickMissionsFor(save.missions?.date ?? localDate())) {
+    if (translated.length >= 3) break;
+    if (haveTiers.has(def.tier)) continue;
+    translated.push({
+      id: def.id, name: def.name, target: def.target, reward: def.reward,
+      tier: def.tier, progress: 0, done: false,
+    });
+    haveTiers.add(def.tier);
+  }
+  migrated.missions = {
+    date: save.missions?.date ?? localDate(),
+    list: translated.slice(0, 3),
+    rerollsUsed: 0,
+    allBonusPaid: translated.length === 3 && translated.every((m) => m.done),
+  };
+  migrated.ftue = { dashCueShown: false };
+  migrated.settings = { muted: false, reduceShake: false };
+  return migrated;
+}
+
+/** Fill any v3 field a hand-edited or partial blob is missing. */
+function fillDefaults(save) {
+  const fresh = freshSave(save.missions?.date ?? localDate());
+  if (!save.streak || typeof save.streak !== 'object') save.streak = fresh.streak;
+  if (typeof save.streak.freeMissUsed !== 'boolean') save.streak.freeMissUsed = false;
+  if (!Array.isArray(save.streak.visitedDays)) save.streak.visitedDays = [];
+  if (!save.dailyReward || typeof save.dailyReward !== 'object') save.dailyReward = fresh.dailyReward;
+  if (!save.missions || typeof save.missions !== 'object') save.missions = fresh.missions;
+  if (typeof save.missions.rerollsUsed !== 'number') save.missions.rerollsUsed = 0;
+  if (typeof save.missions.allBonusPaid !== 'boolean') save.missions.allBonusPaid = false;
+  if (!save.ftue || typeof save.ftue !== 'object') save.ftue = fresh.ftue;
+  if (!save.settings || typeof save.settings !== 'object') save.settings = fresh.settings;
+  return save;
 }
 
 /**
@@ -1574,8 +1777,9 @@ function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
     const raw = storage.getItem(SAVE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (isSaveShape(parsed)) save = parsed;
-      else if (isSaveShapeV1(parsed)) save = migrateSave(parsed);
+      if (isSaveShapeV3(parsed)) save = fillDefaults(parsed);
+      else if (isSaveShapeV2(parsed)) save = migrateSaveV2toV3(parsed);
+      else if (isSaveShapeV1(parsed)) save = migrateSaveV2toV3(migrateSave(parsed));
     }
   } catch {
     save = null;
@@ -1602,32 +1806,89 @@ function saveSave(storage, save) {
   }
 }
 
+/** Cycle day (1-7) for a streak count: day 8 starts a fresh cycle. */
+function cycleDayFor(count) {
+  return ((Math.max(1, count) - 1) % 7) + 1;
+}
+
+/** Shards the daily reward pays on a given cycle day (1-7). */
+function dailyRewardFor(cycleDay) {
+  return DAILY_REWARDS[Math.min(7, Math.max(1, cycleDay)) - 1];
+}
+
 /**
- * Touch the daily streak for today. Returns { bonus, isNewDay, milestone,
- * count }: the shard bonus for coming back (10 per streak day, capped at
- * 100; day 7+ is the milestone). A missed day resets the count to 1.
+ * Touch the daily streak for today. Returns { reward, cycleDay, isNewDay,
+ * milestone, count, forgiven }: the reward is NOT granted here — it waits
+ * in save.dailyReward.pendingReward for the player to claim it from the
+ * calendar panel (see claimDailyReward). One missed day per 7-day cycle
+ * is forgiven (forgiven: true, the streak-freeze is spent); two missed
+ * days in a row restart the count at 1. The streak never reads 0 after
+ * a day of play — a restart still counts today as day 1.
  */
 function touchStreak(save, today) {
   if (save.streak.lastDate === today) {
-    return { bonus: 0, isNewDay: false, milestone: false, count: save.streak.count };
+    return {
+      reward: save.dailyReward.pendingReward || 0,
+      cycleDay: cycleDayFor(save.streak.count),
+      isNewDay: false,
+      milestone: save.streak.count >= 7,
+      count: save.streak.count,
+      forgiven: false,
+    };
   }
   const yesterday = shiftDate(today, -1);
-  const continued = save.streak.lastDate === yesterday;
-  save.streak.count = continued ? save.streak.count + 1 : 1;
+  const twoDaysAgo = shiftDate(today, -2);
+  let forgiven = false;
+  if (save.streak.lastDate === yesterday) {
+    save.streak.count += 1;
+  } else if (save.streak.lastDate === twoDaysAgo && !save.streak.freeMissUsed) {
+    // One missed day, freeze unspent: the streak survives.
+    save.streak.count += 1;
+    save.streak.freeMissUsed = true;
+    forgiven = true;
+  } else {
+    save.streak.count = 1;
+    save.streak.freeMissUsed = false;
+  }
   save.streak.lastDate = today;
   if (!save.streak.visitedDays.includes(today)) {
     save.streak.visitedDays.push(today);
     save.streak.visitedDays = save.streak.visitedDays.slice(-14);
   }
-  const bonus = Math.min(10 * save.streak.count, 100);
-  save.lifetime.shards += bonus;
-  save.shardBalance = (save.shardBalance ?? 0) + bonus;
+  // A fresh cycle refreshes the freeze.
+  const cycleDay = cycleDayFor(save.streak.count);
+  if (cycleDay === 1) save.streak.freeMissUsed = false;
+  const reward = dailyRewardFor(cycleDay);
+  save.dailyReward.pendingReward = reward;
+  save.dailyReward.pendingDate = today;
   return {
-    bonus,
+    reward,
+    cycleDay,
     isNewDay: true,
     milestone: save.streak.count >= 7,
     count: save.streak.count,
+    forgiven,
   };
+}
+
+/**
+ * Claim today's daily reward from the calendar panel. Grants the pending
+ * reward once; a second claim the same day, or a claim with nothing
+ * pending, pays nothing. Returns { claimed, reward }.
+ */
+function claimDailyReward(save, today) {
+  if (save.dailyReward.pendingDate !== today
+    || save.dailyReward.lastClaimDate === today
+    || !(save.dailyReward.pendingReward > 0)) {
+    return { claimed: false, reward: 0 };
+  }
+  const reward = save.dailyReward.pendingReward;
+  save.lifetime.shards += reward;
+  save.shardBalance = (save.shardBalance ?? 0) + reward;
+  save.dailyReward.lastClaimDate = today;
+  save.dailyReward.pendingReward = 0;
+  save.dailyReward.pendingDate = null;
+  return { claimed: true, reward };
 }
 
 /**
@@ -1681,7 +1942,9 @@ function recordRun(save, run, opts = {}) {
 
 /**
  * Bank the run's stats into today's missions. Returns the missions that
- * were just completed (each pays its shard reward immediately).
+ * were just completed (each pays its shard reward immediately). When the
+ * third mission completes, the all-missions bonus chest (+100 shards)
+ * pays once and is reported as a synthetic completion entry.
  */
 function updateMissions(save, run) {
   const completed = [];
@@ -1697,7 +1960,41 @@ function updateMissions(save, run) {
       completed.push({ id: mission.id, name: mission.name, reward: mission.reward });
     }
   }
+  if (save.missions.list.length === 3
+    && save.missions.list.every((m) => m.done)
+    && !save.missions.allBonusPaid) {
+    save.missions.allBonusPaid = true;
+    save.lifetime.shards += ALL_MISSIONS_BONUS;
+    save.shardBalance = (save.shardBalance ?? 0) + ALL_MISSIONS_BONUS;
+    completed.push({ id: 'all', name: 'All 3 missions', reward: ALL_MISSIONS_BONUS });
+  }
   return completed;
+}
+
+/**
+ * Reroll one incomplete mission for another from the same tier (1/day).
+ * Returns { ok, mission } or { ok: false, reason } ('used', 'done',
+ * 'unknown'). The replacement resets progress — a reroll is a fresh
+ * mission, not a free completion.
+ */
+function rerollMission(save, missionId) {
+  if ((save.missions.rerollsUsed ?? 0) >= DAILY_REROLLS) return { ok: false, reason: 'used' };
+  const mission = save.missions.list.find((m) => m.id === missionId);
+  if (!mission) return { ok: false, reason: 'unknown' };
+  if (mission.done) return { ok: false, reason: 'done' };
+  const pool = MISSION_POOLS[mission.tier] || [];
+  const alternatives = pool.filter((d) => d.id !== mission.id);
+  if (alternatives.length === 0) return { ok: false, reason: 'unknown' };
+  const pick = alternatives[hashStr(`${save.missions.date}:${missionId}`) % alternatives.length];
+  mission.id = pick.id;
+  mission.name = pick.name;
+  mission.target = pick.target;
+  mission.reward = pick.reward;
+  mission.tier = pick.tier;
+  mission.progress = 0;
+  mission.done = false;
+  save.missions.rerollsUsed = (save.missions.rerollsUsed ?? 0) + 1;
+  return { ok: true, mission };
 }
 
 /** The 7-day calendar ending today: [{ date, visited, isToday }]. */
@@ -1712,6 +2009,27 @@ function streakCalendar(save, today) {
     });
   }
   return days;
+}
+
+/**
+ * The daily-reward calendar: one box per cycle day (1-7) with its reward,
+ * whether it is done (claimed in this cycle), current (today's, unclaimed)
+ * or locked (a later cycle day). `claimedToday` is true once today's
+ * reward has been claimed.
+ */
+function dailyRewardCalendar(save, today) {
+  const cycleDay = cycleDayFor(save.streak.count);
+  const claimedToday = save.dailyReward.lastClaimDate === today;
+  return DAILY_REWARDS.map((reward, i) => {
+    const day = i + 1;
+    return {
+      day,
+      reward,
+      done: day < cycleDay || (day === cycleDay && claimedToday),
+      current: day === cycleDay && !claimedToday,
+      locked: day > cycleDay,
+    };
+  });
 }
 
 // ---- src/hangar.js ----
@@ -1758,7 +2076,7 @@ const HANGAR_PARTS = [
   {
     id: 'magnet',
     name: 'TRACTOR MAGNET',
-    desc: '+80 shard pickup radius per level.',
+    desc: '+30 shard pickup radius per level.',
     max: 3,
     costs: [150, 500, 1100],
   },
@@ -1842,40 +2160,82 @@ const SCREEN_WIN = 'win';
 const SCREEN_UPGRADE = 'upgrade';
 const SCREEN_STATS = 'stats';
 const SCREEN_HANGAR = 'hangar';
+// Panels over Home (one tap open, one tap close): missions, settings,
+// daily reward. The stats screen is a panel too.
+const SCREEN_MISSIONS = 'missions';
+const SCREEN_SETTINGS = 'settings';
+const SCREEN_REWARD = 'reward';
 
-// Title-screen button that opens the hangar (top left).
-const HANGAR_BUTTON_RECT = { x: 30, y: 30, w: 170, h: 44 };
+// --- Home (title) layout: PLAY only. Top corners hold the gear and the
+// currency; the meta game (hangar / missions / scores) lives in a bottom
+// tab bar that appears after the first run (progressive disclosure).
+const GEAR_RECT = { x: 24, y: 24, w: 48, h: 48 };
+const FLAME_RECT = { x: 1000, y: 24, w: 76, h: 48 };
+const BALANCE_RECT = { x: 1090, y: 24, w: 166, h: 48 };
+const PLAY_RECT = { x: 470, y: 410, w: 340, h: 76 };
+const HANGAR_TAB_RECT = { x: 335, y: 636, w: 190, h: 56 };
+const MISSIONS_TAB_RECT = { x: 545, y: 636, w: 190, h: 56 };
+const SCORES_TAB_RECT = { x: 755, y: 636, w: 190, h: 56 };
+
+// --- Panels: one centred card over a dimmed home screen.
+const PANEL_CARD = { x: 260, y: 96, w: 760, h: 528 };
+const PANEL_CLOSE_RECT = { x: 964, y: 108, w: 44, h: 44 };
+// Daily-reward CLAIM button.
+const CLAIM_RECT = { x: 510, y: 430, w: 260, h: 60 };
+// Settings toggles (right side of their rows).
+const SETTINGS_SOUND_RECT = { x: 880, y: 208, w: 100, h: 44 };
+const SETTINGS_FULLSCREEN_RECT = { x: 880, y: 284, w: 100, h: 44 };
+const SETTINGS_SHAKE_RECT = { x: 880, y: 360, w: 100, h: 44 };
+
 // The deliberate restart button on the game-over / win screens.
-const PLAY_AGAIN_RECT = { x: 510, y: 480, w: 260, h: 56 };
+const PLAY_AGAIN_RECT = { x: 510, y: 470, w: 260, h: 56 };
+// Hangar exit on the game-over screen (the endless trap fix: after an
+// endless death the player can go straight to the hangar to spend).
+const OVER_HANGAR_RECT = { x: 510, y: 546, w: 260, h: 48 };
 // Win-screen button that continues the run into endless mode.
-const ENDLESS_RECT = { x: 510, y: 600, w: 260, h: 56 };
+const ENDLESS_RECT = { x: 510, y: 546, w: 260, h: 56 };
+// Hangar exit on the win screen.
+const WIN_HANGAR_RECT = { x: 510, y: 622, w: 260, h: 48 };
 // Back button on the hangar screen.
-const HANGAR_BACK_RECT = { x: 540, y: 622, w: 200, h: 44 };
-
-// Title-screen skin arrows (◀ ▶) beside the ship preview: tapping an
-// arrow cycles skins — tapping the preview itself no longer does, so a
-// launch tap can never change the skin by accident.
-const SKIN_ARROW_LEFT = { x: 380, y: 560, w: 36, h: 56 };
-const SKIN_ARROW_RIGHT = { x: 524, y: 560, w: 36, h: 56 };
-// Title-screen button that opens the stats / top-5 screen.
-const STATS_BUTTON_RECT = { x: 1060, y: 30, w: 190, h: 44 };
-
-// The title-screen ship preview the player taps to cycle skins
-// (field coordinates; the preview ship is drawn at its centre).
-const SKIN_PREVIEW_RECT = { x: 425, y: 550, w: 95, h: 75 };
+const HANGAR_BACK_RECT = { x: 540, y: 606, w: 200, h: 44 };
+// Skin arrows in the hangar (the selector moved here from the title, so
+// its name can never overlap an arrow again).
+const HANGAR_SKIN_LEFT = { x: 200, y: 126, w: 40, h: 52 };
+const HANGAR_SKIN_RIGHT = { x: 420, y: 126, w: 40, h: 52 };
+// Pause-menu buttons.
+const PAUSE_RESUME_RECT = { x: 510, y: 360, w: 260, h: 52 };
+const PAUSE_RESTART_RECT = { x: 510, y: 428, w: 260, h: 52 };
+const PAUSE_HANGAR_RECT = { x: 510, y: 496, w: 260, h: 52 };
+const PAUSE_MENU_RECT = { x: 510, y: 564, w: 260, h: 52 };
 
 /** Row rectangles for the hangar parts, in field coordinates. */
 function layoutHangarParts() {
   const x = 140;
   const w = 1000;
-  const h = 74;
-  const gap = 8;
-  const y0 = 195;
+  const h = 66;
+  const gap = 6;
+  const y0 = 226;
   return HANGAR_PARTS.map((part, i) => {
     const y = y0 + i * (h + gap);
     return {
       x, y, w, h, part,
-      buy: { x: x + w - 170, y: y + 13, w: 150, h: 48 },
+      buy: { x: x + w - 170, y: y + 9, w: 150, h: 48 },
+    };
+  });
+}
+
+/** Mission rows in the missions panel: row + reroll-button rectangles. */
+function layoutMissionRows() {
+  const x = 300;
+  const w = 680;
+  const h = 92;
+  const gap = 14;
+  const y0 = 208;
+  return [0, 1, 2].map((i) => {
+    const y = y0 + i * (h + gap);
+    return {
+      x, y, w, h,
+      reroll: { x: x + w - 64, y: y + 22, w: 48, h: 48 },
     };
   });
 }
@@ -2312,81 +2672,419 @@ function wrapText(ctx, text, maxWidth) {
 }
 
 function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeShards = 0, extra = {}) {
+  // Home is PLAY only: logo, one big PLAY button, best score, the next
+  // goal, and a gear in the corner. Everything else (hangar, missions,
+  // scores, settings, daily reward) is one tap away in the tab bar or a
+  // panel — never piled onto this screen. The how-to lives in the game
+  // itself now (first-run cues), not in four lines of text here.
   panel(ctx, width, height);
   drawGate(ctx, state, width, height);
-  // Hangar button, top left — the ship's permanent upgrades.
+  const save = extra.save ?? null;
+  const streakInfo = extra.streakInfo ?? null;
+  const hasPlayed = save && save.lifetime.runs > 0;
+  // Gear (settings), top left.
   ctx.save();
-  ctx.strokeStyle = CYAN;
+  ctx.strokeStyle = 'rgba(226, 232, 240, 0.75)';
   ctx.lineWidth = 2;
-  ctx.strokeRect(HANGAR_BUTTON_RECT.x, HANGAR_BUTTON_RECT.y, HANGAR_BUTTON_RECT.w, HANGAR_BUTTON_RECT.h);
-  ctx.fillStyle = CYAN;
-  ctx.font = 'bold 17px sans-serif';
+  ctx.strokeRect(GEAR_RECT.x, GEAR_RECT.y, GEAR_RECT.w, GEAR_RECT.h);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 24px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('HANGAR  [H]', HANGAR_BUTTON_RECT.x + HANGAR_BUTTON_RECT.w / 2, HANGAR_BUTTON_RECT.y + 23);
+  ctx.fillText('⚙', GEAR_RECT.x + GEAR_RECT.w / 2, GEAR_RECT.y + GEAR_RECT.h / 2 + 1);
   ctx.restore();
-  // Top-scores button, top right.
+  // Streak flame (top right): opens the daily-reward calendar. It pulses
+  // with a dot while today's reward waits unclaimed.
+  if (save && save.streak.count > 0) {
+    const pending = save.dailyReward
+      && save.dailyReward.pendingReward > 0
+      && save.dailyReward.lastClaimDate !== localDate();
+    const pulse = pending ? 0.6 + 0.4 * Math.sin(state.time * 5) : 1;
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    ctx.strokeStyle = pending ? GOLD : 'rgba(251, 191, 36, 0.55)';
+    ctx.lineWidth = pending ? 2.5 : 1.5;
+    ctx.strokeRect(FLAME_RECT.x, FLAME_RECT.y, FLAME_RECT.w, FLAME_RECT.h);
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`🔥${save.streak.count}`, FLAME_RECT.x + FLAME_RECT.w / 2, FLAME_RECT.y + FLAME_RECT.h / 2 + 1);
+    ctx.restore();
+  }
+  // Shard balance (top right, display only).
   ctx.save();
-  ctx.strokeStyle = GOLD;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(STATS_BUTTON_RECT.x, STATS_BUTTON_RECT.y, STATS_BUTTON_RECT.w, STATS_BUTTON_RECT.h);
+  ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(BALANCE_RECT.x, BALANCE_RECT.y, BALANCE_RECT.w, BALANCE_RECT.h);
   ctx.fillStyle = GOLD;
-  ctx.font = 'bold 17px sans-serif';
+  ctx.font = 'bold 20px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('★ TOP SCORES  [T]', STATS_BUTTON_RECT.x + STATS_BUTTON_RECT.w / 2, STATS_BUTTON_RECT.y + 23);
+  ctx.fillText(`◆ ${save ? (save.shardBalance ?? 0) : 0}`, BALANCE_RECT.x + BALANCE_RECT.w / 2, BALANCE_RECT.y + BALANCE_RECT.h / 2 + 1);
   ctx.restore();
-  bigTitle(ctx, 'LUMEN DRIFT', 250, width, CYAN, 72);
+  bigTitle(ctx, 'LUMEN DRIFT', 240, width, CYAN, 72);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fbbf24';
   ctx.font = 'bold 24px sans-serif';
-  ctx.fillText('Ride the solar storm. Gather the light.', width / 2, 305);
-  ctx.fillStyle = '#e2e8f0';
-  ctx.font = '19px sans-serif';
-  ctx.fillText('Arrows / WASD, mouse or drag to steer  •  SPACE, click or DASH to dash', width / 2, 360);
-  ctx.fillText('Collect star shards to reach 1,200 and open the Aurora Gate.', width / 2, 390);
-  ctx.fillText('Dodge void mines and storm shards — 3 hull hearts. P pauses, F fullscreen.', width / 2, 420);
-  ctx.fillStyle = '#a5f3fc';
-  ctx.font = '19px sans-serif';
-  ctx.fillText('Level up to choose upgrades. Star shards unlock new ship skins.', width / 2, 450);
-  ctx.font = 'bold 22px sans-serif';
-  ctx.fillText(Math.floor(state.time * 2) % 2 === 0 ? '▶  PRESS ENTER OR TAP TO LAUNCH' : 'PRESS ENTER OR TAP TO LAUNCH', width / 2, 490);
-  // Daily streak: why coming back tomorrow matters.
-  const save = extra.save ?? null;
-  const streakInfo = extra.streakInfo ?? null;
-  if (save && save.streak.count > 0) {
+  ctx.fillText('Ride the solar storm. Gather the light.', width / 2, 292);
+  // The next goal, always visible: the next locked skin with progress.
+  const next = nextUnlock(lifetimeShards);
+  if (next) {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText(`NEXT SKIN ◆ ${next.skin.name} — ${next.have} / ${next.need}`, width / 2, 352);
+    const barW = 320;
+    const barX = (width - barW) / 2;
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+    ctx.fillRect(barX, 366, barW, 9);
+    ctx.fillStyle = next.skin.glow;
+    ctx.fillRect(barX, 366, barW * Math.min(1, next.have / next.need), 9);
+  } else {
     ctx.fillStyle = GOLD;
-    ctx.font = 'bold 18px sans-serif';
-    ctx.fillText(
-      streakInfo && streakInfo.isNewDay
-        ? `🔥 ${save.streak.count}-DAY STREAK — +${streakInfo.bonus} shards today!`
-        : `🔥 ${save.streak.count}-DAY STREAK — come back tomorrow for +${Math.min(10 * (save.streak.count + 1), 100)} shards`,
-      width / 2, 518,
-    );
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText('★ ALL SHIP SKINS UNLOCKED ★', width / 2, 352);
   }
+  // One dominant PLAY button, thumb zone, gently pulsing.
+  const pulse = 0.85 + 0.15 * Math.sin(state.time * 3);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  glow(ctx, GOLD, 22);
+  ctx.fillStyle = GOLD;
+  ctx.fillRect(PLAY_RECT.x, PLAY_RECT.y, PLAY_RECT.w, PLAY_RECT.h);
+  noGlow(ctx);
+  ctx.fillStyle = INK;
+  ctx.font = 'bold 32px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('▶  PLAY', PLAY_RECT.x + PLAY_RECT.w / 2, PLAY_RECT.y + PLAY_RECT.h / 2 + 1);
+  ctx.restore();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
   if (best > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 18px sans-serif';
-    ctx.fillText(`BEST SCORE  ${best}`, width / 2, 542);
+    ctx.fillText(`BEST SCORE  ${best}`, width / 2, 522);
   }
-  // Endless unlocked: the player has beaten the Aurora Gate once.
   if (save && save.endlessUnlocked) {
     ctx.fillStyle = GREEN;
     ctx.font = 'bold 18px sans-serif';
-    ctx.fillText('∞  ENDLESS UNLOCKED — win again to keep drifting past the gate!', width / 2, 566);
+    ctx.fillText('∞  ENDLESS UNLOCKED — win again to keep drifting past the gate!', width / 2, 548);
   }
-  // Ship skin selector: a preview of the ship in the selected skin,
-  // its name, and progress to the next unlock. Tap the preview (or
-  // press ← / →) to cycle through the skins already unlocked.
+  // Bottom tab bar (after the first run only — progressive disclosure:
+  // a brand-new player sees nothing but PLAY).
+  if (hasPlayed) {
+    const tabs = [
+      [HANGAR_TAB_RECT, 'HANGAR', CYAN],
+      [MISSIONS_TAB_RECT, 'MISSIONS', GOLD],
+      [SCORES_TAB_RECT, 'SCORES', '#e2e8f0'],
+    ];
+    for (const [rect, label, color] of tabs) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+      ctx.fillStyle = color;
+      ctx.font = 'bold 19px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2 + 1);
+      ctx.restore();
+    }
+  }
+  // The streak line lives in the flame badge now; a fresh day's bonus is
+  // claimed from the daily-reward panel, not announced in small print.
+  void streakInfo;
+}
+
+// --- Panels: one centred card over the dimmed home screen. One tap on
+// the X (or the backdrop, or Esc) closes back to Home — PLAY is never
+// more than one tap away.
+function drawPanelShell(ctx, width, height, title, color) {
+  ctx.fillStyle = 'rgba(11, 16, 38, 0.62)';
+  ctx.fillRect(0, 0, width, height);
+  const card = PANEL_CARD;
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.97)';
+  ctx.fillRect(card.x, card.y, card.w, card.h);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(card.x, card.y, card.w, card.h);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  glow(ctx, color, 16);
+  ctx.fillStyle = color;
+  ctx.font = 'bold 34px sans-serif';
+  ctx.fillText(title, width / 2, card.y + 44);
+  noGlow(ctx);
+  // Close X, top-right of the card.
+  ctx.save();
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(PANEL_CLOSE_RECT.x, PANEL_CLOSE_RECT.y, PANEL_CLOSE_RECT.w, PANEL_CLOSE_RECT.h);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('✕', PANEL_CLOSE_RECT.x + PANEL_CLOSE_RECT.w / 2, PANEL_CLOSE_RECT.y + PANEL_CLOSE_RECT.h / 2 + 1);
+  ctx.restore();
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawStats(ctx, save, width, height) {
+  drawPanelShell(ctx, width, height, 'TOP SCORES', GOLD);
+  ctx.textAlign = 'center';
+  if (!save) {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('No runs recorded yet — go drift!', width / 2, 320);
+    return;
+  }
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 22px sans-serif';
+  if (save.top5.length === 0) {
+    ctx.fillText('No runs yet — your best runs will live here.', width / 2, 210);
+  } else {
+    save.top5.forEach((entry, i) => {
+      ctx.fillStyle = i === 0 ? GOLD : '#e2e8f0';
+      ctx.font = i === 0 ? 'bold 24px sans-serif' : '20px sans-serif';
+      ctx.fillText(
+        `#${i + 1}   ${entry.score}   —   LEVEL ${entry.level}   •   COMBO x${Math.max(1, entry.bestCombo)}${entry.endless ? '   ∞ ENDLESS' : ''}   •   ${entry.date}`,
+        width / 2, 205 + i * 34,
+      );
+    });
+  }
+  // Lifetime stats.
+  const mins = Math.floor(save.lifetime.playSeconds / 60);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  ctx.fillText(
+    `RUNS ${save.lifetime.runs}   •   LIFETIME SHARDS ${save.lifetime.shards}   •   PLAY TIME ${mins}m   •   BEST ${save.best}`,
+    width / 2, 408,
+  );
+  // 7-day streak calendar.
+  const days = streakCalendar(save, localDate());
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText(`🔥 ${save.streak.count}-DAY STREAK`, width / 2, 448);
+  const boxW = 44;
+  const gap = 10;
+  const totalW = 7 * boxW + 6 * gap;
+  let bx = (width - totalW) / 2;
+  for (const day of days) {
+    ctx.strokeStyle = day.isToday ? CYAN : 'rgba(148, 163, 184, 0.5)';
+    ctx.lineWidth = day.isToday ? 3 : 2;
+    ctx.strokeRect(bx, 468, boxW, boxW);
+    if (day.visited) {
+      ctx.fillStyle = GOLD;
+      ctx.font = 'bold 22px sans-serif';
+      ctx.fillText('✓', bx + boxW / 2, 490);
+    }
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(day.date.slice(5), bx + boxW / 2, 532);
+    bx += boxW + gap;
+  }
+  // Today's missions.
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  save.missions.list.forEach((m, i) => {
+    ctx.fillText(
+      `${m.done ? '✓' : '○'} ${m.name} — ${m.progress}/${m.target}   (+${m.reward} shards)`,
+      width / 2, 566 + i * 26,
+    );
+  });
+}
+
+function drawMissionsPanel(ctx, save, width, height) {
+  drawPanelShell(ctx, width, height, 'DAILY MISSIONS', GOLD);
+  if (!save) return;
+  const rows = layoutMissionRows();
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  save.missions.list.forEach((m, i) => {
+    const row = rows[i];
+    if (!row) return;
+    ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+    ctx.fillRect(row.x, row.y, row.w, row.h);
+    ctx.strokeStyle = m.done ? GREEN : 'rgba(148, 163, 184, 0.45)';
+    ctx.lineWidth = m.done ? 2 : 1.5;
+    ctx.strokeRect(row.x, row.y, row.w, row.h);
+    // Tier tag + name.
+    ctx.fillStyle = m.tier === 'hard' ? MAGENTA : (m.tier === 'medium' ? GOLD : CYAN);
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(m.tier.toUpperCase(), row.x + 16, row.y + 24);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(`${m.done ? '✓ ' : '○ '}${m.name}`, row.x + 16, row.y + 52);
+    // Progress bar.
+    const barX = row.x + 16;
+    const barW = 300;
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+    ctx.fillRect(barX, row.y + 66, barW, 10);
+    ctx.fillStyle = m.done ? GREEN : GOLD;
+    ctx.fillRect(barX, row.y + 66, barW * Math.min(1, m.progress / m.target), 10);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`${m.progress}/${m.target}`, barX + barW + 12, row.y + 76);
+    // Reward.
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 18px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`◆ +${m.reward}`, row.x + row.w - 84, row.y + 52);
+    ctx.textAlign = 'left';
+    // Reroll button (incomplete missions only, 1/day).
+    const canReroll = !m.done && (save.missions.rerollsUsed ?? 0) < DAILY_REROLLS;
+    const rb = row.reroll;
+    ctx.fillStyle = canReroll ? 'rgba(34, 211, 238, 0.18)' : 'rgba(148, 163, 184, 0.10)';
+    ctx.fillRect(rb.x, rb.y, rb.w, rb.h);
+    ctx.strokeStyle = canReroll ? CYAN : 'rgba(148, 163, 184, 0.35)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(rb.x, rb.y, rb.w, rb.h);
+    ctx.fillStyle = canReroll ? CYAN : '#64748b';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('↻', rb.x + rb.w / 2, rb.y + rb.h / 2 + 1);
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+  });
+  // Complete-all-3 bonus.
+  const allDone = save.missions.list.length === 3 && save.missions.list.every((m) => m.done);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = allDone ? GREEN : '#a5f3fc';
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText(
+    allDone
+      ? `★ ALL 3 DONE — +${ALL_MISSIONS_BONUS} shards bonus paid! ★`
+      : `Complete all 3 for a +${ALL_MISSIONS_BONUS} shard bonus   •   ${(save.missions.rerollsUsed ?? 0) >= DAILY_REROLLS ? 'reroll used up for today' : '1 reroll left today (tap ↻)'}   •   resets daily`,
+    width / 2, 552,
+  );
+}
+
+function drawSettingsPanel(ctx, save, width, height, extra = {}) {
+  drawPanelShell(ctx, width, height, 'SETTINGS', CYAN);
+  const settings = save?.settings ?? { muted: false, reduceShake: false };
+  const rows = [
+    { rect: SETTINGS_SOUND_RECT, label: 'SOUND', on: !settings.muted, note: settings.muted ? 'muted — tap to turn on' : 'on — tap to mute' },
+    { rect: SETTINGS_FULLSCREEN_RECT, label: 'FULLSCREEN', on: extra.fullscreenOn ?? false, note: 'tap to toggle' },
+    { rect: SETTINGS_SHAKE_RECT, label: 'REDUCE SHAKE', on: !!settings.reduceShake, note: settings.reduceShake ? 'shake softened' : 'full shake on hits' },
+  ];
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  for (const row of rows) {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(row.label, 300, row.rect.y + 30);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(row.note, 470, row.rect.y + 30);
+    const b = row.rect;
+    ctx.fillStyle = row.on ? GREEN : 'rgba(148, 163, 184, 0.25)';
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = row.on ? INK : '#e2e8f0';
+    ctx.font = 'bold 17px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(row.on ? 'ON' : 'OFF', b.x + b.w / 2, b.y + b.h / 2 + 1);
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+  }
+  // How to play: three icons, no paragraphs.
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText('HOW TO PLAY', width / 2, 470);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  ctx.fillText('DRAG  —  steer the ship', width / 2, 504);
+  ctx.fillText('◆  —  collect star shards', width / 2, 534);
+  ctx.fillText('DASH  —  dodge mines (SPACE / DASH button)', width / 2, 564);
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '15px sans-serif';
+  ctx.fillText('Reach 1,200 to open the Aurora Gate — then keep drifting, endless.', width / 2, 600);
+}
+
+function drawRewardPanel(ctx, save, width, height) {
+  drawPanelShell(ctx, width, height, 'DAILY REWARD', GOLD);
+  if (!save) return;
+  const days = dailyRewardCalendar(save, localDate());
+  const boxW = 84;
+  const boxH = 110;
+  const gap = 12;
+  const totalW = 7 * boxW + 6 * gap;
+  let bx = (width - totalW) / 2;
+  const by = 220;
+  ctx.textBaseline = 'alphabetic';
+  for (const day of days) {
+    ctx.fillStyle = day.current ? 'rgba(251, 191, 36, 0.16)' : 'rgba(20, 27, 61, 0.96)';
+    ctx.fillRect(bx, by, boxW, boxH);
+    ctx.strokeStyle = day.current ? GOLD : (day.done ? GREEN : 'rgba(148, 163, 184, 0.45)');
+    ctx.lineWidth = day.current ? 3 : 1.5;
+    ctx.strokeRect(bx, by, boxW, boxH);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText(`DAY ${day.day}`, bx + boxW / 2, by + 26);
+    ctx.fillStyle = day.done ? GREEN : GOLD;
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText(day.done ? '✓' : `◆ ${day.reward}`, bx + boxW / 2, by + 62);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '13px sans-serif';
+    ctx.fillText(day.current ? 'TODAY' : (day.done ? 'claimed' : (day.locked ? 'locked' : '')), bx + boxW / 2, by + 92);
+    bx += boxW + gap;
+  }
+  // Claim button (or the claimed state).
+  const claimable = save.dailyReward
+    && save.dailyReward.pendingReward > 0
+    && save.dailyReward.lastClaimDate !== localDate();
+  const r = CLAIM_RECT;
+  ctx.save();
+  if (claimable) {
+    glow(ctx, GOLD, 18);
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    noGlow(ctx);
+    ctx.fillStyle = INK;
+  } else {
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.25)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = '#94a3b8';
+  }
+  ctx.font = 'bold 24px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    claimable ? `CLAIM  ◆ ${save.dailyReward.pendingReward}` : 'CLAIMED ✓',
+    r.x + r.w / 2, r.y + r.h / 2 + 1,
+  );
+  ctx.restore();
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '17px sans-serif';
+  ctx.fillText(`🔥 ${save.streak.count}-day streak — day 7 pays ◆ 100, the best of the week.`, width / 2, 532);
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '15px sans-serif';
+  ctx.fillText('Missed a day? Your streak survives once per week — the freeze is automatic.', width / 2, 560);
+}
+
+function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'HANGAR', 64, width, CYAN, 46);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  ctx.fillText('Your ship, upgraded part by part — every purchase stays forever.', width / 2, 96);
+  // --- Skin strip: the ship selector moved here from the title, so its
+  // name can never overlap an arrow again. The ship, its name and the
+  // progress to the next skin each have their own row.
   const preview = {
-    ship: { x: SKIN_PREVIEW_RECT.x + SKIN_PREVIEW_RECT.w / 2, y: 588, angle: -Math.PI / 2, vx: 0, vy: 0, invulnerable: 0 },
-    time: state.time,
+    ship: { x: 150, y: 152, angle: -Math.PI / 2, vx: 0, vy: 0, invulnerable: 0 },
+    time: state ? state.time : 0,
     shield: false,
   };
   drawShip(ctx, preview, skin);
-  // ◀ ▶ arrow buttons: the only way to change skins (a tap on the ship
-  // preview itself does nothing, so it can never eat a launch tap).
-  for (const [rect, dir] of [[SKIN_ARROW_LEFT, -1], [SKIN_ARROW_RIGHT, 1]]) {
+  for (const [rect, dir] of [[HANGAR_SKIN_LEFT, -1], [HANGAR_SKIN_RIGHT, 1]]) {
     ctx.save();
     ctx.strokeStyle = CYAN;
     ctx.lineWidth = 2;
@@ -2408,117 +3106,26 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     ctx.fill();
     ctx.restore();
   }
-  ctx.textAlign = 'left';
+  ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 20px sans-serif';
-  ctx.fillText(`SHIP  ${skin.name}`, 540, 582);
-  const next = nextUnlock(lifetimeShards);
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '17px sans-serif';
-  ctx.fillText(
-    next
-      ? `Next skin ${next.skin.name} — ${next.have} / ${next.need} shards   (◀ ▶ to change)`
-      : 'All ship skins unlocked!   (◀ ▶ to change)',
-    540, 610,
-  );
-  ctx.textAlign = 'center';
-  // Today's missions, one compact line.
-  if (save && save.missions.list.length) {
-    ctx.fillStyle = '#a5f3fc';
-    ctx.font = '15px sans-serif';
-    ctx.fillText(
-      `TODAY  ${save.missions.list.map((m) => `${m.done ? '✓' : '○'} ${m.name} ${m.progress}/${m.target}`).join('   ')}`,
-      width / 2, 642,
-    );
-  }
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '15px sans-serif';
-  ctx.fillText('A neon arcade game — no downloads, no sign-up, just drift.', width / 2, 672);
-}
-
-function drawStats(ctx, save, width, height) {
-  panel(ctx, width, height);
-  bigTitle(ctx, 'TOP SCORES', 120, width, GOLD, 48);
-  ctx.textAlign = 'center';
-  if (!save) {
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '20px sans-serif';
-    ctx.fillText('No runs recorded yet — go drift!', width / 2, 300);
+  ctx.fillText(`SHIP  ${skin.name}`, 330, 152);
+  const nextSkin = nextUnlock(save ? save.lifetime.shards : 0);
+  if (nextSkin) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`Next skin ${nextSkin.skin.name} — ${nextSkin.have} / ${nextSkin.need} shards`, 330, 196);
+    const barW = 260;
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+    ctx.fillRect(200, 206, barW, 8);
+    ctx.fillStyle = nextSkin.skin.glow;
+    ctx.fillRect(200, 206, barW * Math.min(1, nextSkin.have / nextSkin.need), 8);
   } else {
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = 'bold 22px sans-serif';
-    if (save.top5.length === 0) {
-      ctx.fillText('No runs yet — your best runs will live here.', width / 2, 200);
-    } else {
-      save.top5.forEach((entry, i) => {
-        ctx.fillStyle = i === 0 ? GOLD : '#e2e8f0';
-        ctx.font = i === 0 ? 'bold 24px sans-serif' : '20px sans-serif';
-        ctx.fillText(
-          `#${i + 1}   ${entry.score}   —   LEVEL ${entry.level}   •   COMBO x${Math.max(1, entry.bestCombo)}${entry.endless ? '   ∞ ENDLESS' : ''}   •   ${entry.date}`,
-          width / 2, 200 + i * 38,
-        );
-      });
-    }
-    // Lifetime stats.
-    const mins = Math.floor(save.lifetime.playSeconds / 60);
-    ctx.fillStyle = '#a5f3fc';
-    ctx.font = '19px sans-serif';
-    ctx.fillText(
-      `RUNS ${save.lifetime.runs}   •   LIFETIME SHARDS ${save.lifetime.shards}   •   PLAY TIME ${mins}m   •   BEST ${save.best}`,
-      width / 2, 430,
-    );
-    // 7-day streak calendar.
-    const days = streakCalendar(save, localDate());
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = 'bold 19px sans-serif';
-    ctx.fillText(`🔥 ${save.streak.count}-DAY STREAK`, width / 2, 480);
-    const boxW = 44;
-    const gap = 10;
-    const totalW = 7 * boxW + 6 * gap;
-    let bx = (width - totalW) / 2;
-    for (const day of days) {
-      ctx.strokeStyle = day.isToday ? CYAN : 'rgba(148, 163, 184, 0.5)';
-      ctx.lineWidth = day.isToday ? 3 : 2;
-      ctx.strokeRect(bx, 500, boxW, boxW);
-      if (day.visited) {
-        ctx.fillStyle = GOLD;
-        ctx.font = 'bold 22px sans-serif';
-        ctx.fillText('✓', bx + boxW / 2, 522);
-      }
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '12px sans-serif';
-      ctx.fillText(day.date.slice(5), bx + boxW / 2, 560);
-      bx += boxW + gap;
-    }
-    // Today's missions.
-    ctx.fillStyle = '#a5f3fc';
-    ctx.font = '19px sans-serif';
-    save.missions.list.forEach((m, i) => {
-      ctx.fillText(
-        `${m.done ? '✓' : '○'} ${m.name} — ${m.progress}/${m.target}   (+${m.reward} shards)`,
-        width / 2, 600 + i * 28,
-      );
-    });
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('All ship skins unlocked!', 330, 196);
   }
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '17px sans-serif';
-  ctx.fillText('Press T or tap to go back', width / 2, 680);
-}
-
-function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
-  panel(ctx, width, height);
-  bigTitle(ctx, 'HANGAR', 72, width, CYAN, 48);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#a5f3fc';
-  ctx.font = '19px sans-serif';
-  ctx.fillText('Your ship, upgraded part by part — every purchase stays forever.', width / 2, 108);
-  // Ship preview in the selected skin, and the profile summary beside it.
-  const preview = {
-    ship: { x: 130, y: 158, angle: -Math.PI / 2, vx: 0, vy: 0, invulnerable: 0 },
-    time: state ? state.time : 0,
-    shield: false,
-  };
-  drawShip(ctx, preview, skin);
+  // --- Profile summary (right of the skin strip).
   ctx.textAlign = 'left';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 19px sans-serif';
@@ -2526,11 +3133,11 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
   const lifetime = save ? save.lifetime.shards : 0;
   ctx.fillText(
     `BEST ${save ? save.best : 0}   •   RUNS ${save ? save.lifetime.runs : 0}   •   LIFETIME SHARDS ${lifetime}   •   🔥 ${save ? save.streak.count : 0}-DAY STREAK`,
-    210, 140,
+    500, 140,
   );
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 21px sans-serif';
-  ctx.fillText(`BALANCE  ${balance} shards — tap a part to buy it (keys 1–5 work too)`, 210, 172);
+  ctx.fillText(`BALANCE  ${balance} shards — tap a part to buy it (keys 1–5 work too)`, 500, 172);
   // One row per part: name, effect, level pips, buy button.
   for (const row of layoutHangarParts()) {
     const level = save ? hangarLevel(save, row.part.id) : 0;
@@ -2546,12 +3153,12 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
     ctx.textBaseline = 'alphabetic';
     ctx.fillStyle = CYAN;
     ctx.font = 'bold 21px sans-serif';
-    ctx.fillText(row.part.name, row.x + 16, row.y + 30);
+    ctx.fillText(row.part.name, row.x + 16, row.y + 28);
     ctx.fillStyle = '#e2e8f0';
     ctx.font = '16px sans-serif';
     const descLines = wrapText(ctx, row.part.desc, 600);
-    descLines.forEach((line, li) => {
-      ctx.fillText(line, row.x + 16, row.y + 56 + li * 20);
+    descLines.slice(0, 1).forEach((line, li) => {
+      ctx.fillText(line, row.x + 16, row.y + 50 + li * 20);
     });
     // Level pips, ending just left of the buy button.
     const pipGap = 26;
@@ -2589,15 +3196,21 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
     ctx.restore();
   }
   // Back button, bottom centre.
+  drawButton(ctx, HANGAR_BACK_RECT, '◀  BACK  [H]');
+}
+
+// An outlined button with a centred label (pause menu, game-over exits,
+// hangar back). One style, so every exit looks the same.
+function drawButton(ctx, rect, label) {
   ctx.save();
   ctx.strokeStyle = CYAN;
   ctx.lineWidth = 2;
-  ctx.strokeRect(HANGAR_BACK_RECT.x, HANGAR_BACK_RECT.y, HANGAR_BACK_RECT.w, HANGAR_BACK_RECT.h);
+  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
   ctx.fillStyle = CYAN;
   ctx.font = 'bold 18px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('◀  BACK  [H]', HANGAR_BACK_RECT.x + HANGAR_BACK_RECT.w / 2, HANGAR_BACK_RECT.y + 23);
+  ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2 + 1);
   ctx.restore();
 }
 
@@ -2612,11 +3225,9 @@ function drawPlayAgain(ctx) {
   ctx.textBaseline = 'middle';
   ctx.fillText('▶  PLAY AGAIN', r.x + r.w / 2, r.y + r.h / 2 + 1);
   ctx.restore();
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '17px sans-serif';
-  ctx.fillText('or press R', r.x + r.w / 2, r.y + r.h + 28);
+  // No "or press R" line here: the button below (HANGAR / CONTINUE —
+  // ENDLESS) starts 20 px under it, and the key hints live on the
+  // screens' own hint line instead.
 }
 
 function drawUpgrade(ctx, state, offers, width, height, age = 0) {
@@ -2701,32 +3312,39 @@ function drawUpgrade(ctx, state, offers, width, height, age = 0) {
 
 function drawPaused(ctx, width, height) {
   panel(ctx, width, height);
-  bigTitle(ctx, 'PAUSED', 300, width, CYAN, 56);
+  bigTitle(ctx, 'PAUSED', 280, width, CYAN, 56);
   ctx.textAlign = 'center';
-  ctx.fillStyle = '#e2e8f0';
-  ctx.font = '20px sans-serif';
-  ctx.fillText('Press P to keep drifting, or R to restart.', width / 2, 370);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  ctx.fillText('DRAG steer  •  ◆ collect shards  •  DASH dodge mines', width / 2, 330);
+  // Pause is an exit, not a trap: resume, restart, hangar, or menu —
+  // including during endless, where the run can be left at any time.
+  drawButton(ctx, PAUSE_RESUME_RECT, 'RESUME  [P]');
+  drawButton(ctx, PAUSE_RESTART_RECT, 'RESTART  [R]');
+  drawButton(ctx, PAUSE_HANGAR_RECT, 'HANGAR  [H]');
+  // No key hint on MENU: M is the global mute toggle.
+  drawButton(ctx, PAUSE_MENU_RECT, 'MENU');
 }
 
-function drawOver(ctx, state, best, width, height, summary = null) {
+function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
   panel(ctx, width, height);
-  bigTitle(ctx, 'THE STORM TOOK YOU', 220, width, MAGENTA, 54);
+  bigTitle(ctx, 'THE STORM TOOK YOU', 200, width, MAGENTA, 54);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 26px sans-serif';
-  ctx.fillText(`SCORE  ${state.score}    •    LEVEL ${state.level}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 300);
-  let y = 348;
+  ctx.fillText(`SCORE  ${state.score}    •    LEVEL ${state.level}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 268);
+  let y = 306;
   if (summary && summary.endless) {
     ctx.fillStyle = GREEN;
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText('∞  ENDLESS RUN — you drifted past the Aurora Gate!', width / 2, y);
-    y += 40;
+    y += 36;
   }
   if (state.score >= best && state.score > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText('★ NEW BEST SCORE ★', width / 2, y);
-    y += 40;
+    y += 36;
   }
   if (summary && summary.rank > 0) {
     ctx.fillStyle = GOLD;
@@ -2737,24 +3355,42 @@ function drawOver(ctx, state, best, width, height, summary = null) {
         : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
       width / 2, y,
     );
-    y += 40;
+    y += 36;
   }
   // Near-miss line (Zeigarnik): how close the gate was.
   if (state.score >= 800 && state.score < WIN_SCORE) {
     ctx.fillStyle = '#a5f3fc';
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText(`You died at ${state.score} — just ${WIN_SCORE - state.score} more to the gate!`, width / 2, y);
-    y += 40;
+    y += 36;
   }
+  // Missions, one compact line instead of one line per mission.
   if (summary && summary.completed.length) {
+    const total = summary.completed.reduce((n, m) => n + m.reward, 0);
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 20px sans-serif';
-    for (const m of summary.completed) {
-      ctx.fillText(`MISSION COMPLETE: ${m.name}  +${m.reward} shards`, width / 2, y);
-      y += 32;
-    }
+    ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
+    y += 36;
+  }
+  // The visible next goal: the next locked skin, else the gate, else the best.
+  const save = extra.save ?? null;
+  const next = nextUnlock(save ? save.lifetime.shards : 0);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = 'bold 20px sans-serif';
+  if (next) {
+    ctx.fillText(`NEXT GOAL: ${next.skin.name} skin — ${next.have} / ${next.need} ◆`, width / 2, y);
+  } else if (state.score < WIN_SCORE) {
+    ctx.fillText(`NEXT GOAL: Aurora Gate — ${WIN_SCORE - state.score} points to go`, width / 2, y);
+  } else {
+    ctx.fillText(`NEXT GOAL: beat your best ${best}`, width / 2, y);
   }
   drawPlayAgain(ctx);
+  // The endless trap fix: from a death screen the player can go straight
+  // to the hangar to spend the shards they just earned.
+  drawButton(ctx, OVER_HANGAR_RECT, 'HANGAR  [H]');
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '17px sans-serif';
+  ctx.fillText('R retry  •  H hangar  •  Esc menu', width / 2, 622);
 }
 
 function drawWin(ctx, state, best, width, height, summary = null) {
@@ -2781,12 +3417,11 @@ function drawWin(ctx, state, best, width, height, summary = null) {
     y += 40;
   }
   if (summary && summary.completed.length) {
+    const total = summary.completed.reduce((n, m) => n + m.reward, 0);
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 20px sans-serif';
-    for (const m of summary.completed) {
-      ctx.fillText(`MISSION COMPLETE: ${m.name}  +${m.reward} shards`, width / 2, y);
-      y += 32;
-    }
+    ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
+    y += 40;
   }
   drawPlayAgain(ctx);
   // Keep drifting: the run continues past the gate, endless.
@@ -2795,16 +3430,19 @@ function drawWin(ctx, state, best, width, height, summary = null) {
   ctx.fillStyle = GREEN;
   ctx.fillRect(r.x, r.y, r.w, r.h);
   ctx.fillStyle = INK;
-  ctx.font = 'bold 22px sans-serif';
+  ctx.font = 'bold 20px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('▶  CONTINUE — ENDLESS', r.x + r.w / 2, r.y + r.h / 2 + 1);
   ctx.restore();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
+  // Win screen is not a trap either: the player can bank the win and go
+  // spend in the hangar instead of continuing endless.
+  drawButton(ctx, WIN_HANGAR_RECT, 'HANGAR  [H]');
   ctx.fillStyle = '#94a3b8';
   ctx.font = '17px sans-serif';
-  ctx.fillText('or press E', r.x + r.w / 2, r.y + r.h + 28);
+  ctx.fillText('R retry  •  E endless  •  H hangar', width / 2, 692);
 }
 
 function createRenderer(canvas) {
@@ -2861,9 +3499,10 @@ function createRenderer(canvas) {
     ctx.scale(scale, scale);
     // Hit shake: the field jolts ~3 px for 0.1 s. The HUD and overlays
     // are drawn after the matching restore(), so they stay steady.
+    // REDUCE SHAKE (settings) softens it to a 1 px nudge.
     ctx.save();
     if (state.shakeTime > 0) {
-      const mag = (state.shakeMag || 3) * Math.max(0, state.shakeTime / 0.1);
+      const mag = ((state.shakeMag || 3) * (save && save.settings.reduceShake ? 0.33 : 1)) * Math.max(0, state.shakeTime / 0.1);
       ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
     }
     drawStars(ctx, state);
@@ -2903,14 +3542,60 @@ function createRenderer(canvas) {
     if (screen === SCREEN_PLAY && pointer && pointer.down && pointer.mode === 'relative') {
       drawJoystick(ctx, pointer);
     }
-    // Floating score texts ("+10", "CLOSE! +5") rise and fade.
-    for (const f of state.floaters ?? []) {
-      ctx.globalAlpha = Math.max(0, f.life / f.maxLife);
-      ctx.fillStyle = f.color;
-      ctx.font = 'bold 20px sans-serif';
+    // Magnet ring: when the pickup radius grows mid-run, a brief cyan
+    // ring shows the new reach — the pull is visible, not invisible.
+    if (screen === SCREEN_PLAY && state.magnetFlash > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.35 * Math.max(0, state.magnetFlash / 1.5);
+      ctx.strokeStyle = CYAN;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(state.ship.x, state.ship.y, state.magnetRadius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+    // First-run cues (teach by doing, not by a wall of text): while the
+    // player has collected fewer than 3 shards in their very first run,
+    // a pulsing hint floats over the ship; the dash cue appears the
+    // first time a mine comes close while dash is ready.
+    if (screen === SCREEN_PLAY && extra.firstRun && (state.shardsCollected ?? 0) < 3 && state.time < 10) {
+      const pulse = 0.6 + 0.4 * Math.sin(state.time * 4);
+      ctx.save();
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = 'bold 24px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(f.text, f.x, f.y);
+      ctx.fillText('DRAG TO STEER', state.ship.x, state.ship.y - 70);
+      ctx.fillText('↓', state.ship.x, state.ship.y - 42);
+      ctx.restore();
+      ctx.textBaseline = 'alphabetic';
+    }
+    if (screen === SCREEN_PLAY && extra.dashCue) {
+      const pulse = 0.6 + 0.4 * Math.sin(state.time * 4);
+      ctx.save();
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = GOLD;
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('TAP DASH TO DODGE!', FIELD.width - 170, 540);
+      ctx.restore();
+      ctx.textBaseline = 'alphabetic';
+    }
+    // Floating score texts ("+10", "CLOSE! +5") rise and fade — only
+    // while playing. On the game-over / win screens they would bleed
+    // through the dim overlay onto the score lines, so they are not
+    // drawn there.
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) {
+      for (const f of state.floaters ?? []) {
+        ctx.globalAlpha = Math.max(0, f.life / f.maxLife);
+        ctx.fillStyle = f.color;
+        ctx.font = 'bold 20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(f.text, f.x, f.y);
+      }
     }
     ctx.globalAlpha = 1;
     ctx.restore();
@@ -2919,9 +3604,12 @@ function createRenderer(canvas) {
     if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
     if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state);
     if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
-    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary);
+    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
     if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height, summary);
     if (screen === SCREEN_STATS) drawStats(ctx, save, FIELD.width, FIELD.height);
+    if (screen === SCREEN_MISSIONS) drawMissionsPanel(ctx, save, FIELD.width, FIELD.height);
+    if (screen === SCREEN_SETTINGS) drawSettingsPanel(ctx, save, FIELD.width, FIELD.height, { fullscreenOn: extra.fullscreenOn ?? false });
+    if (screen === SCREEN_REWARD) drawRewardPanel(ctx, save, FIELD.width, FIELD.height);
     if (screen === SCREEN_UPGRADE) drawUpgrade(ctx, state, offers, FIELD.width, FIELD.height, upgradeAge);
     ctx.restore();
     noGlow(ctx);
@@ -3039,8 +3727,9 @@ function stageShot(name, world) {
 // Lumen Drift — boot and the one loop. Input is read every frame, the world
 // advances in fixed 1/60 s steps (several in a slow frame, none in a fast
 // one), and the renderer paints what is there. The game moves between
-// seven screens: title, hangar, play, upgrade (level-up choice), paused,
-// game over and win (which can continue into endless mode).
+// eleven screens: title, hangar, play, upgrade (level-up choice), paused,
+// game over and win (which can continue into endless mode), plus the
+// panels over Home — top scores, daily missions, settings and daily reward.
 //
 // ?seed=N fixes the storm's pattern. ?shot=start|play|end|win (with
 // &seed=N) stages that scene instead of running the loop, paints it twice
@@ -3127,9 +3816,15 @@ function runGame() {
   });
   const streakInfo = touchStreak(save, today);
   saveSave(window.localStorage, save);
+  // The settings panel's mute toggle is persisted in the save.
+  audio.setMuted(save.settings.muted);
   let best = save.best;
   let lifetimeShards = save.lifetime.shards;
   let skinId = loadSkinId(window.localStorage, lifetimeShards);
+  // The dash cue (first-time teaching) has been displayed this run.
+  let dashCueSeen = false;
+  // Whether the dash cue should show right now (computed each frame).
+  let dashCue = false;
   // Hangar bonuses apply from the start of every run.
   world.setHangar(hangarBonuses(save));
   // The last run's summary (top-5 rank, missions) for the game-over screen.
@@ -3204,6 +3899,9 @@ function runGame() {
     } else {
       result = recordRun(save, run);
     }
+    // The first-run cue is over once the run ends; the dash cue is
+    // retired the same way, so it teaches exactly once.
+    if (dashCueSeen) save.ftue.dashCueShown = true;
     const completed = updateMissions(save, run);
     saveSave(window.localStorage, save);
     best = save.best;
@@ -3276,12 +3974,14 @@ function runGame() {
       : `Ship skin ${next.name}. All skins unlocked.`);
   }
 
-  function inSkinPreview(tap) {
-    return tap
-      && tap.x >= SKIN_PREVIEW_RECT.x
-      && tap.x <= SKIN_PREVIEW_RECT.x + SKIN_PREVIEW_RECT.w
-      && tap.y >= SKIN_PREVIEW_RECT.y
-      && tap.y <= SKIN_PREVIEW_RECT.y + SKIN_PREVIEW_RECT.h;
+  // Open a panel over Home (top scores, missions, settings, daily
+  // reward). One tap on the X, the backdrop, Esc or Enter closes it.
+  function openPanel(panelScreen, label) {
+    screen = panelScreen;
+    input.clearPressed();
+    input.clearTap();
+    audio.click();
+    announce(`${label}. Tap ✕, the backdrop, or press Esc to go back.`);
   }
 
   function inRect(tap, rect) {
@@ -3354,46 +4054,37 @@ function runGame() {
     if (input.consume(ACTION_FULLSCREEN)) toggleFullscreen();
 
     if (screen === SCREEN_TITLE) {
-      // The title floats over a live drifting field.
+      // The title floats over a live drifting field. Home is PLAY only:
+      // the gear opens settings, the flame opens the daily reward, the
+      // bottom tab bar (after the first run) opens hangar / missions /
+      // scores. The skin selector lives in the hangar now.
       world.step(STEP, { x: 0, y: 0 }, null, false);
-      // Skin selector: ←/→ (or A/D) cycles unlocked skins; the ◀ ▶ arrow
-      // buttons do the same on touch. A tap on the ship preview itself
-      // does nothing now, so a launch tap can never change the skin.
       const tap = input.takeTap();
-      if (inRect(tap, SKIN_ARROW_LEFT)) {
-        cycleSkin(-1);
-        input.clearPressed();
-      } else if (inRect(tap, SKIN_ARROW_RIGHT)) {
-        cycleSkin(1);
-        input.clearPressed();
-      } else if (inRect(tap, HANGAR_BUTTON_RECT)) {
+      if (inRect(tap, GEAR_RECT)) {
+        openPanel(SCREEN_SETTINGS, 'Settings');
+      } else if (inRect(tap, FLAME_RECT) && save.streak.count > 0) {
+        openPanel(SCREEN_REWARD, 'Daily reward');
+      } else if (inRect(tap, PLAY_RECT)) {
+        startGame();
+      } else if (inRect(tap, HANGAR_TAB_RECT) && save.lifetime.runs > 0) {
         enterHangar();
-      } else if (inRect(tap, STATS_BUTTON_RECT)) {
-        screen = SCREEN_STATS;
-        input.clearPressed();
-        input.clearTap();
-        announce('Top scores. Press T or tap to go back.');
-      } else if (inSkinPreview(tap)) {
-        input.clearPressed();
-      } else if (input.consume('ArrowLeft') || input.consume('KeyA')) {
-        cycleSkin(-1);
-      } else if (input.consume('ArrowRight') || input.consume('KeyD')) {
-        cycleSkin(1);
+      } else if (inRect(tap, MISSIONS_TAB_RECT) && save.lifetime.runs > 0) {
+        openPanel(SCREEN_MISSIONS, 'Daily missions');
+      } else if (inRect(tap, SCORES_TAB_RECT) && save.lifetime.runs > 0) {
+        openPanel(SCREEN_STATS, 'Top scores');
       } else if (input.consume('KeyT')) {
-        screen = SCREEN_STATS;
-        input.clearPressed();
-        input.clearTap();
-        announce('Top scores. Press T or tap to go back.');
+        openPanel(SCREEN_STATS, 'Top scores');
       } else if (input.consume('KeyH')) {
         enterHangar();
       } else if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) {
         startGame();
       }
     } else if (screen === SCREEN_HANGAR) {
-      // Buy with keys 1-5 or by tapping a part's BUY button; H, Esc or
-      // the BACK button returns to the title. While the input gate is
-      // closed (the tap that opened the hangar, or its first 400 ms),
-      // swallow everything — a stale tap must never buy a part.
+      // Buy with keys 1-5 or by tapping a part's BUY button; ◀ ▶ (or
+      // ←/→) cycles the ship skin; H, Esc or the BACK button returns to
+      // the title. While the input gate is closed (the tap that opened
+      // the hangar, or its first 400 ms), swallow everything — a stale
+      // tap must never buy a part.
       if (!input.gateOpen()) {
         input.takeTap();
         input.clearPressed();
@@ -3404,6 +4095,12 @@ function runGame() {
           input.clearPressed();
           input.clearTap();
           announce('Lumen Drift. Press Enter or click to launch.');
+        } else if (inRect(tap, HANGAR_SKIN_LEFT)) {
+          cycleSkin(-1);
+          input.clearPressed();
+        } else if (inRect(tap, HANGAR_SKIN_RIGHT)) {
+          cycleSkin(1);
+          input.clearPressed();
         } else {
           const rows = layoutHangarParts();
           const bought = rows.findIndex((row) => inRect(tap, row.buy));
@@ -3413,6 +4110,8 @@ function runGame() {
           else if (input.consume(ACTION_PICK_3)) tryBuyHangar(2);
           else if (input.consume('Digit4')) tryBuyHangar(3);
           else if (input.consume('Digit5')) tryBuyHangar(4);
+          else if (input.consume('ArrowLeft') || input.consume('KeyA')) cycleSkin(-1);
+          else if (input.consume('ArrowRight') || input.consume('KeyD')) cycleSkin(1);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
             screen = SCREEN_TITLE;
             input.clearPressed();
@@ -3421,10 +4120,66 @@ function runGame() {
           }
         }
       }
-    } else if (screen === SCREEN_STATS) {
-      // Any tap (or T / Esc) goes back to the title.
-      input.takeTap();
-      if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_PAUSE) || input.consume('KeyT')) {
+    } else if (screen === SCREEN_STATS || screen === SCREEN_MISSIONS || screen === SCREEN_SETTINGS || screen === SCREEN_REWARD) {
+      // Panels over Home: the X, a tap on the backdrop, Esc/P or T
+      // closes back to Home. Each panel also has its own taps — those
+      // are checked FIRST, because the same press that taps a button
+      // also counts as a confirm (input adds ACTION_CONFIRM on every
+      // canvas press); checking close first would close the panel
+      // instead of claiming / rerolling / toggling.
+      const tap = input.takeTap();
+      let handled = false;
+      if (screen === SCREEN_MISSIONS) {
+        const rows = layoutMissionRows();
+        const rerolled = rows.findIndex((row) => inRect(tap, row.reroll));
+        if (rerolled >= 0 && save.missions.list[rerolled]) {
+          const result = rerollMission(save, save.missions.list[rerolled].id);
+          if (result.ok) {
+            saveSave(window.localStorage, save);
+            audio.click();
+            announce(`Mission rerolled: ${result.mission.name}.`);
+          } else {
+            announce('No rerolls left today — missions reset at midnight.');
+          }
+          handled = true;
+        }
+      } else if (screen === SCREEN_SETTINGS) {
+        if (inRect(tap, SETTINGS_SOUND_RECT)) {
+          save.settings.muted = !save.settings.muted;
+          audio.setMuted(save.settings.muted);
+          saveSave(window.localStorage, save);
+          announce(save.settings.muted ? 'Sound muted.' : 'Sound on.');
+          handled = true;
+        } else if (inRect(tap, SETTINGS_FULLSCREEN_RECT)) {
+          toggleFullscreen();
+          handled = true;
+        } else if (inRect(tap, SETTINGS_SHAKE_RECT)) {
+          save.settings.reduceShake = !save.settings.reduceShake;
+          saveSave(window.localStorage, save);
+          announce(save.settings.reduceShake ? 'Screen shake reduced.' : 'Full screen shake on.');
+          handled = true;
+        }
+      } else if (screen === SCREEN_REWARD) {
+        if (inRect(tap, CLAIM_RECT)) {
+          const claimed = claimDailyReward(save, today);
+          if (claimed.claimed) {
+            saveSave(window.localStorage, save);
+            lifetimeShards = save.lifetime.shards;
+            audio.levelup();
+            announce(`Daily reward claimed: +${claimed.reward} shards!`);
+          }
+          handled = true;
+        }
+      }
+      if (handled) {
+        // Drain the confirm this press also raised, so it cannot leak
+        // into the next screen.
+        input.clearPressed();
+        input.clearTap();
+      } else if (inRect(tap, PANEL_CLOSE_RECT)
+        || (tap && !inRect(tap, PANEL_CARD))
+        || input.consume(ACTION_PAUSE)
+        || input.consume('KeyT')) {
         screen = SCREEN_TITLE;
         input.clearPressed();
         input.clearTap();
@@ -3454,6 +4209,29 @@ function runGame() {
           if (events & EVENT_OVER) { endGame(false); break; }
         }
         runStats.maxLevel = Math.max(runStats.maxLevel, world.state.level);
+        // Dash cue (teach by doing): the first time a mine drifts close
+        // while the dash is ready, and the cue has never been shown, a
+        // "TAP DASH TO DODGE!" hint appears in play. Once the player has
+        // seen it (a dash, or the run ending), it never shows again.
+        dashCue = false;
+        if (!save.ftue.dashCueShown) {
+          const ship = world.state.ship;
+          const dashReady = ship.dashCooldown <= 0 && ship.dashTime <= 0;
+          if (dashReady) {
+            dashCue = world.state.mines.some((m) => {
+              const dx = m.x - ship.x;
+              const dy = m.y - ship.y;
+              return dx * dx + dy * dy < 150 * 150;
+            });
+            // Retire the cue the moment it first shows (one save write),
+            // so quitting mid-run cannot make it pop up again next run.
+            if (dashCue && !dashCueSeen) {
+              dashCueSeen = true;
+              save.ftue.dashCueShown = true;
+              saveSave(window.localStorage, save);
+            }
+          }
+        }
         // A level rose and the run is still going: pause the action and
         // offer the upgrade choice. (Win/over above already changed the
         // screen, so this only fires while still playing.)
@@ -3488,30 +4266,65 @@ function runGame() {
         input.clearPressed();
       }
     } else if (screen === SCREEN_PAUSED) {
-      if (input.consume(ACTION_PAUSE) || input.consume(ACTION_CONFIRM)) {
+      // The pause menu is an exit, not a trap: resume, restart, hangar
+      // or menu — including during endless, where the run can be left
+      // at any time. The button taps are checked FIRST: the same press
+      // that taps a button also counts as a confirm (input adds
+      // ACTION_CONFIRM on every canvas press), and checking resume
+      // first would resume the game instead of opening the hangar.
+      const tap = input.takeTap();
+      if (inRect(tap, PAUSE_RESUME_RECT)) {
+        screen = SCREEN_PLAY;
+        input.clearPressed();
+        input.clearTap();
+        announce('Resumed.');
+      } else if (inRect(tap, PAUSE_RESTART_RECT)) {
+        startGame();
+      } else if (inRect(tap, PAUSE_HANGAR_RECT)) {
+        enterHangar();
+      } else if (inRect(tap, PAUSE_MENU_RECT)) {
+        // No key for MENU here: KeyM is the global mute toggle, so the
+        // menu is the button (keyboard players go H, H: hangar, back).
+        screen = SCREEN_TITLE;
+        input.clearPressed();
+        input.clearTap();
+        announce('Lumen Drift. Press Enter or click to launch.');
+      } else if (input.consume(ACTION_PAUSE) || input.consume(ACTION_CONFIRM)) {
         screen = SCREEN_PLAY;
         input.clearPressed();
         input.clearTap();
         announce('Resumed.');
       } else if (input.consume(ACTION_RESTART)) {
         startGame();
+      } else if (input.consume('KeyH')) {
+        enterHangar();
       }
     } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
       // Deliberate restart only: the PLAY AGAIN button, or the R key.
       // A tap anywhere else no longer restarts — the player gets to read
       // the score, the rank and the near-miss line first. On the win
       // screen, E (or the green button) keeps the run going, endless.
+      // H (or the HANGAR button) banks the run and goes to the hangar
+      // to spend — the endless trap is closed from both screens.
       const tap = input.takeTap();
       if (input.consume(ACTION_RESTART)) {
         startGame();
       } else if (screen === SCREEN_WIN && input.consume('KeyE')) {
         continueEndless();
+      } else if (input.consume('KeyH')) {
+        enterHangar();
       } else if (inRect(tap, PLAY_AGAIN_RECT)) {
         input.clearPressed();
         startGame();
       } else if (screen === SCREEN_WIN && inRect(tap, ENDLESS_RECT)) {
         input.clearPressed();
         continueEndless();
+      } else if (inRect(tap, OVER_HANGAR_RECT)) {
+        input.clearPressed();
+        enterHangar();
+      } else if (screen === SCREEN_WIN && inRect(tap, WIN_HANGAR_RECT)) {
+        input.clearPressed();
+        enterHangar();
       }
     }
 
@@ -3524,11 +4337,14 @@ function runGame() {
       save,
       streakInfo,
       summary: lastSummary,
+      firstRun: save.lifetime.runs === 0,
+      dashCue,
+      fullscreenOn: !!document.fullscreenElement,
     });
   }
 
-  announce(streakInfo.isNewDay
-    ? `Lumen Drift. Day ${save.streak.count} streak — ${streakInfo.bonus} bonus shards! Press Enter or click to launch.`
+  announce(streakInfo.isNewDay && streakInfo.reward > 0
+    ? `Lumen Drift. Day ${save.streak.count} streak — your daily reward (◆ ${streakInfo.reward}) is ready! Tap the flame to claim.`
     : 'Lumen Drift. Press Enter or click to launch.');
   requestAnimationFrame(frame);
 }
