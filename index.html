@@ -90,8 +90,10 @@ const HEARTS = 3;
 
 // Star shards: base points, and the combo ladder (consecutive pickups with
 // no hit multiply the base; every 3 pickups steps the combo up one rung).
-// Combo caps at x5.
-const SHARD_POINTS = 10;
+// Combo caps at x5. Base 6 (was 10): the old 10 made stage 1 clear in
+// ~8 s for the autopilot — far under Petta's 30–60 s for an early stage.
+// At 6, a max-combo shard is 30 and a golden shard is 30 (see world.js).
+const SHARD_POINTS = 6;
 const COMBO_MAX = 5;
 
 // The skiff: how fast it flies, how hard the dash kicks, how long the dash
@@ -120,8 +122,10 @@ const LEVEL_MAX = 5;
 // Spawn pacing, in seconds between spawns at level 1; each level multiplies
 // the rate by SPAWN_GROWTH, so the field gets busier as the score climbs —
 // but more slowly than before (0.88, not 0.82), and never past the caps.
+// Shards every 0.85 s (was 0.55): the old rate carpeted the field, so
+// the magnet vacuumed a stage clear in seconds.
 const SPAWN = {
-  shardEvery: 0.55,
+  shardEvery: 0.85,
   mineEvery: 1.5,
   stormEvery: 2.4,
   shieldEvery: 14,
@@ -419,10 +423,14 @@ const BOSS_NAMES = {
   100: 'THE FINAL STORM',
 };
 
-/** Points needed to clear a non-boss stage; boss/midboss stages are 0 (kill the boss). */
+/** Points needed to clear a non-boss stage; boss/midboss stages are 0 (kill the boss).
+ * 500 + 50*(n-1) (was 300 + 30*(n-1)): with the slower shard economy
+ * (base 6, spawn 0.85 s) the old targets cleared in ~8 s for the
+ * autopilot — stage 1 should take a human 30–60 s, growing with stage.
+ */
 function stageTarget(n) {
   if (isBossStage(n) || isMidbossStage(n)) return 0;
-  return 300 + 30 * (n - 1);
+  return 500 + 50 * (n - 1);
 }
 
 /** Boss stages: every 10th stage (10, 20, …, 100). */
@@ -542,6 +550,16 @@ const BLASTER = {
   id: 'blaster', name: 'BLASTER', range: 460, bulletSpeed: 950, bulletRadius: 5,
 };
 
+// Enemy bullets (the magenta orbs) are shootable: an orb inside this
+// radius of the ship is an immediate threat, so the Blaster shoots it
+// before anything else. Farther orbs are only mopped up when no enemy
+// or boss is in range — shooting orbs must stay defensive, never the
+// main job, or boss fights would lose all their pressure. The radius
+// is deliberately short (~1 s of orb flight): a wide radius let the
+// Blaster spend whole radial bursts on orbs and doubled boss kill
+// times in the sim.
+const BULLET_DEFENSE_RADIUS = 140;
+
 const ENEMY_KILL_POINTS = { drifter: 25, dart: 30, bulwark: 50, spitter: 40 };
 
 function distTo(ship, t) {
@@ -549,14 +567,27 @@ function distTo(ship, t) {
 }
 
 /**
- * Nearest enemy (state.enemies) or boss (state.boss) within
- * BLASTER.range of the ship. Returns { x, y, kind, ref } or null.
- * The boss is just another candidate — it wins only when it is the
- * closest target in range.
+ * Nearest target for the Blaster, in priority order:
+ *   1. an enemy bullet (magenta orb) inside BULLET_DEFENSE_RADIUS —
+ *      self-defense: the orb about to hit the ship is shot first;
+ *   2. the nearest enemy or boss inside BLASTER.range;
+ *   3. the nearest enemy bullet inside BLASTER.range (idle cleanup).
+ * Returns { x, y, kind, ref } or null. Bullet targets carry
+ * kind 'enemyBullet' and ref the orb object (1 HP — see updateBullets).
  */
 function nearestTarget(state) {
   const ship = state.ship;
   if (!ship) return null;
+  let closeBullet = null;
+  let closeDist = BULLET_DEFENSE_RADIUS;
+  for (const b of state.enemyBullets || []) {
+    const d = distTo(ship, b);
+    if (d <= closeDist) {
+      closeDist = d;
+      closeBullet = { x: b.x, y: b.y, kind: 'enemyBullet', ref: b };
+    }
+  }
+  if (closeBullet) return closeBullet;
   let best = null;
   let bestDist = BLASTER.range;
   for (const enemy of state.enemies || []) {
@@ -572,7 +603,17 @@ function nearestTarget(state) {
       best = { x: state.boss.x, y: state.boss.y, kind: state.boss.kind || 'boss', ref: state.boss };
     }
   }
-  return best;
+  if (best) return best;
+  let farBullet = null;
+  let farDist = BLASTER.range;
+  for (const b of state.enemyBullets || []) {
+    const d = distTo(ship, b);
+    if (d <= farDist) {
+      farDist = d;
+      farBullet = { x: b.x, y: b.y, kind: 'enemyBullet', ref: b };
+    }
+  }
+  return farBullet;
 }
 
 /**
@@ -615,7 +656,9 @@ function hitRadius(target) {
  * to state.score, a '+N' floater is pushed, and state.gateProgress is
  * refreshed when state.stageTarget is a finite number. A hit on the
  * boss reduces state.boss.hp (boss death is the world's job — it
- * watches state.boss.hp <= 0). `burst` is an optional (x, y) callback.
+ * watches state.boss.hp <= 0). A hit on an enemy bullet (magenta orb)
+ * destroys the orb with a spark and no score — shooting orbs is
+ * defensive, not a farm. `burst` is an optional (x, y) callback.
  */
 function updateBullets(state, dt, burst) {
   const width = state.width ?? FIELD.width;
@@ -653,6 +696,21 @@ function updateBullets(state, dt, burst) {
         boss.hp -= b.damage;
         if (burst) burst(b.x, b.y);
         spent = true;
+      }
+    }
+    // Last: an enemy bullet (magenta orb) is 1 HP — the bolt pops it
+    // with a spark and no score. Enemies and the boss are checked
+    // first, so one bolt never wastes itself on an orb in their way.
+    if (!spent) {
+      const orbs = state.enemyBullets || [];
+      for (let i = 0; i < orbs.length; i += 1) {
+        const orb = orbs[i];
+        if (Math.hypot(orb.x - b.x, orb.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + (orb.radius ?? 6)) {
+          orbs.splice(i, 1);
+          if (burst) burst(b.x, b.y);
+          spent = true;
+          break;
+        }
       }
     }
     if (!spent) kept.push(b);
@@ -1051,22 +1109,24 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     return true;
   }
 
-  // A boss radial burst: 10 enemy bullets in a ring, speed 120.
+  // A boss radial burst: 10 enemy bullets in a ring, speed 140.
+  // (Was 120: orbs are shootable now, so they fly a little faster to
+  // keep the burst threatening instead of free target practice.)
   function fireRadial(boss) {
     for (let i = 0; i < 10; i += 1) {
       const angle = (i / 10) * Math.PI * 2;
       state.enemyBullets.push({
         x: boss.x,
         y: boss.y,
-        vx: Math.cos(angle) * 120,
-        vy: Math.sin(angle) * 120,
+        vx: Math.cos(angle) * 140,
+        vy: Math.sin(angle) * 140,
         radius: 6,
         age: 0,
       });
     }
   }
 
-  // A boss aimed spread: 3 shots at the ship, speed 150.
+  // A boss aimed spread: 3 shots at the ship, speed 170.
   function fireAimed(boss) {
     const dx = state.ship.x - boss.x;
     const dy = state.ship.y - boss.y;
@@ -1076,15 +1136,15 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
       state.enemyBullets.push({
         x: boss.x,
         y: boss.y,
-        vx: Math.cos(angle) * 150,
-        vy: Math.sin(angle) * 150,
+        vx: Math.cos(angle) * 170,
+        vy: Math.sin(angle) * 170,
         radius: 6,
         age: 0,
       });
     }
   }
 
-  // One spitter shot: a single enemy bullet at the ship, speed 120.
+  // One spitter shot: a single enemy bullet at the ship, speed 140.
   function fireSpitter(enemy) {
     const dx = state.ship.x - enemy.x;
     const dy = state.ship.y - enemy.y;
@@ -1092,8 +1152,8 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     state.enemyBullets.push({
       x: enemy.x,
       y: enemy.y,
-      vx: (dx / len) * 120,
-      vy: (dy / len) * 120,
+      vx: (dx / len) * 140,
+      vy: (dy / len) * 140,
       radius: 6,
       age: 0,
     });
@@ -1422,10 +1482,11 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     state.enemyBullets = state.enemyBullets.filter((e) => !offscreen(e));
 
     // --- Blaster ----------------------------------------------------------
-    // Auto-fires at the nearest enemy or boss in range; bullets resolve
-    // hits (and kill points) in updateBullets. A dead boss clears the stage.
+    // Auto-fires at the nearest enemy or boss in range — or at an enemy
+    // bullet when that is all there is to shoot; bullets resolve hits
+    // (and kill points) in updateBullets. A dead boss clears the stage.
     state.blasterCooldown = Math.max(0, (state.blasterCooldown ?? 0) - dt);
-    if (state.enemies.length > 0 || state.boss) fireBlaster(state);
+    if (state.enemies.length > 0 || state.boss || state.enemyBullets.length > 0) fireBlaster(state);
     updateBullets(state, dt, (x, y) => burst(x, y, '#67e8f9', 8, 200));
     if (state.boss && state.boss.hp <= 0) {
       burst(state.boss.x, state.boss.y, '#f472b6', 40, 420);
@@ -1483,15 +1544,16 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
       state.shardsCollected += 1;
       state.combo = Math.min(COMBO_MAX, 1 + Math.floor(state.comboCount / 3));
       state.bestCombo = Math.max(state.bestCombo, state.combo);
-      // A golden shard pays a flat 50 (no combo multiplier) — the rare
-      // spike is the reward, not the multiplier.
-      const gained = e.golden ? 50 : shardPointsFor(state) * state.combo;
+      // A golden shard pays a flat 30 (no combo multiplier) — the rare
+      // spike is the reward, not the multiplier. (5x the 6-point base,
+      // matching the old 50 on a 10-point base.)
+      const gained = e.golden ? 30 : shardPointsFor(state) * state.combo;
       if (e.golden) state.goldenCollected = (state.goldenCollected || 0) + 1;
       state.score += gained;
       state.level = levelFor(state.score);
       state.floaters.push({
         x: e.x, y: e.y - 10,
-        text: e.golden ? 'GOLDEN +50' : `+${gained}`,
+        text: e.golden ? 'GOLDEN +30' : `+${gained}`,
         life: 0.9, maxLife: 0.9, color: e.golden ? '#fde047' : '#fbbf24',
       });
       state.comboPulse = 1;
@@ -2798,6 +2860,38 @@ function buyHangarPart(save, partId) {
   return { ok: true, cost: check.cost, level: save.hangar[part.id] };
 }
 
+// ---- src/themes.js ----
+// Lumen Drift — one visual theme per 10-stage band (fix round
+// 2026-11-18: "setiap persepuluh level tema stage berubah"). Pure data:
+// no DOM, no storage. A theme is a dark sky gradient (3 stops, like the
+// original indigo) plus one accent color for the band label, the next
+// tile and the HUD stage line. Gameplay is identical in every band —
+// only the look changes. The renderer falls back to band 0 when no
+// theme is given.
+const THEMES = [
+  { band: 0, name: 'SOLAR DAWN', bg: ['#0b1026', '#141b3d', '#1e1b4b'], accent: '#22d3ee' },
+  { band: 1, name: 'EMBER DRIFT', bg: ['#170b12', '#2b1220', '#3d1420'], accent: '#fb923c' },
+  { band: 2, name: 'VIOLET NEBULA', bg: ['#120b26', '#1e1445', '#2e1065'], accent: '#c084fc' },
+  { band: 3, name: 'JADE FIELDS', bg: ['#04160f', '#0a2e1d', '#14532d'], accent: '#34d399' },
+  { band: 4, name: 'CRIMSON STORM', bg: ['#1c0505', '#2d0a0a', '#450a0a'], accent: '#f87171' },
+  { band: 5, name: 'FROST VOID', bg: ['#06121f', '#0a2a44', '#0c4a6e'], accent: '#7dd3fc' },
+  { band: 6, name: 'GOLDEN REACH', bg: ['#171005', '#2a1f08', '#3f2d06'], accent: '#fbbf24' },
+  { band: 7, name: 'ABYSSAL DEEP', bg: ['#040718', '#0c1440', '#172554'], accent: '#818cf8' },
+  { band: 8, name: 'ROSE QUASAR', bg: ['#1c0716', '#330a2e', '#4a044e'], accent: '#f472b6' },
+  { band: 9, name: 'FINAL STORM', bg: ['#0a0a0a', '#1c1917', '#292524'], accent: '#fde047' },
+];
+
+/** The theme of a stage: band = floor((n-1)/10), clamped to 0–9. */
+function themeFor(stage) {
+  const n = typeof stage === 'number' && Number.isFinite(stage) ? stage : 1;
+  return THEMES[Math.min(9, Math.max(0, Math.floor((n - 1) / 10)))];
+}
+
+/** Band index (0–9) of a stage. */
+function bandOf(stage) {
+  return themeFor(stage).band;
+}
+
 // ---- src/ships.js ----
 // Lumen Drift — the ship shop: six ships, their levels, and the coin
 // economy. Pure logic: every function takes the save and returns plain
@@ -3692,7 +3786,7 @@ function drawJoystick(ctx, pointer) {
   ctx.restore();
 }
 
-function drawHud(ctx, state, best, width) {
+function drawHud(ctx, state, best, width, theme = THEMES[0]) {
   const pad = 18;
   ctx.textBaseline = 'alphabetic';
   // Score, big and gold — counted up smoothly (displayScore), not jumped.
@@ -3740,10 +3834,10 @@ function drawHud(ctx, state, best, width) {
     ctx.fill();
     ctx.restore();
   }
-  // Stage, top right — one slot per max heart sits under it (upgrades
-  // can add to 5). LEVEL lives on the upgrade screen only now.
+  // Stage, top right — tinted with the current band's theme accent.
+  // LEVEL lives on the upgrade screen only now.
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#e2e8f0';
+  ctx.fillStyle = theme.accent;
   ctx.font = 'bold 19px sans-serif';
   ctx.fillText(state.endless ? 'ENDLESS' : `STAGE ${state.stage ?? 1}`, width - pad, 66);
   const dashReady = state.ship.dashCooldown <= 0;
@@ -4694,10 +4788,11 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
   const layout = layoutStageTiles(page);
   const lo = layout.page * STAGES_PER_PAGE + 1;
   const hi = lo + STAGES_PER_PAGE - 1;
-  // Band label with page arrows.
-  ctx.fillStyle = '#e2e8f0';
+  // Band label with page arrows — the band's theme name and accent.
+  const bandTheme = themeFor(lo);
+  ctx.fillStyle = bandTheme.accent;
   ctx.font = 'bold 22px sans-serif';
-  ctx.fillText(`STAGES ${lo}–${hi}`, width / 2, 180);
+  ctx.fillText(`${bandTheme.name} · STAGES ${lo}–${hi}`, width / 2, 180);
   for (const [rect, dir, enabled] of [
     [layout.prevArrow, -1, layout.prevEnabled],
     [layout.nextArrow, 1, layout.nextEnabled],
@@ -4723,7 +4818,9 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
     ctx.fill();
     ctx.restore();
   }
-  // The tiles: number, state, coin reward.
+  // The tiles: number, state, coin reward. Boss and midboss stages
+  // are labelled on the tile (★ BOSS / ◆ MIDBOSS) — the fight is only
+  // visible in-game otherwise. The next tile uses the band accent.
   const nextStage = Math.min(100, cleared + 1);
   for (const tile of layout.tiles) {
     const n = tile.stage;
@@ -4731,12 +4828,21 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
     const isNext = n === nextStage;
     const accessible = stageAccessible(save ?? { highestCleared: 0 }, n);
     const reward = stageCoins(n);
+    const boss = isBossStage(n);
+    const midboss = isMidbossStage(n);
+    const stateText = isCleared
+      ? (boss ? '✓ BOSS' : midboss ? '✓ MIDBOSS' : '✓ CLEAR')
+      : (isNext
+        ? (boss ? '★ BOSS' : midboss ? '◆ MIDBOSS' : '▶ NEXT')
+        : (boss ? '🔒 BOSS' : midboss ? '🔒 MIDBOSS' : '🔒 LOCKED'));
+    const stateColor = boss ? GOLD : midboss ? '#c084fc'
+      : (isCleared ? GREEN : (isNext ? bandTheme.accent : '#94a3b8'));
     ctx.save();
     ctx.fillStyle = isCleared
       ? 'rgba(52, 211, 153, 0.16)'
-      : (isNext ? 'rgba(34, 211, 238, 0.18)' : 'rgba(20, 27, 61, 0.96)');
+      : (isNext ? 'rgba(226, 232, 240, 0.10)' : 'rgba(20, 27, 61, 0.96)');
     ctx.fillRect(tile.x, tile.y, tile.w, tile.h);
-    ctx.strokeStyle = isCleared ? GREEN : (isNext ? CYAN : 'rgba(148, 163, 184, 0.45)');
+    ctx.strokeStyle = isCleared ? GREEN : (isNext ? bandTheme.accent : 'rgba(148, 163, 184, 0.45)');
     ctx.lineWidth = isNext ? 3 : 2;
     ctx.strokeRect(tile.x, tile.y, tile.w, tile.h);
     ctx.textAlign = 'center';
@@ -4745,11 +4851,8 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
     ctx.font = 'bold 30px sans-serif';
     ctx.fillText(String(n), tile.x + tile.w / 2, tile.y + 34);
     ctx.font = 'bold 19px sans-serif';
-    ctx.fillStyle = isCleared ? GREEN : (isNext ? CYAN : '#94a3b8');
-    ctx.fillText(
-      isCleared ? '✓ CLEAR' : (isNext ? '▶ NEXT' : '🔒 LOCKED'),
-      tile.x + tile.w / 2, tile.y + 70,
-    );
+    ctx.fillStyle = stateColor;
+    ctx.fillText(stateText, tile.x + tile.w / 2, tile.y + 70);
     ctx.fillStyle = GOLD;
     ctx.font = '16px sans-serif';
     ctx.fillText(`🪙 ${isCleared ? reward.replay : reward.first}`, tile.x + tile.w / 2, tile.y + 94);
@@ -4905,11 +5008,13 @@ function createRenderer(canvas) {
     const { width, height, dpr } = resize();
     // Work in CSS pixels; the backing store is denser on hi-DPI screens.
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    // Deep indigo sky, full screen (it also fills the letterbox bars).
+    // Sky: the current band's theme gradient (extra.theme, or band 0
+    // SOLAR DAWN when none is given). It also fills the letterbox bars.
+    const theme = extra.theme ?? THEMES[0];
     const sky = ctx.createLinearGradient(0, 0, 0, height);
-    sky.addColorStop(0, '#0b1026');
-    sky.addColorStop(0.55, '#141b3d');
-    sky.addColorStop(1, '#1e1b4b');
+    sky.addColorStop(0, theme.bg[0]);
+    sky.addColorStop(0.55, theme.bg[1]);
+    sky.addColorStop(1, theme.bg[2]);
     ctx.fillStyle = sky;
     ctx.fillRect(0, 0, width, height);
     drawNebula(ctx, width, height);
@@ -5033,7 +5138,7 @@ function createRenderer(canvas) {
     ctx.globalAlpha = 1;
     ctx.restore();
 
-    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width);
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width, theme);
     if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
     if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape });
     if (screen === SCREEN_STAGES) drawStages(ctx, save, FIELD.width, FIELD.height, extra.stagesPage ?? 0, { ship: extra.ship });
@@ -5088,7 +5193,7 @@ function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
 // - start: the title screen over a live, drifting field.
 // - play: a busy mid-game — score ~340, combo x3, 2 hearts left.
 // - end: the autopilot flies carelessly and the storm takes the skiff.
-// - win: stage 1 clears at its target (300 points).
+// - win: stage 1 clears at its target (500 points).
 
 const START_SECONDS = 6;
 const PLAY_TARGET = 340;
@@ -5152,7 +5257,7 @@ function stageShot(name, world) {
     // brief asks for: ~340 points, combo x3, two hearts. The autopilot
     // keeps the skiff alive; the numbers below are the scene's floor.
     // (A stage-1 clear event may fire mid-scene once the score passes
-    // 300 — it is ignored here; the render stays 'play'.)
+    // 500 — it is ignored here; the render stays 'play'.)
     for (let i = 0; i < 12; i += 1) world.step(STEP, autopilot(state, false), null, false);
     state.score = PLAY_TARGET;
     state.combo = 3;
@@ -6004,6 +6109,12 @@ function runGame() {
     // no-op and CSS owns the buttons.
     applyTouchButtons(dashBtn, pauseBtn, screen, isTouchDevice());
 
+    // The band theme follows the context: the run's stage in play (the
+    // final band in endless), the visible page on the stage select, and
+    // the player's next stage everywhere else.
+    const themeStage = screen === SCREEN_STAGES
+      ? stagesPage * 10 + 1
+      : (world.state.endless ? 100 : (world.state.stage || (save.highestCleared ?? 0) + 1));
     renderer.draw(world.state, screen, best, {
       skin: skinById(skinId),
       offers: screen === SCREEN_UPGRADE ? offers : [],
@@ -6019,6 +6130,7 @@ function runGame() {
       shipShape: equippedShip(save).shape,
       ship: { name: equippedShip(save).name, level: Math.max(1, save.ships?.owned?.[equippedShip(save).id]?.level ?? 1) },
       stagesPage,
+      theme: themeFor(themeStage),
     });
   }
 
