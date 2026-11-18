@@ -676,6 +676,709 @@ function recordStageClear(save, n) {
   return { coins: replay, firstClear: false, unlockedEndless: false };
 }
 
+// ---- src/hangar.js ----
+// Lumen Drift — the hangar: permanent per-part ship upgrades bought with
+// lifetime star shards. Unlike the in-run upgrade picks (which reset every
+// run), hangar parts stay bought forever, so the ship visibly grows
+// stronger run after run — that is the point of this screen.
+//
+// Economy: two shard counters. `lifetime.shards` counts every shard ever
+// earned and NEVER decreases — it is what unlocks ship skins. `shardBalance`
+// is the spendable purse: every shard earned adds to it, every hangar
+// purchase deducts from it. Spending can therefore never lock a skin.
+//
+// Balance: a good run earns ~60-120 shards, plus the daily streak bonus
+// (10-100) and mission rewards (100/day). The first level of every part
+// costs 150-300, so each is affordable after a few runs; maxing all five
+// parts costs 9,400 shards — weeks of play, not a day. A fully kitted
+// ship is much stronger (up to 6 hearts, +24% speed, a starting shield,
+// a wide magnet, +6 points per shard) but the early levels stay hard:
+// the first levels only add a little, and the endless ramp (Part 2)
+// keeps scaling past anything the hangar can give.
+const HANGAR_PARTS = [
+  {
+    id: 'hull',
+    name: 'REINFORCED HULL',
+    desc: '+1 max hull heart per level.',
+    max: 3,
+    costs: [250, 700, 1500],
+  },
+  {
+    id: 'engine',
+    name: 'ION ENGINE',
+    desc: '+8% top speed and dash speed per level.',
+    max: 3,
+    costs: [200, 600, 1200],
+  },
+  {
+    id: 'shield',
+    name: 'AEGIS PLATING',
+    desc: 'Lv1: start each run with a shield. Lv2: shield cells spawn twice as often.',
+    max: 2,
+    costs: [300, 800],
+  },
+  {
+    id: 'magnet',
+    name: 'TRACTOR MAGNET',
+    desc: '+30 shard pickup radius per level.',
+    max: 3,
+    costs: [150, 500, 1100],
+  },
+  {
+    id: 'collector',
+    name: 'LIGHT COLLECTOR',
+    desc: '+2 points per star shard per level.',
+    max: 3,
+    costs: [200, 600, 1300],
+  },
+];
+
+function hangarPartById(id) {
+  return HANGAR_PARTS.find((p) => p.id === id) || null;
+}
+
+/** Current level of one part (0 when never bought). */
+function hangarLevel(save, id) {
+  return (save && save.hangar && save.hangar[id]) || 0;
+}
+
+/** Every part's level, for the world (missing parts read as 0). */
+function hangarBonuses(save) {
+  const out = {};
+  for (const part of HANGAR_PARTS) out[part.id] = hangarLevel(save, part.id);
+  return out;
+}
+
+/** Shards the next level costs, or null when the part is maxed. */
+function hangarNextCost(part, level) {
+  if (!part || level >= part.max) return null;
+  return part.costs[level];
+}
+
+/**
+ * Can this part be bought right now? Returns { ok } or { ok: false,
+ * reason } where reason is 'maxed', 'broke' or 'unknown'.
+ */
+function canBuyHangarPart(save, part) {
+  if (!part) return { ok: false, reason: 'unknown' };
+  const level = hangarLevel(save, part.id);
+  const cost = hangarNextCost(part, level);
+  if (cost === null) return { ok: false, reason: 'maxed' };
+  if ((save.shardBalance ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Buy the next level of one part. Mutates save.hangar and
+ * save.shardBalance. Returns { ok: true, cost, level } or
+ * { ok: false, reason } — the caller shows the reason, never crashes.
+ */
+function buyHangarPart(save, partId) {
+  const part = hangarPartById(partId);
+  const check = canBuyHangarPart(save, part);
+  if (!check.ok) return check;
+  if (!save.hangar) save.hangar = {};
+  save.hangar[part.id] = hangarLevel(save, part.id) + 1;
+  save.shardBalance = (save.shardBalance ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.hangar[part.id] };
+}
+
+// ---- src/ships.js ----
+// Lumen Drift — the ship shop: six ships, their levels, and the coin
+// economy. Pure logic: every function takes the save and returns plain
+// data or a { ok } / { ok: false, reason } result, like hangar.js.
+// Coins are save.coins (spendable); shards (shardBalance) are untouched.
+//
+// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
+// ship level + a better ship. A ship's level is bought with coins in
+// the shop (cap Lv 10); each level boosts stats, so the loop is:
+// clear stages -> earn coins -> level up / buy a better ship -> clear
+// higher stages.
+//
+// Unique power (Stage 2, Spekter "Agents" model): each ship has ONE
+// power beyond its base stats — the thing that makes it play
+// differently, not just bigger numbers. Powers never duplicate a
+// hangar part or a chip (no dash-recharge power, no start-with-shield,
+// no pierce, no drone — those live elsewhere).
+const SHIP_LEVEL_MAX = 10;
+
+const SHIPS = [
+  {
+    id: 'spark', name: 'SPARK', rarity: 'common', unlockStage: 0, price: 0,
+    hearts: 3, speedMult: 1.00, blasterDamage: 1, blasterRate: 2.0,
+    shape: 'skiff', desc: 'The starter skiff. Reliable, nothing fancy.',
+    power: { id: 'second-wind', name: 'SECOND WIND', desc: 'Survive a fatal hit once per run at 1 heart.' },
+  },
+  {
+    id: 'comet', name: 'COMET', rarity: 'common', unlockStage: 3, price: 150,
+    hearts: 3, speedMult: 1.05, blasterDamage: 1, blasterRate: 2.2,
+    shape: 'dart', desc: 'A quick dart. Fires a little faster.',
+    power: { id: 'dual-dash', name: 'DUAL DASH', desc: 'Dash twice before recharging.' },
+  },
+  {
+    id: 'nebula', name: 'NEBULA', rarity: 'rare', unlockStage: 10, price: 500,
+    hearts: 4, speedMult: 1.10, blasterDamage: 2, blasterRate: 2.2,
+    shape: 'wing', desc: 'A winged cruiser with a heavier blaster.',
+    power: { id: 'slow-field', name: 'SLOW FIELD', desc: 'Enemies within 120 px move 25% slower.' },
+  },
+  {
+    id: 'pulsar', name: 'PULSAR', rarity: 'epic', unlockStage: 25, price: 1500,
+    hearts: 4, speedMult: 1.15, blasterDamage: 2, blasterRate: 2.6,
+    shape: 'dart', desc: 'An epic dart that spits blaster fire.',
+    power: { id: 'rapid-fire', name: 'RAPID FIRE', desc: 'Weapon fires 20% faster.' },
+  },
+  {
+    id: 'aurora', name: 'AURORA', rarity: 'legendary', unlockStage: 50, price: 4000,
+    hearts: 5, speedMult: 1.20, blasterDamage: 3, blasterRate: 2.6,
+    shape: 'wing', desc: 'A legendary wing — the stage-50 gate-breaker.',
+    power: { id: 'renewal', name: 'RENEWAL', desc: 'Regain 1 heart when a stage is cleared.' },
+  },
+  {
+    id: 'novaprime', name: 'NOVA PRIME', rarity: 'mythic', unlockStage: 75, price: 8000,
+    hearts: 6, speedMult: 1.25, blasterDamage: 4, blasterRate: 3.0,
+    shape: 'skiff', desc: 'The mythic skiff. The final storm fears it.',
+    power: { id: 'nova-dash', name: 'NOVA DASH', desc: 'Dashing through an enemy deals 1 damage.' },
+  },
+];
+
+/** Every ship's unique power, as { ship, id, name, desc }. */
+const SHIP_POWERS = SHIPS.map((s) => ({ ship: s.id, ...s.power }));
+
+function shipById(id) {
+  return SHIPS.find((s) => s.id === id) || null;
+}
+
+/** A ship's unique power def (or null for a power-less def). */
+function shipPowerById(id) {
+  const def = shipById(id);
+  return (def && def.power) || null;
+}
+
+/** The ship that carries power `powerId` (or null). */
+function shipForPower(powerId) {
+  return SHIPS.find((s) => s.power && s.power.id === powerId) || null;
+}
+
+/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
+function shipLevelCost(level) {
+  return 100 * level;
+}
+
+/**
+ * Derived stats for a ship definition at a level:
+ * hearts +1 at Lv 5 and Lv 10, +2% speed per level, +1 blaster damage
+ * per level (flat), blaster rate unchanged.
+ */
+function shipStats(def, level) {
+  return {
+    hearts: def.hearts + (level >= 5 ? 1 : 0) + (level >= 10 ? 1 : 0),
+    speedMult: def.speedMult * (1 + 0.02 * (level - 1)),
+    blasterDamage: def.blasterDamage + (level - 1),
+    blasterRate: def.blasterRate,
+    level,
+  };
+}
+
+/** Current level of a ship (0 when not owned). */
+function shipLevel(save, id) {
+  return (save && save.ships && save.ships.owned && save.ships.owned[id]
+    && save.ships.owned[id].level) || 0;
+}
+
+/** The equipped ship's definition (defaults to SPARK when unset). */
+function equippedShip(save) {
+  const id = (save && save.ships && save.ships.equipped) || 'spark';
+  return shipById(id) || shipById('spark');
+}
+
+/** Derived stats of the equipped ship at its owned level. */
+function equippedShipStats(save) {
+  const def = equippedShip(save);
+  return shipStats(def, Math.max(1, shipLevel(save, def.id)));
+}
+
+/**
+ * Can this ship be bought right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
+ * | 'unknown'. Locked = highestCleared < unlockStage (spark, unlock 0,
+ * is always available; it starts owned).
+ */
+function canBuyShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) > 0) return { ok: false, reason: 'owned' };
+  if ((save.highestCleared || 0) < def.unlockStage) return { ok: false, reason: 'locked' };
+  if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
+  return { ok: true, cost: def.price };
+}
+
+/**
+ * Buy a ship. Deducts the price from save.coins, owns it at Lv 1 and
+ * equips it. Returns { ok: true, cost, level: 1 } or the canBuy reason.
+ */
+function buyShip(save, id) {
+  const check = canBuyShip(save, id);
+  if (!check.ok) return check;
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  if (!save.ships.owned) save.ships.owned = {};
+  save.coins = (save.coins ?? 0) - check.cost;
+  save.ships.owned[id] = { level: 1 };
+  save.ships.equipped = id;
+  return { ok: true, cost: check.cost, level: 1 };
+}
+
+/**
+ * Can this ship be levelled up right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
+ * 'broke' | 'unknown'.
+ */
+function canLevelShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const level = shipLevel(save, id);
+  if (level === 0) return { ok: false, reason: 'not-owned' };
+  if (level >= SHIP_LEVEL_MAX) return { ok: false, reason: 'maxed' };
+  const cost = shipLevelCost(level);
+  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Level a ship up one level. Deducts shipLevelCost(level) from
+ * save.coins. Returns { ok: true, cost, level } or the reason.
+ */
+function levelUpShip(save, id) {
+  const check = canLevelShip(save, id);
+  if (!check.ok) return check;
+  save.ships.owned[id].level += 1;
+  save.coins = (save.coins ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.ships.owned[id].level };
+}
+
+/**
+ * Equip an owned ship. Returns { ok } or
+ * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
+ */
+function equipShip(save, id) {
+  if (!shipById(id)) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  save.ships.equipped = id;
+  return { ok: true };
+}
+
+// ---- src/skins.js ----
+// Lumen Drift — ship skins: cosmetic hull colours unlocked by lifetime
+// star shards (total shards collected across ALL runs). Skins never change
+// the ship shape or hitbox — hull, glow, flame and trail colours only.
+//
+// Persistence lives here so it is testable with a fake storage object;
+// main.js passes window.localStorage. Every read/write is guarded, so
+// private windows (storage off) just fall back to the default skin.
+
+const DEFAULT_SKIN_ID = 'cyan';
+
+// Unlock thresholds: the first skin (EMBER) is earnable on day 1-2
+// (~2-3 good runs), so the first trophy lands fast; later skins space
+// out by gates, days and score milestones. Skins are milestone trophies,
+// not shop filler — the next one is always visible-but-locked as the
+// home-screen goal.
+const SKINS = [
+  {
+    id: 'cyan', name: 'CYAN', unlock: 0,
+    hull: '#0891b2', glow: '#22d3ee', flame: '#f97316', flameGlow: '#fb923c', trail: '#22d3ee',
+  },
+  {
+    id: 'ember', name: 'EMBER', unlock: 200,
+    hull: '#c2410c', glow: '#fb923c', flame: '#fbbf24', flameGlow: '#fb923c', trail: '#fb923c',
+  },
+  {
+    id: 'violet', name: 'VIOLET', unlock: 1000,
+    hull: '#6d28d9', glow: '#a78bfa', flame: '#e879f9', flameGlow: '#c084fc', trail: '#a78bfa',
+  },
+  {
+    id: 'aurora', name: 'AURORA', unlock: 2500,
+    hull: '#059669', glow: '#34d399', flame: '#6ee7b7', flameGlow: '#34d399', trail: '#34d399',
+  },
+  {
+    id: 'solar', name: 'SOLAR', unlock: 4500,
+    hull: '#b45309', glow: '#fbbf24', flame: '#fde68a', flameGlow: '#f59e0b', trail: '#fbbf24',
+  },
+  {
+    id: 'nova', name: 'NOVA', unlock: 7500,
+    hull: '#be185d', glow: '#f472b6', flame: '#67e8f9', flameGlow: '#22d3ee', trail: '#f472b6',
+  },
+];
+
+function skinById(id) {
+  return SKINS.find((s) => s.id === id) || SKINS[0];
+}
+
+/** Every skin the lifetime total has unlocked, in unlock order. */
+function unlockedSkins(lifetimeShards) {
+  return SKINS.filter((s) => lifetimeShards >= s.unlock);
+}
+
+/**
+ * The next skin still locked, with progress toward it — or null when
+ * every skin is unlocked.
+ */
+function nextUnlock(lifetimeShards) {
+  const next = SKINS.find((s) => lifetimeShards < s.unlock);
+  return next ? { skin: next, have: lifetimeShards, need: next.unlock } : null;
+}
+
+function loadLifetimeShards(storage) {
+  try {
+    return Number.parseInt(storage.getItem(SHARDS_KEY) ?? '0', 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveLifetimeShards(storage, value) {
+  try {
+    storage.setItem(SHARDS_KEY, String(value));
+  } catch {
+    // Storage can be off (private windows): progress lasts this visit.
+  }
+}
+
+/** Saved skin id, falling back to the default when it is locked/unknown. */
+function loadSkinId(storage, lifetimeShards) {
+  try {
+    const id = storage.getItem(SKIN_KEY);
+    const skin = id ? SKINS.find((s) => s.id === id) : null;
+    if (skin && lifetimeShards >= skin.unlock) return skin.id;
+  } catch {
+    // Fall through to the default.
+  }
+  return DEFAULT_SKIN_ID;
+}
+
+function saveSkinId(storage, id) {
+  try {
+    storage.setItem(SKIN_KEY, id);
+  } catch {
+    // Storage can be off: the choice lasts this visit.
+  }
+}
+
+// ---- src/pilot.js ----
+// Lumen Drift — the pilot: account level / XP, achievements, and the
+// profile aggregation (loadout + attributes + collection + totals).
+// Pure logic over the save blob; no DOM, no storage. Wave C renders
+// this (profile menu); Waves A/C build on the exact names below.
+//
+// XP model (tuned so an average player hits pilot Lv 5 in ~10-15 runs
+// and Lv 10 in ~40 runs — see the simulation test in
+// tests/pilot.test.mjs for the assumed average run):
+//   xpToNext(level) = 100 * level   (Lv1->2: 100, Lv2->3: 200, ...;
+//   cumulative XP to Lv 10 is 4500).
+//   awardRunXp: 15 base (showing up counts — every run pays, win or
+//   lose) + floor(score / 10) (performance) + 25 per stage cleared
+//   (50 on a first clear) + 1 per endless second + 25 flawless
+//   (noDamage). A first clear is detected from save.highestCleared,
+//   so call awardRunXp BEFORE recordStageClear mutates it — or pass
+//   run.firstClear explicitly.
+// Pilot level gates gear (PILOT_GATES): weapons, chip rarities and the
+// third chip slot unlock by pilot level, never by coins alone — the
+// level is the account's seniority, coins are the spend.
+//
+// Assumptions (chips.js / the full weapon roster are Wave A's and do
+// not exist yet): the only weapon is the Blaster, so weaponDamage /
+// weaponRate come from the equipped ship's blaster stats; chipEffects
+// is empty until the chip roster lands; the weapons collection total
+// is 1 (Blaster) and the chips collection total is 0 for the same
+// reason. Nothing here imports weapons.js or chips.js.
+
+/** XP to go from pilot level `level` to `level + 1` (100/level). */
+function xpToNext(level) {
+  return 100 * Math.max(1, level);
+}
+
+/** Total XP needed to reach `level` from level 1 (0 for level 1). */
+function xpForLevel(level) {
+  const n = Math.max(1, level) - 1;
+  return 50 * n * (n + 1);
+}
+
+/** Pilot level for a lifetime XP total (level 1 at 0 XP). */
+function pilotLevelForXp(totalXp) {
+  const xp = Math.max(0, totalXp || 0);
+  let level = 1;
+  while (xp >= xpForLevel(level + 1) && level < 999) level += 1;
+  return level;
+}
+
+/**
+ * Pilot level read from a save blob (defensive: 1 when the pilot
+ * block is missing). The single home for this helper — chips.js and
+ * weapons.js used to define their own copies, which collided into a
+ * duplicate declaration once bundled into one module scope and broke
+ * the live game with a SyntaxError (the multi-file tests never saw it).
+ */
+function pilotLevel(save) {
+  return (save && save.pilot && save.pilot.level) || 1;
+}
+
+/** Make sure save.pilot exists (a v4 blob, or a hand-edited one). */
+function ensurePilot(save) {
+  if (!save.pilot || typeof save.pilot !== 'object') save.pilot = { xp: 0, level: 1 };
+  if (typeof save.pilot.xp !== 'number') save.pilot.xp = 0;
+  if (typeof save.pilot.level !== 'number') save.pilot.level = 1;
+  return save.pilot;
+}
+
+/**
+ * Award XP for a finished run — win OR lose, no battle is wasted.
+ * run = { stage, score, cleared, endlessSeconds, kills,
+ * bulletsDestroyed, noDamage, firstClear? }. Returns
+ * { xpGained, level, leveledUp }. Mutates save.pilot.
+ *
+ * First-clear detection: run.firstClear when given, else
+ * run.cleared && run.stage > (save.highestCleared || 0) — so call
+ * this before recordStageClear updates highestCleared.
+ */
+function awardRunXp(save, run = {}) {
+  const pilot = ensurePilot(save);
+  const score = Math.max(0, run.score || 0);
+  const cleared = !!run.cleared;
+  const firstClear = cleared && (run.firstClear !== undefined
+    ? !!run.firstClear
+    : (run.stage || 0) > (save.highestCleared || 0));
+  let xp = 15 + Math.floor(score / 10);
+  if (cleared) xp += firstClear ? 50 : 25;
+  xp += Math.max(0, Math.floor(run.endlessSeconds || 0));
+  if (run.noDamage) xp += 25;
+  const oldLevel = pilot.level;
+  pilot.xp = (pilot.xp || 0) + xp;
+  pilot.level = pilotLevelForXp(pilot.xp);
+  return { xpGained: xp, level: pilot.level, leveledUp: pilot.level > oldLevel };
+}
+
+// --- Pilot-level gates ------------------------------------------------------
+
+/** What pilot level unlocks what gear (Wave A/C read this). */
+const PILOT_GATES = {
+  weapons: { mortar: 3, laser: 5, pulse: 8 },
+  chipRarity: { common: 1, rare: 3, epic: 5, legendary: 8 },
+  chipSlot3: 10,
+};
+
+// --- Achievements -----------------------------------------------------------
+
+/**
+ * Achievements: ~11, each { id, name, desc, reward (coins),
+ * check(save, stats) }. stats is save.stats (lifetime counters);
+ * checks that need other save fields read them from `save` directly.
+ * Rewards are coins (the stage economy), paid once on claim.
+ */
+const ACHIEVEMENTS = [
+  {
+    id: 'first-blood', name: 'FIRST BLOOD', desc: 'Destroy your first enemy.',
+    reward: 25,
+    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1,
+  },
+  {
+    id: 'boss-first', name: 'BOSS SLAYER', desc: 'Defeat your first boss.',
+    reward: 100,
+    check: (_save, stats) => (stats.bossesKilled || 0) >= 1,
+  },
+  {
+    id: 'clear-10', name: 'STAGE 10 CLEAR', desc: 'Clear stage 10 — the first boss falls.',
+    reward: 100,
+    check: (save) => (save.highestCleared || 0) >= 10,
+  },
+  {
+    id: 'clear-25', name: 'QUARTER WAY', desc: 'Clear stage 25.',
+    reward: 200,
+    check: (save) => (save.highestCleared || 0) >= 25,
+  },
+  {
+    id: 'clear-50', name: 'HALFWAY HERO', desc: 'Clear stage 50 — past the NEBULA CRUSHER.',
+    reward: 400,
+    check: (save) => (save.highestCleared || 0) >= 50,
+  },
+  {
+    id: 'clear-100', name: 'FINAL STORM', desc: 'Clear stage 100. The drift is yours.',
+    reward: 1000,
+    check: (save) => (save.highestCleared || 0) >= 100,
+  },
+  {
+    id: 'own-3-ships', name: 'FLEET OWNER', desc: 'Own 3 ships.',
+    reward: 150,
+    check: (save) => Object.keys(save.ships?.owned || {}).length >= 3,
+  },
+  {
+    id: 'pilot-5', name: 'SEASONED PILOT', desc: 'Reach pilot level 5.',
+    reward: 100,
+    check: (save) => (save.pilot?.level || 1) >= 5,
+  },
+  {
+    id: 'pilot-10', name: 'ACE PILOT', desc: 'Reach pilot level 10.',
+    reward: 250,
+    check: (save) => (save.pilot?.level || 1) >= 10,
+  },
+  {
+    id: 'slayer-1000', name: 'SLAYER', desc: 'Destroy 1,000 enemies (lifetime).',
+    reward: 300,
+    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1000,
+  },
+  {
+    id: 'bullet-breaker-500', name: 'BULLET BREAKER', desc: 'Shoot down 500 enemy bullets (lifetime).',
+    reward: 200,
+    check: (_save, stats) => (stats.bulletsDestroyed || 0) >= 500,
+  },
+];
+
+function achievementById(id) {
+  return ACHIEVEMENTS.find((a) => a.id === id) || null;
+}
+
+/** Make sure save.achievements exists (a v4 blob, or hand-edited). */
+function ensureAchievements(save) {
+  if (!save.achievements || typeof save.achievements !== 'object') {
+    save.achievements = { unlocked: {}, claimed: {} };
+  }
+  if (!save.achievements.unlocked || typeof save.achievements.unlocked !== 'object') {
+    save.achievements.unlocked = {};
+  }
+  if (!save.achievements.claimed || typeof save.achievements.claimed !== 'object') {
+    save.achievements.claimed = {};
+  }
+  return save.achievements;
+}
+
+/**
+ * Check every achievement against the save; unlock the newly earned
+ * ones. Returns the array of newly unlocked ids — idempotent: an
+ * already-unlocked achievement is never returned again.
+ */
+function checkAchievements(save) {
+  const achievements = ensureAchievements(save);
+  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
+  const newly = [];
+  for (const def of ACHIEVEMENTS) {
+    if (achievements.unlocked[def.id]) continue;
+    if (def.check(save, stats)) {
+      achievements.unlocked[def.id] = true;
+      newly.push(def.id);
+    }
+  }
+  return newly;
+}
+
+/**
+ * Claim an unlocked achievement's coin reward — once only. Returns
+ * { ok: true, reward } or { ok: false, reason } where reason is
+ * 'unknown' (bad id), 'not-unlocked' or 'claimed'.
+ */
+function claimAchievement(save, id) {
+  const def = achievementById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const achievements = ensureAchievements(save);
+  if (!achievements.unlocked[id]) return { ok: false, reason: 'not-unlocked' };
+  if (achievements.claimed[id]) return { ok: false, reason: 'claimed' };
+  achievements.claimed[id] = true;
+  save.coins = (save.coins ?? 0) + def.reward;
+  return { ok: true, reward: def.reward };
+}
+
+/**
+ * The equipped ship's unique power, for the profile menu. Wave C adds
+ * a `power` field { id, name, desc } to each ship def in ships.js;
+ * until then (or for a def without one) this is null — read
+ * defensively, never crash on a power-less def.
+ */
+function shipPowerFor(def) {
+  const power = def && def.power;
+  if (!power || typeof power !== 'object') return null;
+  return {
+    id: power.id ?? null,
+    name: power.name ?? null,
+    desc: power.desc ?? null,
+  };
+}
+
+// --- Profile aggregation ----------------------------------------------------
+
+/**
+ * The profile menu's data, aggregated from the save — pure, no
+ * mutation. Attribute totals use the same model as the in-game
+ * derived numbers: ship level (shipStats) + hangar parts, the
+ * Blaster's rate/damage from the equipped ship, dash cooldown from
+ * config, magnet radius = base + hangar magnet, shard value = base +
+ * hangar collector. In-run upgrade picks are NOT included (they reset
+ * every run); chips contribute nothing yet — the chip roster is
+ * Wave A's, so chipEffects is [] until it lands.
+ */
+function profileStats(save) {
+  const pilot = ensurePilot(save);
+  const level = pilot.level;
+  const xp = pilot.xp;
+  const xpIntoLevel = xp - xpForLevel(level);
+  const next = xpToNext(level);
+  const ship = equippedShipStats(save);
+  const shipPower = shipPowerFor(equippedShip(save));
+  const hangar = save.hangar || {};
+  const weapons = (save.weapons && typeof save.weapons === 'object') ? save.weapons : {};
+  const ownedWeapons = (weapons.owned && typeof weapons.owned === 'object') ? weapons.owned : {};
+  const equippedWeapon = typeof weapons.equipped === 'string' ? weapons.equipped : 'blaster';
+  const weaponLevel = (ownedWeapons[equippedWeapon] && ownedWeapons[equippedWeapon].level) || 1;
+  const chips = (save.chips && typeof save.chips === 'object') ? save.chips : {};
+  const ownedChips = (chips.owned && typeof chips.owned === 'object') ? chips.owned : {};
+  const slots = Array.isArray(chips.slots) ? chips.slots : [null, null];
+  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
+  const lifetimeShards = (save.lifetime && save.lifetime.shards) || 0;
+  return {
+    pilot: {
+      level,
+      xp,
+      xpToNext: next,
+      // 0..1 progress through the current level.
+      xpProgress: next > 0 ? xpIntoLevel / next : 0,
+    },
+    loadout: {
+      ship: { id: (save.ships?.equipped) || 'spark', level: ship.level },
+      // The equipped ship's unique power (null until Wave C adds the
+      // `power` field to the ship defs in ships.js).
+      shipPower,
+      weapon: { id: equippedWeapon, level: weaponLevel },
+      chips: slots.filter((c) => c !== null && c !== undefined),
+    },
+    attributes: {
+      // The ship's unique power, listed with the other attributes so
+      // the profile menu shows what makes this ship special.
+      shipPower,
+      hearts: ship.hearts + (hangarLevel(save, 'hull')),
+      speedMult: Math.round(ship.speedMult * (1 + 0.08 * (hangar.engine || 0)) * 1000) / 1000,
+      weaponDamage: ship.blasterDamage,
+      weaponRate: ship.blasterRate,
+      dashCooldown: SHIP.dashCooldown,
+      magnetRadius: MAGNET_BASE_RADIUS + 30 * (hangar.magnet || 0),
+      shardValue: SHARD_POINTS + 2 * (hangar.collector || 0),
+      chipEffects: [],
+    },
+    collection: {
+      ships: {
+        owned: Object.keys(save.ships?.owned || {}).length,
+        total: SHIPS.length,
+      },
+      weapons: { owned: Object.keys(ownedWeapons).length, total: 1 },
+      chips: { owned: Object.keys(ownedChips).length, total: 0 },
+      skins: { owned: unlockedSkins(lifetimeShards).length, total: SKINS.length },
+    },
+    totals: {
+      stagesCleared: stats.stagesCleared || 0,
+      enemiesDestroyed: stats.enemiesDestroyed || 0,
+      bossesKilled: stats.bossesKilled || 0,
+      runsPlayed: stats.runsPlayed || 0,
+      totalScore: stats.totalScore || 0,
+    },
+  };
+}
+
 // ---- src/weapons.js ----
 // Lumen Drift — the weapon roster (stage 2, Wave A). Pure logic over a
 // plain world state — no DOM, no storage, no import of world.js (Wave C
@@ -833,10 +1536,6 @@ function weaponStats(def, level, shipStats) {
 function weaponsOf(save) {
   if (save && save.weapons && save.weapons.owned) return save.weapons;
   return { owned: { blaster: { level: 1 } }, equipped: 'blaster' };
-}
-
-function pilotLevel(save) {
-  return (save && save.pilot && save.pilot.level) || 1;
 }
 
 /** Current level of a weapon (0 when not owned; Blaster is owned from the start). */
@@ -1368,190 +2067,6 @@ function updateBullets(state, dt, burst) {
     if (!spent) kept.push(b);
   }
   state.bullets = kept;
-}
-
-// ---- src/ships.js ----
-// Lumen Drift — the ship shop: six ships, their levels, and the coin
-// economy. Pure logic: every function takes the save and returns plain
-// data or a { ok } / { ok: false, reason } result, like hangar.js.
-// Coins are save.coins (spendable); shards (shardBalance) are untouched.
-//
-// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
-// ship level + a better ship. A ship's level is bought with coins in
-// the shop (cap Lv 10); each level boosts stats, so the loop is:
-// clear stages -> earn coins -> level up / buy a better ship -> clear
-// higher stages.
-//
-// Unique power (Stage 2, Spekter "Agents" model): each ship has ONE
-// power beyond its base stats — the thing that makes it play
-// differently, not just bigger numbers. Powers never duplicate a
-// hangar part or a chip (no dash-recharge power, no start-with-shield,
-// no pierce, no drone — those live elsewhere).
-const SHIP_LEVEL_MAX = 10;
-
-const SHIPS = [
-  {
-    id: 'spark', name: 'SPARK', rarity: 'common', unlockStage: 0, price: 0,
-    hearts: 3, speedMult: 1.00, blasterDamage: 1, blasterRate: 2.0,
-    shape: 'skiff', desc: 'The starter skiff. Reliable, nothing fancy.',
-    power: { id: 'second-wind', name: 'SECOND WIND', desc: 'Survive a fatal hit once per run at 1 heart.' },
-  },
-  {
-    id: 'comet', name: 'COMET', rarity: 'common', unlockStage: 3, price: 150,
-    hearts: 3, speedMult: 1.05, blasterDamage: 1, blasterRate: 2.2,
-    shape: 'dart', desc: 'A quick dart. Fires a little faster.',
-    power: { id: 'dual-dash', name: 'DUAL DASH', desc: 'Dash twice before recharging.' },
-  },
-  {
-    id: 'nebula', name: 'NEBULA', rarity: 'rare', unlockStage: 10, price: 500,
-    hearts: 4, speedMult: 1.10, blasterDamage: 2, blasterRate: 2.2,
-    shape: 'wing', desc: 'A winged cruiser with a heavier blaster.',
-    power: { id: 'slow-field', name: 'SLOW FIELD', desc: 'Enemies within 120 px move 25% slower.' },
-  },
-  {
-    id: 'pulsar', name: 'PULSAR', rarity: 'epic', unlockStage: 25, price: 1500,
-    hearts: 4, speedMult: 1.15, blasterDamage: 2, blasterRate: 2.6,
-    shape: 'dart', desc: 'An epic dart that spits blaster fire.',
-    power: { id: 'rapid-fire', name: 'RAPID FIRE', desc: 'Weapon fires 20% faster.' },
-  },
-  {
-    id: 'aurora', name: 'AURORA', rarity: 'legendary', unlockStage: 50, price: 4000,
-    hearts: 5, speedMult: 1.20, blasterDamage: 3, blasterRate: 2.6,
-    shape: 'wing', desc: 'A legendary wing — the stage-50 gate-breaker.',
-    power: { id: 'renewal', name: 'RENEWAL', desc: 'Regain 1 heart when a stage is cleared.' },
-  },
-  {
-    id: 'novaprime', name: 'NOVA PRIME', rarity: 'mythic', unlockStage: 75, price: 8000,
-    hearts: 6, speedMult: 1.25, blasterDamage: 4, blasterRate: 3.0,
-    shape: 'skiff', desc: 'The mythic skiff. The final storm fears it.',
-    power: { id: 'nova-dash', name: 'NOVA DASH', desc: 'Dashing through an enemy deals 1 damage.' },
-  },
-];
-
-/** Every ship's unique power, as { ship, id, name, desc }. */
-const SHIP_POWERS = SHIPS.map((s) => ({ ship: s.id, ...s.power }));
-
-function shipById(id) {
-  return SHIPS.find((s) => s.id === id) || null;
-}
-
-/** A ship's unique power def (or null for a power-less def). */
-function shipPowerById(id) {
-  const def = shipById(id);
-  return (def && def.power) || null;
-}
-
-/** The ship that carries power `powerId` (or null). */
-function shipForPower(powerId) {
-  return SHIPS.find((s) => s.power && s.power.id === powerId) || null;
-}
-
-/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
-function shipLevelCost(level) {
-  return 100 * level;
-}
-
-/**
- * Derived stats for a ship definition at a level:
- * hearts +1 at Lv 5 and Lv 10, +2% speed per level, +1 blaster damage
- * per level (flat), blaster rate unchanged.
- */
-function shipStats(def, level) {
-  return {
-    hearts: def.hearts + (level >= 5 ? 1 : 0) + (level >= 10 ? 1 : 0),
-    speedMult: def.speedMult * (1 + 0.02 * (level - 1)),
-    blasterDamage: def.blasterDamage + (level - 1),
-    blasterRate: def.blasterRate,
-    level,
-  };
-}
-
-/** Current level of a ship (0 when not owned). */
-function shipLevel(save, id) {
-  return (save && save.ships && save.ships.owned && save.ships.owned[id]
-    && save.ships.owned[id].level) || 0;
-}
-
-/** The equipped ship's definition (defaults to SPARK when unset). */
-function equippedShip(save) {
-  const id = (save && save.ships && save.ships.equipped) || 'spark';
-  return shipById(id) || shipById('spark');
-}
-
-/** Derived stats of the equipped ship at its owned level. */
-function equippedShipStats(save) {
-  const def = equippedShip(save);
-  return shipStats(def, Math.max(1, shipLevel(save, def.id)));
-}
-
-/**
- * Can this ship be bought right now? Returns { ok } or
- * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
- * | 'unknown'. Locked = highestCleared < unlockStage (spark, unlock 0,
- * is always available; it starts owned).
- */
-function canBuyShip(save, id) {
-  const def = shipById(id);
-  if (!def) return { ok: false, reason: 'unknown' };
-  if (shipLevel(save, id) > 0) return { ok: false, reason: 'owned' };
-  if ((save.highestCleared || 0) < def.unlockStage) return { ok: false, reason: 'locked' };
-  if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
-  return { ok: true, cost: def.price };
-}
-
-/**
- * Buy a ship. Deducts the price from save.coins, owns it at Lv 1 and
- * equips it. Returns { ok: true, cost, level: 1 } or the canBuy reason.
- */
-function buyShip(save, id) {
-  const check = canBuyShip(save, id);
-  if (!check.ok) return check;
-  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
-  if (!save.ships.owned) save.ships.owned = {};
-  save.coins = (save.coins ?? 0) - check.cost;
-  save.ships.owned[id] = { level: 1 };
-  save.ships.equipped = id;
-  return { ok: true, cost: check.cost, level: 1 };
-}
-
-/**
- * Can this ship be levelled up right now? Returns { ok } or
- * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
- * 'broke' | 'unknown'.
- */
-function canLevelShip(save, id) {
-  const def = shipById(id);
-  if (!def) return { ok: false, reason: 'unknown' };
-  const level = shipLevel(save, id);
-  if (level === 0) return { ok: false, reason: 'not-owned' };
-  if (level >= SHIP_LEVEL_MAX) return { ok: false, reason: 'maxed' };
-  const cost = shipLevelCost(level);
-  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
-  return { ok: true, cost };
-}
-
-/**
- * Level a ship up one level. Deducts shipLevelCost(level) from
- * save.coins. Returns { ok: true, cost, level } or the reason.
- */
-function levelUpShip(save, id) {
-  const check = canLevelShip(save, id);
-  if (!check.ok) return check;
-  save.ships.owned[id].level += 1;
-  save.coins = (save.coins ?? 0) - check.cost;
-  return { ok: true, cost: check.cost, level: save.ships.owned[id].level };
-}
-
-/**
- * Equip an owned ship. Returns { ok } or
- * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
- */
-function equipShip(save, id) {
-  if (!shipById(id)) return { ok: false, reason: 'unknown' };
-  if (shipLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
-  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
-  save.ships.equipped = id;
-  return { ok: true };
 }
 
 // ---- src/world.js ----
@@ -2817,103 +3332,6 @@ function createWorld(random, hangarLevels = {}, shipStats = null, loadout = {}) 
   return { state, reset, step, burst, grantGrace, setHangar, setShip, setLoadout, getRunStats, setStage, spawnEnemy, enterEndless };
 }
 
-// ---- src/skins.js ----
-// Lumen Drift — ship skins: cosmetic hull colours unlocked by lifetime
-// star shards (total shards collected across ALL runs). Skins never change
-// the ship shape or hitbox — hull, glow, flame and trail colours only.
-//
-// Persistence lives here so it is testable with a fake storage object;
-// main.js passes window.localStorage. Every read/write is guarded, so
-// private windows (storage off) just fall back to the default skin.
-
-const DEFAULT_SKIN_ID = 'cyan';
-
-// Unlock thresholds: the first skin (EMBER) is earnable on day 1-2
-// (~2-3 good runs), so the first trophy lands fast; later skins space
-// out by gates, days and score milestones. Skins are milestone trophies,
-// not shop filler — the next one is always visible-but-locked as the
-// home-screen goal.
-const SKINS = [
-  {
-    id: 'cyan', name: 'CYAN', unlock: 0,
-    hull: '#0891b2', glow: '#22d3ee', flame: '#f97316', flameGlow: '#fb923c', trail: '#22d3ee',
-  },
-  {
-    id: 'ember', name: 'EMBER', unlock: 200,
-    hull: '#c2410c', glow: '#fb923c', flame: '#fbbf24', flameGlow: '#fb923c', trail: '#fb923c',
-  },
-  {
-    id: 'violet', name: 'VIOLET', unlock: 1000,
-    hull: '#6d28d9', glow: '#a78bfa', flame: '#e879f9', flameGlow: '#c084fc', trail: '#a78bfa',
-  },
-  {
-    id: 'aurora', name: 'AURORA', unlock: 2500,
-    hull: '#059669', glow: '#34d399', flame: '#6ee7b7', flameGlow: '#34d399', trail: '#34d399',
-  },
-  {
-    id: 'solar', name: 'SOLAR', unlock: 4500,
-    hull: '#b45309', glow: '#fbbf24', flame: '#fde68a', flameGlow: '#f59e0b', trail: '#fbbf24',
-  },
-  {
-    id: 'nova', name: 'NOVA', unlock: 7500,
-    hull: '#be185d', glow: '#f472b6', flame: '#67e8f9', flameGlow: '#22d3ee', trail: '#f472b6',
-  },
-];
-
-function skinById(id) {
-  return SKINS.find((s) => s.id === id) || SKINS[0];
-}
-
-/** Every skin the lifetime total has unlocked, in unlock order. */
-function unlockedSkins(lifetimeShards) {
-  return SKINS.filter((s) => lifetimeShards >= s.unlock);
-}
-
-/**
- * The next skin still locked, with progress toward it — or null when
- * every skin is unlocked.
- */
-function nextUnlock(lifetimeShards) {
-  const next = SKINS.find((s) => lifetimeShards < s.unlock);
-  return next ? { skin: next, have: lifetimeShards, need: next.unlock } : null;
-}
-
-function loadLifetimeShards(storage) {
-  try {
-    return Number.parseInt(storage.getItem(SHARDS_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveLifetimeShards(storage, value) {
-  try {
-    storage.setItem(SHARDS_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): progress lasts this visit.
-  }
-}
-
-/** Saved skin id, falling back to the default when it is locked/unknown. */
-function loadSkinId(storage, lifetimeShards) {
-  try {
-    const id = storage.getItem(SKIN_KEY);
-    const skin = id ? SKINS.find((s) => s.id === id) : null;
-    if (skin && lifetimeShards >= skin.unlock) return skin.id;
-  } catch {
-    // Fall through to the default.
-  }
-  return DEFAULT_SKIN_ID;
-}
-
-function saveSkinId(storage, id) {
-  try {
-    storage.setItem(SKIN_KEY, id);
-  } catch {
-    // Storage can be off: the choice lasts this visit.
-  }
-}
-
 // ---- src/view.js ----
 // Lumen Drift — the one mapping between the world (1280x720) and the screen.
 // The renderer AND the pointer input both use this, so what you see is where
@@ -3997,113 +4415,6 @@ function dailyRewardCalendar(save, today) {
   });
 }
 
-// ---- src/hangar.js ----
-// Lumen Drift — the hangar: permanent per-part ship upgrades bought with
-// lifetime star shards. Unlike the in-run upgrade picks (which reset every
-// run), hangar parts stay bought forever, so the ship visibly grows
-// stronger run after run — that is the point of this screen.
-//
-// Economy: two shard counters. `lifetime.shards` counts every shard ever
-// earned and NEVER decreases — it is what unlocks ship skins. `shardBalance`
-// is the spendable purse: every shard earned adds to it, every hangar
-// purchase deducts from it. Spending can therefore never lock a skin.
-//
-// Balance: a good run earns ~60-120 shards, plus the daily streak bonus
-// (10-100) and mission rewards (100/day). The first level of every part
-// costs 150-300, so each is affordable after a few runs; maxing all five
-// parts costs 9,400 shards — weeks of play, not a day. A fully kitted
-// ship is much stronger (up to 6 hearts, +24% speed, a starting shield,
-// a wide magnet, +6 points per shard) but the early levels stay hard:
-// the first levels only add a little, and the endless ramp (Part 2)
-// keeps scaling past anything the hangar can give.
-const HANGAR_PARTS = [
-  {
-    id: 'hull',
-    name: 'REINFORCED HULL',
-    desc: '+1 max hull heart per level.',
-    max: 3,
-    costs: [250, 700, 1500],
-  },
-  {
-    id: 'engine',
-    name: 'ION ENGINE',
-    desc: '+8% top speed and dash speed per level.',
-    max: 3,
-    costs: [200, 600, 1200],
-  },
-  {
-    id: 'shield',
-    name: 'AEGIS PLATING',
-    desc: 'Lv1: start each run with a shield. Lv2: shield cells spawn twice as often.',
-    max: 2,
-    costs: [300, 800],
-  },
-  {
-    id: 'magnet',
-    name: 'TRACTOR MAGNET',
-    desc: '+30 shard pickup radius per level.',
-    max: 3,
-    costs: [150, 500, 1100],
-  },
-  {
-    id: 'collector',
-    name: 'LIGHT COLLECTOR',
-    desc: '+2 points per star shard per level.',
-    max: 3,
-    costs: [200, 600, 1300],
-  },
-];
-
-function hangarPartById(id) {
-  return HANGAR_PARTS.find((p) => p.id === id) || null;
-}
-
-/** Current level of one part (0 when never bought). */
-function hangarLevel(save, id) {
-  return (save && save.hangar && save.hangar[id]) || 0;
-}
-
-/** Every part's level, for the world (missing parts read as 0). */
-function hangarBonuses(save) {
-  const out = {};
-  for (const part of HANGAR_PARTS) out[part.id] = hangarLevel(save, part.id);
-  return out;
-}
-
-/** Shards the next level costs, or null when the part is maxed. */
-function hangarNextCost(part, level) {
-  if (!part || level >= part.max) return null;
-  return part.costs[level];
-}
-
-/**
- * Can this part be bought right now? Returns { ok } or { ok: false,
- * reason } where reason is 'maxed', 'broke' or 'unknown'.
- */
-function canBuyHangarPart(save, part) {
-  if (!part) return { ok: false, reason: 'unknown' };
-  const level = hangarLevel(save, part.id);
-  const cost = hangarNextCost(part, level);
-  if (cost === null) return { ok: false, reason: 'maxed' };
-  if ((save.shardBalance ?? 0) < cost) return { ok: false, reason: 'broke' };
-  return { ok: true, cost };
-}
-
-/**
- * Buy the next level of one part. Mutates save.hangar and
- * save.shardBalance. Returns { ok: true, cost, level } or
- * { ok: false, reason } — the caller shows the reason, never crashes.
- */
-function buyHangarPart(save, partId) {
-  const part = hangarPartById(partId);
-  const check = canBuyHangarPart(save, part);
-  if (!check.ok) return check;
-  if (!save.hangar) save.hangar = {};
-  save.hangar[part.id] = hangarLevel(save, part.id) + 1;
-  save.shardBalance = (save.shardBalance ?? 0) - check.cost;
-  return { ok: true, cost: check.cost, level: save.hangar[part.id] };
-}
-
 // ---- src/themes.js ----
 // Lumen Drift — one visual theme per 10-stage band (fix round
 // 2026-11-18: "setiap persepuluh level tema stage berubah"). Pure data:
@@ -4147,6 +4458,7 @@ function bandOf(stage) {
 // slots: [null, null] } (slot entries are chip ids or null).
 // Pilot level lives in save.pilot.level (Wave B owns pilot.js); read
 // it defensively as save.pilot?.level ?? 1 everywhere below.
+
 //
 // Rarity gates: common unlocks at pilot Lv 1, rare at Lv 3, epic at
 // Lv 5, legendary at Lv 8 — each chip's unlockPilotLevel matches its
@@ -4222,10 +4534,6 @@ const CHIPS = [
 
 function chipById(id) {
   return CHIPS.find((c) => c.id === id) || null;
-}
-
-function pilotLevel(save) {
-  return (save && save.pilot && save.pilot.level) || 1;
 }
 
 function chipsOf(save) {
@@ -4406,310 +4714,6 @@ function grantBossDrop(save, stage) {
   }
   chips.owned[id] = true;
   return { granted: id };
-}
-
-// ---- src/pilot.js ----
-// Lumen Drift — the pilot: account level / XP, achievements, and the
-// profile aggregation (loadout + attributes + collection + totals).
-// Pure logic over the save blob; no DOM, no storage. Wave C renders
-// this (profile menu); Waves A/C build on the exact names below.
-//
-// XP model (tuned so an average player hits pilot Lv 5 in ~10-15 runs
-// and Lv 10 in ~40 runs — see the simulation test in
-// tests/pilot.test.mjs for the assumed average run):
-//   xpToNext(level) = 100 * level   (Lv1->2: 100, Lv2->3: 200, ...;
-//   cumulative XP to Lv 10 is 4500).
-//   awardRunXp: 15 base (showing up counts — every run pays, win or
-//   lose) + floor(score / 10) (performance) + 25 per stage cleared
-//   (50 on a first clear) + 1 per endless second + 25 flawless
-//   (noDamage). A first clear is detected from save.highestCleared,
-//   so call awardRunXp BEFORE recordStageClear mutates it — or pass
-//   run.firstClear explicitly.
-// Pilot level gates gear (PILOT_GATES): weapons, chip rarities and the
-// third chip slot unlock by pilot level, never by coins alone — the
-// level is the account's seniority, coins are the spend.
-//
-// Assumptions (chips.js / the full weapon roster are Wave A's and do
-// not exist yet): the only weapon is the Blaster, so weaponDamage /
-// weaponRate come from the equipped ship's blaster stats; chipEffects
-// is empty until the chip roster lands; the weapons collection total
-// is 1 (Blaster) and the chips collection total is 0 for the same
-// reason. Nothing here imports weapons.js or chips.js.
-
-/** XP to go from pilot level `level` to `level + 1` (100/level). */
-function xpToNext(level) {
-  return 100 * Math.max(1, level);
-}
-
-/** Total XP needed to reach `level` from level 1 (0 for level 1). */
-function xpForLevel(level) {
-  const n = Math.max(1, level) - 1;
-  return 50 * n * (n + 1);
-}
-
-/** Pilot level for a lifetime XP total (level 1 at 0 XP). */
-function pilotLevelForXp(totalXp) {
-  const xp = Math.max(0, totalXp || 0);
-  let level = 1;
-  while (xp >= xpForLevel(level + 1) && level < 999) level += 1;
-  return level;
-}
-
-/** Make sure save.pilot exists (a v4 blob, or a hand-edited one). */
-function ensurePilot(save) {
-  if (!save.pilot || typeof save.pilot !== 'object') save.pilot = { xp: 0, level: 1 };
-  if (typeof save.pilot.xp !== 'number') save.pilot.xp = 0;
-  if (typeof save.pilot.level !== 'number') save.pilot.level = 1;
-  return save.pilot;
-}
-
-/**
- * Award XP for a finished run — win OR lose, no battle is wasted.
- * run = { stage, score, cleared, endlessSeconds, kills,
- * bulletsDestroyed, noDamage, firstClear? }. Returns
- * { xpGained, level, leveledUp }. Mutates save.pilot.
- *
- * First-clear detection: run.firstClear when given, else
- * run.cleared && run.stage > (save.highestCleared || 0) — so call
- * this before recordStageClear updates highestCleared.
- */
-function awardRunXp(save, run = {}) {
-  const pilot = ensurePilot(save);
-  const score = Math.max(0, run.score || 0);
-  const cleared = !!run.cleared;
-  const firstClear = cleared && (run.firstClear !== undefined
-    ? !!run.firstClear
-    : (run.stage || 0) > (save.highestCleared || 0));
-  let xp = 15 + Math.floor(score / 10);
-  if (cleared) xp += firstClear ? 50 : 25;
-  xp += Math.max(0, Math.floor(run.endlessSeconds || 0));
-  if (run.noDamage) xp += 25;
-  const oldLevel = pilot.level;
-  pilot.xp = (pilot.xp || 0) + xp;
-  pilot.level = pilotLevelForXp(pilot.xp);
-  return { xpGained: xp, level: pilot.level, leveledUp: pilot.level > oldLevel };
-}
-
-// --- Pilot-level gates ------------------------------------------------------
-
-/** What pilot level unlocks what gear (Wave A/C read this). */
-const PILOT_GATES = {
-  weapons: { mortar: 3, laser: 5, pulse: 8 },
-  chipRarity: { common: 1, rare: 3, epic: 5, legendary: 8 },
-  chipSlot3: 10,
-};
-
-// --- Achievements -----------------------------------------------------------
-
-/**
- * Achievements: ~11, each { id, name, desc, reward (coins),
- * check(save, stats) }. stats is save.stats (lifetime counters);
- * checks that need other save fields read them from `save` directly.
- * Rewards are coins (the stage economy), paid once on claim.
- */
-const ACHIEVEMENTS = [
-  {
-    id: 'first-blood', name: 'FIRST BLOOD', desc: 'Destroy your first enemy.',
-    reward: 25,
-    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1,
-  },
-  {
-    id: 'boss-first', name: 'BOSS SLAYER', desc: 'Defeat your first boss.',
-    reward: 100,
-    check: (_save, stats) => (stats.bossesKilled || 0) >= 1,
-  },
-  {
-    id: 'clear-10', name: 'STAGE 10 CLEAR', desc: 'Clear stage 10 — the first boss falls.',
-    reward: 100,
-    check: (save) => (save.highestCleared || 0) >= 10,
-  },
-  {
-    id: 'clear-25', name: 'QUARTER WAY', desc: 'Clear stage 25.',
-    reward: 200,
-    check: (save) => (save.highestCleared || 0) >= 25,
-  },
-  {
-    id: 'clear-50', name: 'HALFWAY HERO', desc: 'Clear stage 50 — past the NEBULA CRUSHER.',
-    reward: 400,
-    check: (save) => (save.highestCleared || 0) >= 50,
-  },
-  {
-    id: 'clear-100', name: 'FINAL STORM', desc: 'Clear stage 100. The drift is yours.',
-    reward: 1000,
-    check: (save) => (save.highestCleared || 0) >= 100,
-  },
-  {
-    id: 'own-3-ships', name: 'FLEET OWNER', desc: 'Own 3 ships.',
-    reward: 150,
-    check: (save) => Object.keys(save.ships?.owned || {}).length >= 3,
-  },
-  {
-    id: 'pilot-5', name: 'SEASONED PILOT', desc: 'Reach pilot level 5.',
-    reward: 100,
-    check: (save) => (save.pilot?.level || 1) >= 5,
-  },
-  {
-    id: 'pilot-10', name: 'ACE PILOT', desc: 'Reach pilot level 10.',
-    reward: 250,
-    check: (save) => (save.pilot?.level || 1) >= 10,
-  },
-  {
-    id: 'slayer-1000', name: 'SLAYER', desc: 'Destroy 1,000 enemies (lifetime).',
-    reward: 300,
-    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1000,
-  },
-  {
-    id: 'bullet-breaker-500', name: 'BULLET BREAKER', desc: 'Shoot down 500 enemy bullets (lifetime).',
-    reward: 200,
-    check: (_save, stats) => (stats.bulletsDestroyed || 0) >= 500,
-  },
-];
-
-function achievementById(id) {
-  return ACHIEVEMENTS.find((a) => a.id === id) || null;
-}
-
-/** Make sure save.achievements exists (a v4 blob, or hand-edited). */
-function ensureAchievements(save) {
-  if (!save.achievements || typeof save.achievements !== 'object') {
-    save.achievements = { unlocked: {}, claimed: {} };
-  }
-  if (!save.achievements.unlocked || typeof save.achievements.unlocked !== 'object') {
-    save.achievements.unlocked = {};
-  }
-  if (!save.achievements.claimed || typeof save.achievements.claimed !== 'object') {
-    save.achievements.claimed = {};
-  }
-  return save.achievements;
-}
-
-/**
- * Check every achievement against the save; unlock the newly earned
- * ones. Returns the array of newly unlocked ids — idempotent: an
- * already-unlocked achievement is never returned again.
- */
-function checkAchievements(save) {
-  const achievements = ensureAchievements(save);
-  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
-  const newly = [];
-  for (const def of ACHIEVEMENTS) {
-    if (achievements.unlocked[def.id]) continue;
-    if (def.check(save, stats)) {
-      achievements.unlocked[def.id] = true;
-      newly.push(def.id);
-    }
-  }
-  return newly;
-}
-
-/**
- * Claim an unlocked achievement's coin reward — once only. Returns
- * { ok: true, reward } or { ok: false, reason } where reason is
- * 'unknown' (bad id), 'not-unlocked' or 'claimed'.
- */
-function claimAchievement(save, id) {
-  const def = achievementById(id);
-  if (!def) return { ok: false, reason: 'unknown' };
-  const achievements = ensureAchievements(save);
-  if (!achievements.unlocked[id]) return { ok: false, reason: 'not-unlocked' };
-  if (achievements.claimed[id]) return { ok: false, reason: 'claimed' };
-  achievements.claimed[id] = true;
-  save.coins = (save.coins ?? 0) + def.reward;
-  return { ok: true, reward: def.reward };
-}
-
-/**
- * The equipped ship's unique power, for the profile menu. Wave C adds
- * a `power` field { id, name, desc } to each ship def in ships.js;
- * until then (or for a def without one) this is null — read
- * defensively, never crash on a power-less def.
- */
-function shipPowerFor(def) {
-  const power = def && def.power;
-  if (!power || typeof power !== 'object') return null;
-  return {
-    id: power.id ?? null,
-    name: power.name ?? null,
-    desc: power.desc ?? null,
-  };
-}
-
-// --- Profile aggregation ----------------------------------------------------
-
-/**
- * The profile menu's data, aggregated from the save — pure, no
- * mutation. Attribute totals use the same model as the in-game
- * derived numbers: ship level (shipStats) + hangar parts, the
- * Blaster's rate/damage from the equipped ship, dash cooldown from
- * config, magnet radius = base + hangar magnet, shard value = base +
- * hangar collector. In-run upgrade picks are NOT included (they reset
- * every run); chips contribute nothing yet — the chip roster is
- * Wave A's, so chipEffects is [] until it lands.
- */
-function profileStats(save) {
-  const pilot = ensurePilot(save);
-  const level = pilot.level;
-  const xp = pilot.xp;
-  const xpIntoLevel = xp - xpForLevel(level);
-  const next = xpToNext(level);
-  const ship = equippedShipStats(save);
-  const shipPower = shipPowerFor(equippedShip(save));
-  const hangar = save.hangar || {};
-  const weapons = (save.weapons && typeof save.weapons === 'object') ? save.weapons : {};
-  const ownedWeapons = (weapons.owned && typeof weapons.owned === 'object') ? weapons.owned : {};
-  const equippedWeapon = typeof weapons.equipped === 'string' ? weapons.equipped : 'blaster';
-  const weaponLevel = (ownedWeapons[equippedWeapon] && ownedWeapons[equippedWeapon].level) || 1;
-  const chips = (save.chips && typeof save.chips === 'object') ? save.chips : {};
-  const ownedChips = (chips.owned && typeof chips.owned === 'object') ? chips.owned : {};
-  const slots = Array.isArray(chips.slots) ? chips.slots : [null, null];
-  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
-  const lifetimeShards = (save.lifetime && save.lifetime.shards) || 0;
-  return {
-    pilot: {
-      level,
-      xp,
-      xpToNext: next,
-      // 0..1 progress through the current level.
-      xpProgress: next > 0 ? xpIntoLevel / next : 0,
-    },
-    loadout: {
-      ship: { id: (save.ships?.equipped) || 'spark', level: ship.level },
-      // The equipped ship's unique power (null until Wave C adds the
-      // `power` field to the ship defs in ships.js).
-      shipPower,
-      weapon: { id: equippedWeapon, level: weaponLevel },
-      chips: slots.filter((c) => c !== null && c !== undefined),
-    },
-    attributes: {
-      // The ship's unique power, listed with the other attributes so
-      // the profile menu shows what makes this ship special.
-      shipPower,
-      hearts: ship.hearts + (hangarLevel(save, 'hull')),
-      speedMult: Math.round(ship.speedMult * (1 + 0.08 * (hangar.engine || 0)) * 1000) / 1000,
-      weaponDamage: ship.blasterDamage,
-      weaponRate: ship.blasterRate,
-      dashCooldown: SHIP.dashCooldown,
-      magnetRadius: MAGNET_BASE_RADIUS + 30 * (hangar.magnet || 0),
-      shardValue: SHARD_POINTS + 2 * (hangar.collector || 0),
-      chipEffects: [],
-    },
-    collection: {
-      ships: {
-        owned: Object.keys(save.ships?.owned || {}).length,
-        total: SHIPS.length,
-      },
-      weapons: { owned: Object.keys(ownedWeapons).length, total: 1 },
-      chips: { owned: Object.keys(ownedChips).length, total: 0 },
-      skins: { owned: unlockedSkins(lifetimeShards).length, total: SKINS.length },
-    },
-    totals: {
-      stagesCleared: stats.stagesCleared || 0,
-      enemiesDestroyed: stats.enemiesDestroyed || 0,
-      bossesKilled: stats.bossesKilled || 0,
-      runsPlayed: stats.runsPlayed || 0,
-      totalScore: stats.totalScore || 0,
-    },
-  };
 }
 
 // ---- src/render.js ----
