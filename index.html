@@ -76,6 +76,34 @@
 <button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
 <button id="btn-pause" class="touch-btn" type="button" aria-label="Pause">❚❚</button>
 <button id="btn-fullscreen" class="touch-btn" type="button" aria-label="Fullscreen">⛶</button>
+<!-- On-device diagnostics: a classic (non-module) script, so it runs even
+     if the game module fails to load. It records boot progress and any
+     uncaught error into this hidden overlay, which only becomes visible
+     when an error occurs — on a phone there is no console to read, so the
+     error must show itself on the page. -->
+<div id="err-overlay" style="display:none;position:fixed;left:8px;top:8px;right:8px;z-index:99;max-height:60vh;overflow:auto;background:rgba(0,0,0,0.85);color:#fca5a5;font:12px/1.5 monospace;white-space:pre-wrap;padding:10px;border:1px solid #ef4444;border-radius:8px;"></div>
+<script>
+(function () {
+  var box = document.getElementById('err-overlay');
+  function show() { if (box) box.style.display = 'block'; }
+  function line(text) {
+    if (!box) return;
+    box.textContent += text + '\n';
+  }
+  window.__diag = function (msg) { line('[boot] ' + msg); };
+  window.__diagError = function (text) { show(); line('[error] ' + text); };
+  window.onerror = function (msg, src, lineno, colno, err) {
+    show();
+    line('[error] ' + msg + ' @ ' + (src || '?') + ':' + (lineno || '?') + ':' + (colno || '?'));
+    if (err && err.stack) line(String(err.stack).split('\n').slice(0, 5).join('\n'));
+    return false;
+  };
+  window.addEventListener('unhandledrejection', function (e) {
+    show();
+    line('[error] unhandled rejection: ' + (e.reason && e.reason.stack ? e.reason.stack : e.reason));
+  });
+})();
+</script>
 <script type="module">
 // ---- src/config.js ----
 // Lumen Drift — tuning constants. One place holds every number that shapes
@@ -7727,6 +7755,15 @@ function stageShot(name, world) {
 /** The longest frame the loop catches up on; a longer stall is dropped. */
 const MAX_FRAME = 0.25;
 
+/** Boot trace for the on-page diagnostics overlay (see game/index.html):
+ * guarded so it can never break the game, and a no-op outside a browser. */
+function diag(msg) {
+  try {
+    if (typeof window !== 'undefined' && typeof window.__diag === 'function') window.__diag(msg);
+  } catch { /* diagnostics never break the game */ }
+}
+diag('module evaluated');
+
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
@@ -7735,8 +7772,11 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
 const world = createWorld(createRandom(seed));
+diag('world created');
 const renderer = createRenderer(canvas);
+diag('renderer created');
 const audio = createAudio();
+diag('audio created');
 
 function readBest() {
   try {
@@ -7795,6 +7835,7 @@ function runGame() {
   }
   document.addEventListener('fullscreenchange', syncFullscreenButton);
   let screen = SCREEN_TITLE;
+  let firstFrameDrawn = false;
   // Local progress: one versioned save blob (best, top-5, history,
   // lifetime stats, streak, missions), seeded from the legacy keys.
   const today = localDate();
@@ -8840,11 +8881,16 @@ function runGame() {
       weaponLabel: `${lv.weapon.name} Lv ${lv.weapon.level}`,
       theme: themeFor(themeStage),
     });
+    if (!firstFrameDrawn) {
+      firstFrameDrawn = true;
+      diag('first frame drawn');
+    }
   }
 
   announce(streakInfo.isNewDay && streakInfo.reward > 0
     ? `Lumen Drift. Day ${save.streak.count} streak — your daily reward (◆ ${streakInfo.reward}) is ready! Tap the flame to claim.`
     : 'Lumen Drift. Press Enter or click to launch.');
+  diag('game started');
   requestAnimationFrame(frame);
 }
 
