@@ -70,7 +70,7 @@
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, reach 1,200 points to open the Aurora Gate"></canvas>
+<canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, clear 100 stages and defeat the bosses"></canvas>
 <p id="status" role="status" aria-live="polite"></p>
 <div id="rotate-hint">📱 Rotate to landscape — the field is much bigger sideways!</div>
 <button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
@@ -86,8 +86,6 @@ const FIELD = { width: 1280, height: 720 };
 // Fixed simulation step: the world advances in 1/60 s slices.
 const STEP = 1 / 60;
 
-// The goal: reach this score and the Aurora Gate opens.
-const WIN_SCORE = 1200;
 const HEARTS = 3;
 
 // Star shards: base points, and the combo ladder (consecutive pickups with
@@ -114,7 +112,8 @@ const SHIP = {
 // while the player re-orients on the busiest frame of the run).
 const UPGRADE_GRACE = 2;
 
-// Difficulty ramps one level every 200 points, up to level 5.
+// Difficulty ramps one level every 200 points, uncapped, in both stage
+// and endless modes. LEVEL_MAX only clamps the early storm gate.
 const LEVEL_EVERY = 200;
 const LEVEL_MAX = 5;
 
@@ -328,12 +327,14 @@ function effectiveDashCooldown(state) {
 
 function effectiveDashSpeed(state) {
   return SHIP.dashSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG))
-    * (1 + 0.08 * (state.hangar?.engine ?? 0));
+    * (1 + 0.08 * (state.hangar?.engine ?? 0))
+    * (state.shipStats?.speedMult ?? 1);
 }
 
 function effectiveMaxSpeed(state) {
   return SHIP.maxSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG))
-    * (1 + 0.08 * (state.hangar?.engine ?? 0));
+    * (1 + 0.08 * (state.hangar?.engine ?? 0))
+    * (state.shipStats?.speedMult ?? 1);
 }
 
 /** Base points one shard is worth, before the combo multiplier. */
@@ -392,16 +393,285 @@ function drawUpgrades(state, rng = Math.random) {
   return pool.slice(0, 3);
 }
 
+// ---- src/stages.js ----
+// Lumen Drift — stages 1–100: targets, bosses, coin rewards, enemy
+// unlocks and spawn pressure. Pure logic: every function takes plain
+// numbers (or the save) and returns plain data — no DOM, no storage.
+// The world (Wave B) and the stage-select/shop UI (Wave C) build on
+// these exact exports.
+//
+// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
+// ship level + a better ship — ship power gates progress. The boss HP
+// table below is tuned so a starter ship cannot brute-force stage 50
+// (see the balance check in tests/ships.test.mjs).
+const STAGE_COUNT = 100;
+
+const BOSS_NAMES = {
+  10: 'STORM TYRANT',
+  20: 'ABYSSAL MAW',
+  30: 'STAR EATER',
+  40: 'VOID HERALD',
+  50: 'NEBULA CRUSHER',
+  60: 'DARK COMET',
+  70: 'EVENT HORIZON',
+  80: 'GALAXY REAPER',
+  90: 'VOID EMPEROR',
+  100: 'THE FINAL STORM',
+};
+
+/** Points needed to clear a non-boss stage; boss/midboss stages are 0 (kill the boss). */
+function stageTarget(n) {
+  if (isBossStage(n) || isMidbossStage(n)) return 0;
+  return 300 + 30 * (n - 1);
+}
+
+/** Boss stages: every 10th stage (10, 20, …, 100). */
+function isBossStage(n) {
+  return n % 10 === 0;
+}
+
+/** Midboss stages: every 10th stage offset by 5 (5, 15, …, 95). */
+function isMidbossStage(n) {
+  return n % 10 === 5;
+}
+
+/**
+ * The boss (or midboss) of a boss/midboss stage. Returns
+ * { name, hp, kind: 'midboss'|'boss', radialEvery, aimedEvery }.
+ * Midboss HP: 30 + 10 * floor((n-5)/10) (S5: 30 … S95: 120).
+ * Boss HP: 60 + 40 * (n/10 - 1) (S10: 60 … S100: 420).
+ * Returns null for non-boss stages.
+ */
+function bossFor(n) {
+  if (isMidbossStage(n)) {
+    return {
+      name: 'VOID WARDEN',
+      hp: 30 + 10 * Math.floor((n - 5) / 10),
+      kind: 'midboss',
+      radialEvery: 5.5,
+      aimedEvery: Infinity,
+    };
+  }
+  if (isBossStage(n)) {
+    return {
+      name: BOSS_NAMES[n],
+      hp: 60 + 40 * (n / 10 - 1),
+      kind: 'boss',
+      radialEvery: 4.5,
+      aimedEvery: 7,
+    };
+  }
+  return null;
+}
+
+/** Coins a stage pays: first clear vs replay (25%, rounded). */
+function stageCoins(n) {
+  const first = 20 + 5 * n;
+  return { first, replay: Math.round(first * 0.25) };
+}
+
+/** Elite tier of a stage: 0 for 1–10, 1 for 11–20, …, 9 for 91–100. */
+function eliteTier(n) {
+  return Math.floor((n - 1) / 10);
+}
+
+/** Enemy kinds that can spawn on a stage (unlocks at 4 / 8 / 12). */
+function enemyKindsFor(n) {
+  const kinds = ['drifter'];
+  if (n >= 4) kinds.push('dart');
+  if (n >= 8) kinds.push('bulwark');
+  if (n >= 12) kinds.push('spitter');
+  return kinds;
+}
+
+/** HP of one enemy of `kind` on stage n (base + elite tier). */
+function enemyHp(kind, n) {
+  const base = { drifter: 1, dart: 1, bulwark: 5, spitter: 2 }[kind] ?? 1;
+  return base + eliteTier(n);
+}
+
+/** Spawn pressure for a stage (mine/storm caps, spawn intervals). */
+function stageSpawn(n) {
+  return {
+    mineCap: Math.min(8 + (n - 1), 22),
+    stormCap: Math.min(2 + Math.floor((n - 1) / 3), 6),
+    enemyEvery: Math.max(2.2 - 0.012 * (n - 1), 1.0),
+    mineEvery: 1.5,
+    stormEvery: 2.4,
+  };
+}
+
+/** A stage is playable when it is the next uncleared one or earlier. */
+function stageAccessible(save, n) {
+  return n >= 1 && n <= STAGE_COUNT && n <= (save.highestCleared || 0) + 1;
+}
+
+/**
+ * Bank a stage clear. A first clear raises highestCleared, pays the
+ * full reward and (at stage 10) unlocks endless mode; a replay pays
+ * the smaller replay reward. Returns { coins, firstClear, unlockedEndless }.
+ */
+function recordStageClear(save, n) {
+  const { first, replay } = stageCoins(n);
+  if (n > (save.highestCleared || 0)) {
+    save.highestCleared = n;
+    save.coins = (save.coins ?? 0) + first;
+    let unlockedEndless = false;
+    if (n === 10) {
+      save.endlessUnlocked = true;
+      unlockedEndless = true;
+    }
+    return { coins: first, firstClear: true, unlockedEndless };
+  }
+  save.coins = (save.coins ?? 0) + replay;
+  return { coins: replay, firstClear: false, unlockedEndless: false };
+}
+
+// ---- src/weapons.js ----
+// Lumen Drift — the starter Blaster (stage 1; the full weapon roster
+// is stage 2). Pure logic over a plain world state — no DOM, no storage,
+// no import of world.js (Wave B owns the world; it calls these with its
+// state). The state shape used here:
+//   ship { x, y }, enemies [{ x, y, kind, hp, radius }], boss null or
+//   { x, y, kind, hp, radius }, bullets [], score, floaters [],
+//   gateProgress, shipStats { blasterDamage, blasterRate },
+//   blasterCooldown. Bounds come from state.width/height when present,
+//   else the FIELD size from config.js.
+
+const BLASTER = {
+  id: 'blaster', name: 'BLASTER', range: 460, bulletSpeed: 950, bulletRadius: 5,
+};
+
+const ENEMY_KILL_POINTS = { drifter: 25, dart: 30, bulwark: 50, spitter: 40 };
+
+function distTo(ship, t) {
+  return Math.hypot(t.x - ship.x, t.y - ship.y);
+}
+
+/**
+ * Nearest enemy (state.enemies) or boss (state.boss) within
+ * BLASTER.range of the ship. Returns { x, y, kind, ref } or null.
+ * The boss is just another candidate — it wins only when it is the
+ * closest target in range.
+ */
+function nearestTarget(state) {
+  const ship = state.ship;
+  if (!ship) return null;
+  let best = null;
+  let bestDist = BLASTER.range;
+  for (const enemy of state.enemies || []) {
+    const d = distTo(ship, enemy);
+    if (d <= bestDist) {
+      bestDist = d;
+      best = { x: enemy.x, y: enemy.y, kind: enemy.kind || 'drifter', ref: enemy };
+    }
+  }
+  if (state.boss) {
+    const d = distTo(ship, state.boss);
+    if (d <= bestDist) {
+      best = { x: state.boss.x, y: state.boss.y, kind: state.boss.kind || 'boss', ref: state.boss };
+    }
+  }
+  return best;
+}
+
+/**
+ * Fire one blaster bolt at the nearest target, when the cooldown has
+ * expired and a target exists. The bolt starts at the ship and flies
+ * toward the target at BLASTER.bulletSpeed, carrying the ship's
+ * blaster damage. Sets state.blasterCooldown = 1 / blasterRate.
+ * Returns true when a bolt was fired, false otherwise.
+ */
+function fireBlaster(state) {
+  if ((state.blasterCooldown ?? 0) > 0) return false;
+  const target = nearestTarget(state);
+  if (!target) return false;
+  const dx = target.x - state.ship.x;
+  const dy = target.y - state.ship.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const speed = BLASTER.bulletSpeed;
+  const stats = state.shipStats || {};
+  if (!state.bullets) state.bullets = [];
+  state.bullets.push({
+    x: state.ship.x,
+    y: state.ship.y,
+    vx: (dx / len) * speed,
+    vy: (dy / len) * speed,
+    damage: stats.blasterDamage ?? 1,
+    radius: BLASTER.bulletRadius,
+  });
+  state.blasterCooldown = 1 / (stats.blasterRate ?? 2);
+  return true;
+}
+
+function hitRadius(target) {
+  return target.radius ?? target.r ?? 15;
+}
+
+/**
+ * Move bullets, resolve hits, drop spent/offscreen ones. A hit on an
+ * enemy reduces its hp (a `burst` spark on hit when the callback is
+ * given); at hp <= 0 the enemy is removed, its kill points are added
+ * to state.score, a '+N' floater is pushed, and state.gateProgress is
+ * refreshed when state.stageTarget is a finite number. A hit on the
+ * boss reduces state.boss.hp (boss death is the world's job — it
+ * watches state.boss.hp <= 0). `burst` is an optional (x, y) callback.
+ */
+function updateBullets(state, dt, burst) {
+  const width = state.width ?? FIELD.width;
+  const height = state.height ?? FIELD.height;
+  const margin = 60;
+  const bullets = state.bullets || [];
+  const kept = [];
+  for (const b of bullets) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.x < -margin || b.x > width + margin || b.y < -margin || b.y > height + margin) continue;
+    let spent = false;
+    for (const enemy of state.enemies || []) {
+      if (Math.hypot(enemy.x - b.x, enemy.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(enemy)) {
+        enemy.hp -= b.damage;
+        if (burst) burst(b.x, b.y);
+        if (enemy.hp <= 0) {
+          const idx = state.enemies.indexOf(enemy);
+          if (idx >= 0) state.enemies.splice(idx, 1);
+          const points = ENEMY_KILL_POINTS[enemy.kind] ?? 25;
+          state.score = (state.score ?? 0) + points;
+          if (!state.floaters) state.floaters = [];
+          state.floaters.push({ x: enemy.x, y: enemy.y, text: `+${points}` });
+          if (typeof state.stageTarget === 'number' && state.stageTarget > 0) {
+            state.gateProgress = Math.min(1, state.score / state.stageTarget);
+          }
+        }
+        spent = true;
+        break;
+      }
+    }
+    if (!spent && state.boss) {
+      const boss = state.boss;
+      if (Math.hypot(boss.x - b.x, boss.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(boss)) {
+        boss.hp -= b.damage;
+        if (burst) burst(b.x, b.y);
+        spent = true;
+      }
+    }
+    if (!spent) kept.push(b);
+  }
+  state.bullets = kept;
+}
+
 // ---- src/world.js ----
 // Lumen Drift — the world: the skiff, the storm field, and the rules.
 // Everything the game simulates lives in one plain state object so the
 // renderer, the screenshots and the tests all read the same truth.
 //
 // Entities: star shards (collect for points), void mines (slow, spiky,
-// drifting), storm shards (fast, sharp), shield cells (one free hit).
+// drifting), storm shards (fast, sharp), shield cells (one free hit),
+// enemies (drifters, darts, bulwarks, spitters) and stage bosses.
 // Picking up shards in a row without a hit raises the combo x1..x5; a hit
-// resets it. Every 200 points the level rises (1..5): spawns quicken and
-// everything drifts faster. At 1,200 points the Aurora Gate opens: win.
+// resets it. Every 200 points the level rises: spawns quicken and
+// everything drifts faster, with no cap — upgrade picks keep coming.
+// A stage clears when its score target is reached (or its boss dies).
 
 const KIND_SHARD = 'shard';
 const KIND_MINE = 'mine';
@@ -413,10 +683,34 @@ const EVENT_PICKUP = 1;
 const EVENT_HIT = 2;
 const EVENT_SHIELD = 4;
 const EVENT_OVER = 8;
-const EVENT_WIN = 16;
 const EVENT_DASH = 32;
 const EVENT_LEVELUP = 64;
 const EVENT_NEARMISS = 128;
+const EVENT_CLEAR = 256;
+
+// Spark Lv 1: the starter ship's stats, used when the caller passes no
+// shipStats (the world never reads the save — the caller passes plain
+// stats, see ships.js shipStats()).
+const DEFAULT_SHIP_STATS = {
+  hearts: 3, speedMult: 1, blasterDamage: 1, blasterRate: 2, level: 1,
+};
+
+// Enemy shape per kind: radius, drift speed and the weight in the spawn
+// pick (renormalised over the kinds a stage has unlocked).
+const ENEMY_DEFS = {
+  drifter: { radius: 15, speed: 55, weight: 0.5 },
+  dart: { radius: 11, speed: 190, weight: 0.25 },
+  bulwark: { radius: 24, speed: 30, weight: 0.15 },
+  spitter: { radius: 14, speed: 40, weight: 0.1 },
+};
+
+// Seconds between a spitter's shots; the last 0.5 s is its telegraph.
+const SPITTER_SHOOT_EVERY = 3;
+const SPITTER_TELEGRAPH = 0.5;
+// Seconds after a boss stage starts before the boss arrives.
+const BOSS_SPAWN_DELAY = 1.5;
+// Seconds of telegraph before a boss attack fires (renderer flashes it).
+const BOSS_TELEGRAPH = 0.8;
 
 function freshUpgrades() {
   const counts = {};
@@ -437,7 +731,7 @@ function makeShip() {
   };
 }
 
-function createWorld(random, hangarLevels = {}) {
+function createWorld(random, hangarLevels = {}, shipStats = null) {
   const state = {
     time: 0,
     score: 0,
@@ -461,19 +755,33 @@ function createWorld(random, hangarLevels = {}) {
     shield: false,
     // Permanent hangar bonuses (levels per part; all 0 for a fresh ship).
     hangar: { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0, ...hangarLevels },
-    // Endless mode: true once the player continues past the Aurora Gate.
+    // Equipped ship's stats (plain data, passed by the caller — never
+    // the save). Speed and blaster read these live; hearts apply on reset().
+    shipStats: { ...DEFAULT_SHIP_STATS, ...(shipStats || {}) },
+    // Endless mode: true once the player continues past a stage clear.
     endless: false,
+    // Stage mode: the stage being played (1..100) and its score target;
+    // endless runs use stage 0 and an Infinite target.
+    stage: 1,
+    stageTarget: stageTarget(1),
     ship: makeShip(),
     shards: [],
     mines: [],
     storms: [],
     shields: [],
+    enemies: [],
+    bullets: [],
+    enemyBullets: [],
+    boss: null,
+    blasterCooldown: 0,
+    cleared: false,
+    bossSpawnTimer: 0,
     particles: [],
     trail: [],
     stars: [],
     gateOpen: false,
     gateProgress: 0,
-    spawnTimers: { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 },
+    spawnTimers: { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8, enemy: 1.5 },
     shieldEvery: SPAWN.shieldEvery,
     flashes: 0,
     // Juice state (Stage 4): floating score texts, the animated score,
@@ -502,11 +810,10 @@ function createWorld(random, hangarLevels = {}) {
     }
   }
 
+  // One level per 200 points, uncapped in both stage and endless modes,
+  // so upgrade picks keep coming every 200 points.
   function levelFor(score) {
-    // The campaign caps at level 5; endless keeps counting past it, one
-    // level per 200 points, so upgrade picks keep coming.
-    if (state.endless) return 1 + Math.floor(score / LEVEL_EVERY);
-    return Math.min(LEVEL_MAX, 1 + Math.floor(score / LEVEL_EVERY));
+    return 1 + Math.floor(score / LEVEL_EVERY);
   }
 
   function speedScale() {
@@ -520,20 +827,33 @@ function createWorld(random, hangarLevels = {}) {
     return base * Math.pow(SPAWN.growth, rateLevel - 1);
   }
 
-  // Max concurrent threats at the current level. In endless the mine cap
-  // climbs +1 per level (to 22) and the storm cap +1 every two levels
-  // (to 6) — the field keeps getting busier, but never saturates.
+  // Max concurrent threats. In stage mode the caps come from the stage
+  // (stageSpawn); in endless the mine cap climbs +1 per level (to 22)
+  // and the storm cap +1 every two levels (to 6) — the field keeps
+  // getting busier, but never saturates.
   function mineCap() {
+    if (!state.endless) return stageSpawn(state.stage).mineCap;
     if (state.level <= LEVEL_MAX) return SPAWN_CAPS.mine[state.level - 1];
     return Math.min(SPAWN_CAPS.mine[LEVEL_MAX - 1] + (state.level - LEVEL_MAX), ENDLESS_MINE_CAP_MAX);
   }
 
   function stormCap() {
+    if (!state.endless) return stageSpawn(state.stage).stormCap;
     if (state.level <= LEVEL_MAX) return SPAWN_CAPS.storm[state.level - 1];
     return Math.min(
       SPAWN_CAPS.storm[LEVEL_MAX - 1] + Math.floor((state.level - LEVEL_MAX) / 2),
       ENDLESS_STORM_CAP_MAX,
     );
+  }
+
+  // Enemy spawn pressure: the stage's own interval in stage mode,
+  // stage-100 pressure in endless. Kinds likewise.
+  function enemyEvery() {
+    return stageSpawn(state.endless ? 100 : state.stage).enemyEvery;
+  }
+
+  function enemyKinds() {
+    return enemyKindsFor(state.endless ? 100 : state.stage);
   }
 
   // True when a candidate spawn point is clear of the ship.
@@ -555,6 +875,27 @@ function createWorld(random, hangarLevels = {}) {
         color,
       });
     }
+  }
+
+  // Progress toward clearing the stage: score/target on a normal stage,
+  // boss damage on a boss stage, level progress in endless. A cleared
+  // stage reads 1.
+  function refreshGateProgress() {
+    if (state.cleared) {
+      state.gateProgress = 1;
+      return;
+    }
+    if (state.endless) {
+      state.gateProgress = (state.score % LEVEL_EVERY) / LEVEL_EVERY;
+      return;
+    }
+    if (isBossStage(state.stage) || isMidbossStage(state.stage)) {
+      state.gateProgress = state.boss
+        ? Math.max(0, 1 - state.boss.hp / state.boss.maxHp)
+        : 0;
+      return;
+    }
+    state.gateProgress = Math.min(1, state.score / state.stageTarget);
   }
 
   function spawnShard() {
@@ -636,16 +977,139 @@ function createWorld(random, hangarLevels = {}) {
     });
   }
 
+  // Pick an enemy kind for the current stage: the design weights
+  // (drifter .5 / dart .25 / bulwark .15 / spitter .1) renormalised over
+  // the kinds the stage has unlocked.
+  function pickEnemyKind() {
+    const kinds = enemyKinds();
+    let total = 0;
+    for (const k of kinds) total += ENEMY_DEFS[k].weight;
+    let roll = random.next() * total;
+    for (const k of kinds) {
+      roll -= ENEMY_DEFS[k].weight;
+      if (roll <= 0) return k;
+    }
+    return kinds[kinds.length - 1];
+  }
+
+  // One enemy of `kind`, drifting in from a side edge like a mine.
+  // Returns false when no safe spot was found in 8 tries.
+  function spawnEnemy(kind) {
+    const def = ENEMY_DEFS[kind] || ENEMY_DEFS.drifter;
+    const stage = state.endless ? 100 : state.stage;
+    const hp = enemyHp(kind, stage);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const fromLeft = random.next() < 0.5;
+      const x = fromLeft ? -24 : FIELD.width + 24;
+      const y = random.range(60, FIELD.height - 60);
+      if (!farFromShip(x, y)) continue;
+      state.enemies.push({
+        kind,
+        x,
+        y,
+        vx: (fromLeft ? 1 : -1) * def.speed * speedScale() * random.range(0.8, 1.3),
+        vy: random.range(-14, 14),
+        radius: def.radius,
+        hp,
+        maxHp: hp,
+        spin: random.range(0, Math.PI * 2),
+        spinSpeed: random.range(0.6, 1.6),
+        pulse: random.range(0, Math.PI * 2),
+        age: 0,
+        // Spitters shoot every 3 s (first shot after 2-3 s); the other
+        // kinds never use the timer. `telegraph` flashes 0.5 s before
+        // a spitter shot so the player can dodge it.
+        shootTimer: kind === 'spitter' ? random.range(2, SPITTER_SHOOT_EVERY) : 0,
+        telegraph: 0,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  // The boss (or midboss) of a boss stage, arriving at the top-centre.
+  function spawnBoss() {
+    const def = bossFor(state.stage);
+    if (!def) return false;
+    state.boss = {
+      name: def.name,
+      kind: def.kind,
+      x: FIELD.width / 2,
+      y: 120,
+      baseY: 120,
+      vx: random.next() < 0.5 ? -30 : 30,
+      hp: def.hp,
+      maxHp: def.hp,
+      radius: 46,
+      attackTimer: def.radialEvery,
+      aimedTimer: def.aimedEvery,
+      attackKind: null,
+      telegraph: 0,
+      pulse: 0,
+      age: 0,
+    };
+    return true;
+  }
+
+  // A boss radial burst: 10 enemy bullets in a ring, speed 120.
+  function fireRadial(boss) {
+    for (let i = 0; i < 10; i += 1) {
+      const angle = (i / 10) * Math.PI * 2;
+      state.enemyBullets.push({
+        x: boss.x,
+        y: boss.y,
+        vx: Math.cos(angle) * 120,
+        vy: Math.sin(angle) * 120,
+        radius: 6,
+        age: 0,
+      });
+    }
+  }
+
+  // A boss aimed spread: 3 shots at the ship, speed 150.
+  function fireAimed(boss) {
+    const dx = state.ship.x - boss.x;
+    const dy = state.ship.y - boss.y;
+    const base = Math.atan2(dy, dx);
+    for (const off of [-0.25, 0, 0.25]) {
+      const angle = base + off;
+      state.enemyBullets.push({
+        x: boss.x,
+        y: boss.y,
+        vx: Math.cos(angle) * 150,
+        vy: Math.sin(angle) * 150,
+        radius: 6,
+        age: 0,
+      });
+    }
+  }
+
+  // One spitter shot: a single enemy bullet at the ship, speed 120.
+  function fireSpitter(enemy) {
+    const dx = state.ship.x - enemy.x;
+    const dy = state.ship.y - enemy.y;
+    const len = Math.hypot(dx, dy) || 1;
+    state.enemyBullets.push({
+      x: enemy.x,
+      y: enemy.y,
+      vx: (dx / len) * 120,
+      vy: (dy / len) * 120,
+      radius: 6,
+      age: 0,
+    });
+  }
+
   function reset() {
     state.time = 0;
     state.score = 0;
     state.bestCombo = 0;
     state.combo = 0;
     state.comboCount = 0;
-    // Hangar bonuses apply from the start of every run: extra max hearts
-    // (and the hearts to fill them), a starting shield at AEGIS Lv1.
-    state.hearts = HEARTS + (state.hangar.hull || 0);
-    state.maxHearts = HEARTS + (state.hangar.hull || 0);
+    // Ship stats apply from the start of every run: the ship's hearts
+    // plus hangar hull, and a starting shield at AEGIS Lv1.
+    const hearts = (state.shipStats?.hearts ?? HEARTS) + (state.hangar.hull || 0);
+    state.hearts = hearts;
+    state.maxHearts = hearts;
     state.upgrades = freshUpgrades();
     state.shardsCollected = 0;
     state.nearMisses = 0;
@@ -657,17 +1121,30 @@ function createWorld(random, hangarLevels = {}) {
     state.level = 1;
     state.shield = (state.hangar.shield || 0) >= 1;
     state.endless = false;
+    // The run replays the current stage (stage 0 is endless-only, so a
+    // reset without a stage falls back to stage 1).
+    if (state.stage < 1) state.stage = 1;
+    state.stageTarget = stageTarget(state.stage);
     state.ship = makeShip();
     state.shards = [];
     state.mines = [];
     state.storms = [];
     state.shields = [];
+    state.enemies = [];
+    state.bullets = [];
+    state.enemyBullets = [];
+    state.boss = null;
+    state.blasterCooldown = 0;
+    state.cleared = false;
+    state.bossSpawnTimer = (isBossStage(state.stage) || isMidbossStage(state.stage))
+      ? BOSS_SPAWN_DELAY
+      : 0;
     state.particles = [];
     state.trail = [];
     state.gateOpen = false;
     state.gateProgress = 0;
     state.goldenCollected = 0;
-    state.spawnTimers = { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 };
+    state.spawnTimers = { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8, enemy: 1.5 };
     // AEGIS PLATING Lv2: shield cells spawn twice as often.
     state.shieldEvery = (state.hangar.shield || 0) >= 2 ? SPAWN.shieldEvery / 2 : SPAWN.shieldEvery;
     state.flashes = 0;
@@ -689,6 +1166,16 @@ function createWorld(random, hangarLevels = {}) {
     state.time += dt;
     state.level = levelFor(state.score);
     const levelAtStart = state.level;
+    // Fires EVENT_CLEAR once and marks the stage cleared. Boss stages
+    // clear only on boss death (checked where the boss dies); normal
+    // stages clear on reaching the score target (checked at the end
+    // of the step, after every score change).
+    const fireClear = () => {
+      if (state.cleared) return;
+      state.cleared = true;
+      state.gateProgress = 1;
+      events |= EVENT_CLEAR;
+    };
     // Derived upgrade numbers are re-computed every step from the stack
     // counts, so they can never go stale. The magnet radius is the hangar
     // magnet plus the in-run SHARD MAGNET stacks.
@@ -711,19 +1198,33 @@ function createWorld(random, hangarLevels = {}) {
     state.spawnTimers.mine -= dt;
     state.spawnTimers.storm -= dt;
     state.spawnTimers.shield -= dt;
+    state.spawnTimers.enemy -= dt;
     if (state.spawnTimers.shard <= 0) { spawnShard(); state.spawnTimers.shard = spawnRate(SPAWN.shardEvery); }
-    // Spawn caps: the field never holds more than the per-level max.
+    // Spawn caps: the field never holds more than the stage's max
+    // (endless keeps its level-based ramp).
     if (state.spawnTimers.mine <= 0) {
       if (state.mines.length < mineCap()) spawnMine();
-      state.spawnTimers.mine = spawnRate(SPAWN.mineEvery);
+      const base = state.endless ? SPAWN.mineEvery : stageSpawn(state.stage).mineEvery;
+      state.spawnTimers.mine = spawnRate(base);
     }
     if (state.spawnTimers.storm <= 0) {
       if (state.storms.length < stormCap()) spawnStorm();
       // Storms are gated early (nearly none at level 1-2); past level 5
       // the gate stays at its level-5 value.
-      state.spawnTimers.storm = spawnRate(SPAWN.stormEvery) * STORM_GATE[Math.min(state.level, LEVEL_MAX) - 1];
+      const base = state.endless ? SPAWN.stormEvery : stageSpawn(state.stage).stormEvery;
+      state.spawnTimers.storm = spawnRate(base) * STORM_GATE[Math.min(state.level, LEVEL_MAX) - 1];
     }
     if (state.spawnTimers.shield <= 0 && !state.shield) { spawnShield(); state.spawnTimers.shield = state.shieldEvery; }
+    if (state.spawnTimers.enemy <= 0) {
+      spawnEnemy(pickEnemyKind());
+      state.spawnTimers.enemy = enemyEvery();
+    }
+    // Boss stages: the boss arrives 1.5 s in, at the top-centre.
+    if (!state.endless && !state.cleared && !state.boss
+      && (isBossStage(state.stage) || isMidbossStage(state.stage))) {
+      state.bossSpawnTimer -= dt;
+      if (state.bossSpawnTimer <= 0) spawnBoss();
+    }
 
     // --- Ship steering ----------------------------------------------------
     // Keyboard steers directly. With no keys, a held pointer steers:
@@ -844,11 +1345,93 @@ function createWorld(random, hangarLevels = {}) {
       s.y += s.vy * dt;
       s.pulse += dt;
     }
+    // Enemies drift like mines. Darts steer slightly toward the ship;
+    // spitters count down to their next shot, telegraphing the last 0.5 s.
+    for (const e of state.enemies) {
+      if (e.kind === 'dart') {
+        const dx = ship.x - e.x;
+        const dy = ship.y - e.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const spd = ENEMY_DEFS.dart.speed * speedScale();
+        e.vx += ((dx / d) * spd - e.vx) * 0.6 * dt;
+        e.vy += ((dy / d) * spd - e.vy) * 0.6 * dt;
+      }
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      e.spin += e.spinSpeed * dt;
+      e.pulse += dt;
+      e.age = (e.age ?? 0) + dt;
+      if (e.kind === 'spitter') {
+        e.shootTimer -= dt;
+        if (e.shootTimer <= SPITTER_TELEGRAPH && e.shootTimer > 0 && e.telegraph <= 0) {
+          e.telegraph = SPITTER_TELEGRAPH;
+        }
+        e.telegraph = Math.max(0, (e.telegraph ?? 0) - dt);
+        if (e.shootTimer <= 0) {
+          fireSpitter(e);
+          e.shootTimer = SPITTER_SHOOT_EVERY;
+          e.telegraph = 0;
+        }
+      }
+    }
+    // Enemy bullets fly straight and fade offscreen.
+    for (const b of state.enemyBullets) {
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.age = (b.age ?? 0) + dt;
+    }
+    // The boss drifts slowly side to side (vx ±30) and bobs on a sine,
+    // telegraphing each attack 0.8 s before it fires.
+    if (state.boss) {
+      const boss = state.boss;
+      boss.age = (boss.age ?? 0) + dt;
+      boss.pulse = (boss.pulse ?? 0) + dt;
+      boss.x += boss.vx * dt;
+      if (boss.x < 140) { boss.x = 140; boss.vx = Math.abs(boss.vx); }
+      if (boss.x > FIELD.width - 140) { boss.x = FIELD.width - 140; boss.vx = -Math.abs(boss.vx); }
+      boss.y = boss.baseY + Math.sin(state.time * 1.2) * 24;
+      const def = bossFor(state.stage);
+      boss.attackTimer -= dt;
+      boss.aimedTimer -= dt;
+      if (boss.attackTimer <= BOSS_TELEGRAPH && boss.attackTimer > 0 && boss.telegraph <= 0) {
+        boss.telegraph = BOSS_TELEGRAPH;
+        boss.attackKind = 'radial';
+      }
+      if (boss.aimedTimer <= BOSS_TELEGRAPH && boss.aimedTimer > 0 && boss.telegraph <= 0) {
+        boss.telegraph = BOSS_TELEGRAPH;
+        boss.attackKind = 'aimed';
+      }
+      boss.telegraph = Math.max(0, boss.telegraph - dt);
+      if (boss.attackTimer <= 0) {
+        fireRadial(boss);
+        boss.attackTimer = def ? def.radialEvery : 5;
+        if (boss.attackKind === 'radial') { boss.telegraph = 0; boss.attackKind = null; }
+      }
+      if (boss.aimedTimer <= 0) {
+        fireAimed(boss);
+        boss.aimedTimer = def ? def.aimedEvery : Infinity;
+        if (boss.attackKind === 'aimed') { boss.telegraph = 0; boss.attackKind = null; }
+      }
+    }
     const offscreen = (e) => e.y > FIELD.height + 40 || e.y < -60 || e.x < -60 || e.x > FIELD.width + 60;
     state.shards = state.shards.filter((e) => !offscreen(e));
     state.mines = state.mines.filter((e) => !offscreen(e));
     state.storms = state.storms.filter((e) => !offscreen(e));
     state.shields = state.shields.filter((e) => !offscreen(e));
+    state.enemies = state.enemies.filter((e) => !offscreen(e));
+    state.enemyBullets = state.enemyBullets.filter((e) => !offscreen(e));
+
+    // --- Blaster ----------------------------------------------------------
+    // Auto-fires at the nearest enemy or boss in range; bullets resolve
+    // hits (and kill points) in updateBullets. A dead boss clears the stage.
+    state.blasterCooldown = Math.max(0, (state.blasterCooldown ?? 0) - dt);
+    if (state.enemies.length > 0 || state.boss) fireBlaster(state);
+    updateBullets(state, dt, (x, y) => burst(x, y, '#67e8f9', 8, 200));
+    if (state.boss && state.boss.hp <= 0) {
+      burst(state.boss.x, state.boss.y, '#f472b6', 40, 420);
+      state.boss = null;
+      fireClear();
+    }
 
     // --- Particles --------------------------------------------------------
     for (const p of state.particles) {
@@ -875,16 +1458,11 @@ function createWorld(random, hangarLevels = {}) {
             e.nearMissed = true;
             state.nearMisses += 1;
             state.score += 5;
-            state.gateProgress = Math.min(1, state.score / WIN_SCORE);
             state.floaters.push({
               x: e.x, y: e.y - 10, text: 'CLOSE! +5',
               life: 0.9, maxLife: 0.9, color: '#a5f3fc',
             });
             events |= EVENT_NEARMISS;
-            if (state.score >= WIN_SCORE && !state.gateOpen) {
-              state.gateOpen = true;
-              events |= EVENT_WIN;
-            }
           }
         }
       }
@@ -911,7 +1489,6 @@ function createWorld(random, hangarLevels = {}) {
       if (e.golden) state.goldenCollected = (state.goldenCollected || 0) + 1;
       state.score += gained;
       state.level = levelFor(state.score);
-      state.gateProgress = Math.min(1, state.score / WIN_SCORE);
       state.floaters.push({
         x: e.x, y: e.y - 10,
         text: e.golden ? 'GOLDEN +50' : `+${gained}`,
@@ -920,10 +1497,6 @@ function createWorld(random, hangarLevels = {}) {
       state.comboPulse = 1;
       burst(e.x, e.y, e.golden ? '#fde047' : '#fbbf24', e.golden ? 22 : 12, e.golden ? 320 : 200);
       events |= EVENT_PICKUP;
-      if (state.score >= WIN_SCORE && !state.gateOpen) {
-        state.gateOpen = true;
-        events |= EVENT_WIN;
-      }
     });
     // A level risen during this step queues one upgrade choice per level
     // (normally exactly one — a shard is worth at most 60 points).
@@ -949,7 +1522,14 @@ function createWorld(random, hangarLevels = {}) {
       }
       return false;
     };
-    const hit = hitBy(state.mines) || hitBy(state.storms);
+    // Boss contact is a hit too, but the boss is not consumed.
+    const bossTouch = () => {
+      if (ship.invulnerable > 0 || !state.boss) return false;
+      const b = state.boss;
+      return Math.hypot(b.x - ship.x, b.y - ship.y) < SHIP.radius * 0.8 + b.radius * 0.85;
+    };
+    const hit = hitBy(state.mines) || hitBy(state.storms)
+      || hitBy(state.enemies) || hitBy(state.enemyBullets) || bossTouch();
     if (hit) {
       state.combo = 0;
       state.comboCount = 0;
@@ -991,6 +1571,10 @@ function createWorld(random, hangarLevels = {}) {
     // Floaters rise and fade; the combo pop and the shake decay; the
     // displayed score counts up toward the real score instead of jumping.
     for (const f of state.floaters) {
+      // Kill floaters pushed by updateBullets carry no life — give them
+      // the standard 0.9 s so they actually render instead of being
+      // filtered out on the same step.
+      if (f.life === undefined) { f.life = 0.9; f.maxLife = 0.9; }
       f.y -= 30 * dt;
       f.life -= dt;
     }
@@ -1003,6 +1587,14 @@ function createWorld(random, hangarLevels = {}) {
       state.displayScore += Math.sign(diff) * Math.min(Math.abs(diff), stepAmt);
       if (Math.abs(state.score - state.displayScore) < 1) state.displayScore = state.score;
     }
+
+    // --- Stage clear (score target only; boss stages clear on the kill) --
+    if (!state.endless && !state.cleared
+      && !isBossStage(state.stage) && !isMidbossStage(state.stage)
+      && state.score >= state.stageTarget) {
+      fireClear();
+    }
+    refreshGateProgress();
 
     return events;
   }
@@ -1019,16 +1611,34 @@ function createWorld(random, hangarLevels = {}) {
     state.hangar = { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0, ...levels };
   }
 
-  // Continue past the Aurora Gate: the run goes endless. The gate is
-  // already open, so the win can never re-trigger; levels keep rising
-  // one per 200 points and upgrade picks keep coming with them.
-  function enterEndless() {
-    state.endless = true;
-    state.gateOpen = true;
-    state.gateProgress = 1;
+  // Replace the equipped ship's stats (plain data from ships.js) — hearts
+  // apply on the next reset(), speed and blaster read live.
+  function setShip(stats) {
+    state.shipStats = { ...DEFAULT_SHIP_STATS, ...(stats || {}) };
   }
 
-  return { state, reset, step, burst, grantGrace, setHangar, enterEndless };
+  // Play a stage: sets the stage and its score target (boss stages have
+  // target 0 — they clear on the boss kill). The run itself starts on
+  // the next reset(). A boss stage also re-arms its 1.5 s spawn timer.
+  function setStage(n) {
+    state.stage = n;
+    state.stageTarget = state.endless ? Infinity : stageTarget(n);
+    state.bossSpawnTimer = (isBossStage(n) || isMidbossStage(n)) ? BOSS_SPAWN_DELAY : 0;
+    state.gateProgress = 0;
+  }
+
+  // Continue past a stage clear: the run goes endless. No stage target,
+  // no clear can fire; levels keep rising one per 200 points and
+  // upgrade picks keep coming with them.
+  function enterEndless() {
+    state.endless = true;
+    state.stage = 0;
+    state.stageTarget = Infinity;
+    state.gateOpen = true;
+    refreshGateProgress();
+  }
+
+  return { state, reset, step, burst, grantGrace, setHangar, setShip, setStage, spawnEnemy, enterEndless };
 }
 
 // ---- src/skins.js ----
@@ -1544,7 +2154,7 @@ function createAudio() {
 // rewards above the passive earn rate, finishing all three pays a bonus
 // chest (+100 shards), and one mission can be rerolled per day.
 const SAVE_KEY = 'lumen-drift-save';
-const SAVE_VERSION = 3;
+const SAVE_VERSION = 4;
 
 // Daily-reward calendar: shards per cycle day (day 7 is visibly best).
 const DAILY_REWARDS = [10, 15, 20, 30, 40, 50, 100];
@@ -1631,6 +2241,13 @@ function freshSave(today) {
     // `lifetime.shards` counts every shard ever earned and never drops —
     // it is what unlocks ship skins, so spending can never lock a skin.
     shardBalance: 0,
+    // Spendable coin purse (stage clears pay coins; the ship shop
+    // spends them). Shards (shardBalance) are a separate economy.
+    coins: 0,
+    // Highest stage cleared (0 = none yet); gates stage access.
+    highestCleared: 0,
+    // Owned ships: { owned: { spark: { level: 1 } }, equipped: 'spark' }.
+    ships: { owned: { spark: { level: 1 } }, equipped: 'spark' },
     // Permanent per-part ship upgrades (see hangar.js).
     hangar: { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0 },
     // True once the player has beaten the Aurora Gate: endless mode is
@@ -1649,6 +2266,23 @@ function freshSave(today) {
     // Player settings (persisted).
     settings: { muted: false, reduceShake: false },
   };
+}
+
+function isSaveShapeV4(save) {
+  return save && typeof save === 'object'
+    && save.version === 4
+    && Array.isArray(save.top5) && Array.isArray(save.history)
+    && save.lifetime && typeof save.lifetime === 'object'
+    && typeof save.shardBalance === 'number'
+    && save.hangar && typeof save.hangar === 'object'
+    && typeof save.endlessUnlocked === 'boolean'
+    && save.streak && typeof save.streak === 'object'
+    && save.missions && Array.isArray(save.missions.list)
+    && typeof save.coins === 'number'
+    && typeof save.highestCleared === 'number'
+    && save.ships && typeof save.ships === 'object'
+    && save.ships.owned && typeof save.ships.owned === 'object'
+    && typeof save.ships.equipped === 'string';
 }
 
 function isSaveShapeV3(save) {
@@ -1711,7 +2345,7 @@ const MISSION_ID_MAP = { shards: 'shards50', level: 'level3', dash: 'dash10' };
  * unclaimed for today, and the streak-freeze starts unused.
  */
 function migrateSaveV2toV3(save) {
-  const migrated = { ...save, version: SAVE_VERSION };
+  const migrated = { ...save, version: 3 };
   migrated.streak = {
     lastDate: save.streak.lastDate ?? null,
     count: save.streak.count ?? 0,
@@ -1751,6 +2385,20 @@ function migrateSaveV2toV3(save) {
   return migrated;
 }
 
+/**
+ * Migrate a v3 save to v4. Nothing earned is lost: coins, highest
+ * stage and ships start at their defaults (0 / 0 / SPARK Lv 1);
+ * endlessUnlocked carries over as-is — a player who earned it under
+ * the old gate keeps it. Everything else untouched.
+ */
+function migrateSaveV3toV4(save) {
+  const migrated = { ...save, version: SAVE_VERSION };
+  migrated.coins = 0;
+  migrated.highestCleared = 0;
+  migrated.ships = { owned: { spark: { level: 1 } }, equipped: 'spark' };
+  return migrated;
+}
+
 /** Fill any v3 field a hand-edited or partial blob is missing. */
 function fillDefaults(save) {
   const fresh = freshSave(save.missions?.date ?? localDate());
@@ -1763,6 +2411,16 @@ function fillDefaults(save) {
   if (typeof save.missions.allBonusPaid !== 'boolean') save.missions.allBonusPaid = false;
   if (!save.ftue || typeof save.ftue !== 'object') save.ftue = fresh.ftue;
   if (!save.settings || typeof save.settings !== 'object') save.settings = fresh.settings;
+  // v4 fields, filled defensively when missing (a v3-shaped blob that
+  // reaches here, or a hand-edited v4 blob, keeps its old progress).
+  if (typeof save.coins !== 'number') save.coins = 0;
+  if (typeof save.highestCleared !== 'number') save.highestCleared = 0;
+  if (!save.ships || typeof save.ships !== 'object') save.ships = fresh.ships;
+  if (!save.ships.owned || typeof save.ships.owned !== 'object') save.ships.owned = {};
+  if (!save.ships.owned.spark) save.ships.owned.spark = { level: 1 };
+  if (typeof save.ships.equipped !== 'string' || !save.ships.owned[save.ships.equipped]) {
+    save.ships.equipped = 'spark';
+  }
   return save;
 }
 
@@ -1777,9 +2435,10 @@ function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
     const raw = storage.getItem(SAVE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (isSaveShapeV3(parsed)) save = fillDefaults(parsed);
-      else if (isSaveShapeV2(parsed)) save = migrateSaveV2toV3(parsed);
-      else if (isSaveShapeV1(parsed)) save = migrateSaveV2toV3(migrateSave(parsed));
+      if (isSaveShapeV4(parsed)) save = fillDefaults(parsed);
+      else if (isSaveShapeV3(parsed)) save = migrateSaveV3toV4(fillDefaults(parsed));
+      else if (isSaveShapeV2(parsed)) save = migrateSaveV3toV4(migrateSaveV2toV3(parsed));
+      else if (isSaveShapeV1(parsed)) save = migrateSaveV3toV4(migrateSaveV2toV3(migrateSave(parsed)));
     }
   } catch {
     save = null;
@@ -1923,7 +2582,7 @@ function recordRun(save, run, opts = {}) {
   if (run.score > save.best) save.best = run.score;
   const entry = {
     score: run.score, level: run.level, bestCombo: run.bestCombo,
-    date: run.date, endless: !!run.endless,
+    date: run.date, endless: !!run.endless, stage: run.stage ?? 0,
   };
   save.top5.push(entry);
   save.top5.sort((a, b) => b.score - a.score);
@@ -1932,7 +2591,7 @@ function recordRun(save, run, opts = {}) {
   const historyEntry = {
     score: run.score, level: run.level, bestCombo: run.bestCombo,
     shards: run.shards, dashes: run.dashes, upgrades: run.upgrades || [],
-    date: run.date, endless: !!run.endless,
+    date: run.date, endless: !!run.endless, stage: run.stage ?? 0,
   };
   save.history.unshift(historyEntry);
   save.history = save.history.slice(0, 20);
@@ -2139,6 +2798,164 @@ function buyHangarPart(save, partId) {
   return { ok: true, cost: check.cost, level: save.hangar[part.id] };
 }
 
+// ---- src/ships.js ----
+// Lumen Drift — the ship shop: six ships, their levels, and the coin
+// economy. Pure logic: every function takes the save and returns plain
+// data or a { ok } / { ok: false, reason } result, like hangar.js.
+// Coins are save.coins (spendable); shards (shardBalance) are untouched.
+//
+// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
+// ship level + a better ship. A ship's level is bought with coins in
+// the shop (cap Lv 10); each level boosts stats, so the loop is:
+// clear stages -> earn coins -> level up / buy a better ship -> clear
+// higher stages.
+const SHIP_LEVEL_MAX = 10;
+
+const SHIPS = [
+  {
+    id: 'spark', name: 'SPARK', rarity: 'common', unlockStage: 0, price: 0,
+    hearts: 3, speedMult: 1.00, blasterDamage: 1, blasterRate: 2.0,
+    shape: 'skiff', desc: 'The starter skiff. Reliable, nothing fancy.',
+  },
+  {
+    id: 'comet', name: 'COMET', rarity: 'common', unlockStage: 3, price: 150,
+    hearts: 3, speedMult: 1.05, blasterDamage: 1, blasterRate: 2.2,
+    shape: 'dart', desc: 'A quick dart. Fires a little faster.',
+  },
+  {
+    id: 'nebula', name: 'NEBULA', rarity: 'rare', unlockStage: 10, price: 500,
+    hearts: 4, speedMult: 1.10, blasterDamage: 2, blasterRate: 2.2,
+    shape: 'wing', desc: 'A winged cruiser with a heavier blaster.',
+  },
+  {
+    id: 'pulsar', name: 'PULSAR', rarity: 'epic', unlockStage: 25, price: 1500,
+    hearts: 4, speedMult: 1.15, blasterDamage: 2, blasterRate: 2.6,
+    shape: 'dart', desc: 'An epic dart that spits blaster fire.',
+  },
+  {
+    id: 'aurora', name: 'AURORA', rarity: 'legendary', unlockStage: 50, price: 4000,
+    hearts: 5, speedMult: 1.20, blasterDamage: 3, blasterRate: 2.6,
+    shape: 'wing', desc: 'A legendary wing — the stage-50 gate-breaker.',
+  },
+  {
+    id: 'novaprime', name: 'NOVA PRIME', rarity: 'mythic', unlockStage: 75, price: 8000,
+    hearts: 6, speedMult: 1.25, blasterDamage: 4, blasterRate: 3.0,
+    shape: 'skiff', desc: 'The mythic skiff. The final storm fears it.',
+  },
+];
+
+function shipById(id) {
+  return SHIPS.find((s) => s.id === id) || null;
+}
+
+/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
+function shipLevelCost(level) {
+  return 100 * level;
+}
+
+/**
+ * Derived stats for a ship definition at a level:
+ * hearts +1 at Lv 5 and Lv 10, +2% speed per level, +1 blaster damage
+ * per level (flat), blaster rate unchanged.
+ */
+function shipStats(def, level) {
+  return {
+    hearts: def.hearts + (level >= 5 ? 1 : 0) + (level >= 10 ? 1 : 0),
+    speedMult: def.speedMult * (1 + 0.02 * (level - 1)),
+    blasterDamage: def.blasterDamage + (level - 1),
+    blasterRate: def.blasterRate,
+    level,
+  };
+}
+
+/** Current level of a ship (0 when not owned). */
+function shipLevel(save, id) {
+  return (save && save.ships && save.ships.owned && save.ships.owned[id]
+    && save.ships.owned[id].level) || 0;
+}
+
+/** The equipped ship's definition (defaults to SPARK when unset). */
+function equippedShip(save) {
+  const id = (save && save.ships && save.ships.equipped) || 'spark';
+  return shipById(id) || shipById('spark');
+}
+
+/** Derived stats of the equipped ship at its owned level. */
+function equippedShipStats(save) {
+  const def = equippedShip(save);
+  return shipStats(def, Math.max(1, shipLevel(save, def.id)));
+}
+
+/**
+ * Can this ship be bought right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
+ * | 'unknown'. Locked = highestCleared < unlockStage (spark, unlock 0,
+ * is always available; it starts owned).
+ */
+function canBuyShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) > 0) return { ok: false, reason: 'owned' };
+  if ((save.highestCleared || 0) < def.unlockStage) return { ok: false, reason: 'locked' };
+  if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
+  return { ok: true, cost: def.price };
+}
+
+/**
+ * Buy a ship. Deducts the price from save.coins, owns it at Lv 1 and
+ * equips it. Returns { ok: true, cost, level: 1 } or the canBuy reason.
+ */
+function buyShip(save, id) {
+  const check = canBuyShip(save, id);
+  if (!check.ok) return check;
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  if (!save.ships.owned) save.ships.owned = {};
+  save.coins = (save.coins ?? 0) - check.cost;
+  save.ships.owned[id] = { level: 1 };
+  save.ships.equipped = id;
+  return { ok: true, cost: check.cost, level: 1 };
+}
+
+/**
+ * Can this ship be levelled up right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
+ * 'broke' | 'unknown'.
+ */
+function canLevelShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const level = shipLevel(save, id);
+  if (level === 0) return { ok: false, reason: 'not-owned' };
+  if (level >= SHIP_LEVEL_MAX) return { ok: false, reason: 'maxed' };
+  const cost = shipLevelCost(level);
+  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Level a ship up one level. Deducts shipLevelCost(level) from
+ * save.coins. Returns { ok: true, cost, level } or the reason.
+ */
+function levelUpShip(save, id) {
+  const check = canLevelShip(save, id);
+  if (!check.ok) return check;
+  save.ships.owned[id].level += 1;
+  save.coins = (save.coins ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.ships.owned[id].level };
+}
+
+/**
+ * Equip an owned ship. Returns { ok } or
+ * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
+ */
+function equipShip(save, id) {
+  if (!shipById(id)) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  save.ships.equipped = id;
+  return { ok: true };
+}
+
 // ---- src/render.js ----
 // Lumen Drift — the renderer. One canvas, one palette, everything drawn
 // with vector shapes and glows: a deep indigo sky, three parallax star
@@ -2156,7 +2973,9 @@ const SCREEN_TITLE = 'title';
 const SCREEN_PLAY = 'play';
 const SCREEN_PAUSED = 'paused';
 const SCREEN_OVER = 'over';
-const SCREEN_WIN = 'win';
+const SCREEN_CLEAR = 'clear';
+const SCREEN_STAGES = 'stages';
+const SCREEN_SHOP = 'shop';
 const SCREEN_UPGRADE = 'upgrade';
 const SCREEN_STATS = 'stats';
 const SCREEN_HANGAR = 'hangar';
@@ -2170,12 +2989,17 @@ const SCREEN_REWARD = 'reward';
 // currency; the meta game (hangar / missions / scores) lives in a bottom
 // tab bar that appears after the first run (progressive disclosure).
 const GEAR_RECT = { x: 24, y: 24, w: 48, h: 48 };
-const FLAME_RECT = { x: 1000, y: 24, w: 76, h: 48 };
+// Top-right cluster, left to right: streak flame, coins purse, shard
+// balance. (The flame only draws while a streak is alive; the coins
+// chip always shows — coins are the stage economy now.)
+const FLAME_RECT = { x: 856, y: 24, w: 76, h: 48 };
+const COINS_RECT = { x: 946, y: 24, w: 130, h: 48 };
 const BALANCE_RECT = { x: 1090, y: 24, w: 166, h: 48 };
 const PLAY_RECT = { x: 470, y: 410, w: 340, h: 76 };
-const HANGAR_TAB_RECT = { x: 335, y: 636, w: 190, h: 56 };
-const MISSIONS_TAB_RECT = { x: 545, y: 636, w: 190, h: 56 };
-const SCORES_TAB_RECT = { x: 755, y: 636, w: 190, h: 56 };
+const HANGAR_TAB_RECT = { x: 260, y: 636, w: 190, h: 56 };
+const SHOP_TAB_RECT = { x: 470, y: 636, w: 190, h: 56 };
+const MISSIONS_TAB_RECT = { x: 680, y: 636, w: 190, h: 56 };
+const SCORES_TAB_RECT = { x: 890, y: 636, w: 190, h: 56 };
 
 // --- Panels: one centred card over a dimmed home screen.
 const PANEL_CARD = { x: 260, y: 96, w: 760, h: 528 };
@@ -2187,17 +3011,23 @@ const SETTINGS_SOUND_RECT = { x: 880, y: 208, w: 100, h: 44 };
 const SETTINGS_FULLSCREEN_RECT = { x: 880, y: 284, w: 100, h: 44 };
 const SETTINGS_SHAKE_RECT = { x: 880, y: 360, w: 100, h: 44 };
 
-// The deliberate restart button on the game-over / win screens.
+// The deliberate restart button on the game-over screen.
 const PLAY_AGAIN_RECT = { x: 510, y: 470, w: 260, h: 56 };
 // Hangar exit on the game-over screen (the endless trap fix: after an
 // endless death the player can go straight to the hangar to spend).
 const OVER_HANGAR_RECT = { x: 510, y: 546, w: 260, h: 48 };
-// Win-screen button that continues the run into endless mode.
-const ENDLESS_RECT = { x: 510, y: 546, w: 260, h: 56 };
-// Hangar exit on the win screen.
-const WIN_HANGAR_RECT = { x: 510, y: 622, w: 260, h: 48 };
+// Stage-clear buttons, stacked under the coins line.
+const CLEAR_NEXT_RECT = { x: 510, y: 360, w: 260, h: 56 };
+const CLEAR_REPLAY_RECT = { x: 510, y: 428, w: 260, h: 48 };
+const CLEAR_STAGES_RECT = { x: 510, y: 488, w: 260, h: 48 };
+const CLEAR_HANGAR_RECT = { x: 510, y: 548, w: 260, h: 48 };
+// Endless continuation on the clear screen (drawn only when unlocked).
+const CLEAR_ENDLESS_RECT = { x: 510, y: 608, w: 260, h: 48 };
 // Back button on the hangar screen.
 const HANGAR_BACK_RECT = { x: 540, y: 606, w: 200, h: 44 };
+// Back buttons on the stage-select and shop screens (same spot).
+const STAGES_BACK_RECT = { x: 540, y: 580, w: 200, h: 44 };
+const SHOP_BACK_RECT = { x: 540, y: 636, w: 200, h: 44 };
 // Skin arrows in the hangar (the selector moved here from the title, so
 // its name can never overlap an arrow again).
 const HANGAR_SKIN_LEFT = { x: 200, y: 126, w: 40, h: 52 };
@@ -2253,6 +3083,71 @@ function layoutUpgradeCards(offers) {
     h: cardH,
     upgrade,
   }));
+}
+
+// --- Stage select: 10 tiles per page in a 5x2 grid, band arrows on the
+// sides, a big PLAY STAGE button under the grid, BACK under that.
+const STAGES_PER_PAGE = 10;
+const STAGE_PAGE_COUNT = 10;
+function layoutStageTiles(page) {
+  const p = Math.max(0, Math.min(STAGE_PAGE_COUNT - 1, page | 0));
+  const tileW = 180;
+  const tileH = 110;
+  const gap = 20;
+  const totalW = 5 * tileW + 4 * gap;
+  const x0 = (FIELD.width - totalW) / 2;
+  const y0 = 200;
+  const tiles = [];
+  for (let i = 0; i < STAGES_PER_PAGE; i += 1) {
+    const col = i % 5;
+    const row = Math.floor(i / 5);
+    tiles.push({
+      x: x0 + col * (tileW + gap),
+      y: y0 + row * (tileH + gap),
+      w: tileW,
+      h: tileH,
+      stage: p * STAGES_PER_PAGE + i + 1,
+    });
+  }
+  return {
+    page: p,
+    pageCount: STAGE_PAGE_COUNT,
+    tiles,
+    prevArrow: { x: 60, y: 245, w: 60, h: 60 },
+    nextArrow: { x: 1160, y: 245, w: 60, h: 60 },
+    prevEnabled: p > 0,
+    nextEnabled: p < STAGE_PAGE_COUNT - 1,
+    play: { x: 470, y: 480, w: 340, h: 64 },
+    back: STAGES_BACK_RECT,
+  };
+}
+
+// --- Ship shop: 6 cards in a 2x3 grid; each card's action button sits
+// at its foot (BUY / LEVEL UP / EQUIP / EQUIPPED).
+const RARITY_COLORS = {
+  common: '#e2e8f0',
+  rare: '#38bdf8',
+  epic: '#c084fc',
+  legendary: '#fbbf24',
+  mythic: '#f472b6',
+};
+function layoutShopCards() {
+  const cardW = 380;
+  const cardH = 210;
+  const gap = 20;
+  const totalW = 3 * cardW + 2 * gap;
+  const x0 = (FIELD.width - totalW) / 2;
+  const y0 = 170;
+  return SHIPS.map((ship, i) => {
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    const x = x0 + col * (cardW + gap);
+    const y = y0 + row * (cardH + gap);
+    return {
+      x, y, w: cardW, h: cardH, ship,
+      action: { x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 },
+    };
+  });
 }
 
 const CYAN = '#22d3ee';
@@ -2415,6 +3310,238 @@ function drawStorm(ctx, x, y, spin, age = 1) {
   ctx.restore();
 }
 
+function drawEnemy(ctx, e) {
+  // One silhouette per kind, so the threat reads at a glance: drifter a
+  // grey-green spiky blob, dart a red triangle, bulwark a big purple
+  // hexagon, spitter an orange diamond. An elite (eliteTier > 0) wears
+  // a gold outline.
+  const r = e.radius ?? 15;
+  ctx.save();
+  ctx.translate(e.x, e.y);
+  const pulse = 1 + 0.05 * Math.sin((e.pulse ?? 0) * 4);
+  if (e.kind === 'dart') {
+    ctx.rotate(Math.atan2(e.vy ?? 0, e.vx ?? -1));
+    glow(ctx, '#f87171', 14);
+    ctx.fillStyle = '#dc2626';
+    ctx.strokeStyle = '#fca5a5';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(r * 1.4, 0);
+    ctx.lineTo(-r, -r * 0.8);
+    ctx.lineTo(-r * 0.5, 0);
+    ctx.lineTo(-r, r * 0.8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  } else if (e.kind === 'bulwark') {
+    ctx.rotate(e.spin ?? 0);
+    glow(ctx, '#a78bfa', 16);
+    ctx.fillStyle = '#6d28d9';
+    ctx.strokeStyle = '#c4b5fd';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (let i = 0; i < 6; i += 1) {
+      const a = (i / 6) * Math.PI * 2;
+      const px = Math.cos(a) * r * pulse;
+      const py = Math.sin(a) * r * pulse;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#ede9fe';
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (e.kind === 'spitter') {
+    ctx.rotate((e.spin ?? 0) * 0.5);
+    glow(ctx, '#fb923c', 14);
+    ctx.fillStyle = '#ea580c';
+    ctx.strokeStyle = '#fdba74';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 1.2);
+    ctx.lineTo(r, 0);
+    ctx.lineTo(0, r * 1.2);
+    ctx.lineTo(-r, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#ffedd5';
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.28, 0, Math.PI * 2);
+    ctx.fill();
+    // Telegraph: a bright ring while the spitter is about to shoot.
+    if ((e.telegraph ?? 0) > 0) {
+      ctx.strokeStyle = '#fb923c';
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin((e.pulse ?? 0) * 12);
+      ctx.beginPath();
+      ctx.arc(0, 0, r + 10, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    // Drifter (default): a grey-green spiky blob, slow and tumbling.
+    ctx.rotate(e.spin ?? 0);
+    glow(ctx, '#a3e635', 12);
+    ctx.fillStyle = '#4d7c0f';
+    ctx.strokeStyle = '#a3e635';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 8; i += 1) {
+      const angle = (i / 8) * Math.PI * 2;
+      const outer = r * 1.3 * pulse;
+      const inner = r * 0.65;
+      const tipX = Math.cos(angle) * outer;
+      const tipY = Math.sin(angle) * outer;
+      const baseAngle = angle + Math.PI / 8;
+      const baseX = Math.cos(baseAngle) * inner;
+      const baseY = Math.sin(baseAngle) * inner;
+      if (i === 0) ctx.moveTo(tipX, tipY);
+      else ctx.lineTo(tipX, tipY);
+      ctx.lineTo(baseX, baseY);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#d9f99d';
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  // Elite tier: a gold ring over the top, whatever the kind.
+  if ((e.eliteTier ?? 0) > 0) {
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.strokeStyle = GOLD;
+    ctx.lineWidth = 3;
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    ctx.arc(0, 0, r + 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawBullet(ctx, b) {
+  // A player blaster bolt: a short cyan streak along its flight path.
+  const angle = Math.atan2(b.vy ?? 0, b.vx ?? 1);
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.rotate(angle);
+  glow(ctx, CYAN, 10);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 11, 3.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ecfeff';
+  ctx.beginPath();
+  ctx.ellipse(3, 0, 5, 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawEnemyBullet(ctx, b) {
+  // An enemy orb: magenta, round, unmistakable next to a cyan bolt.
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  glow(ctx, MAGENTA, 12);
+  ctx.fillStyle = MAGENTA;
+  ctx.beginPath();
+  ctx.arc(0, 0, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fdf2f8';
+  ctx.beginPath();
+  ctx.arc(0, 0, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBoss(ctx, boss) {
+  // A boss is a crown-like ring around a burning core: spikes on the
+  // rim, a pulsing magenta heart. While telegraph > 0 it is about to
+  // fire — a flashing ring warns the player.
+  const r = boss.radius ?? 46;
+  ctx.save();
+  ctx.translate(boss.x, boss.y);
+  const throb = 1 + 0.06 * Math.sin((boss.age ?? 0) * 5);
+  if ((boss.telegraph ?? 0) > 0) {
+    ctx.save();
+    ctx.globalAlpha = 0.45 + 0.45 * Math.sin((boss.age ?? 0) * 18);
+    ctx.strokeStyle = '#f43f5e';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(0, 0, r + 22, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.rotate(Math.sin((boss.age ?? 0) * 0.8) * 0.15);
+  glow(ctx, '#c084fc', 24);
+  ctx.fillStyle = '#4c1d95';
+  ctx.strokeStyle = '#c084fc';
+  ctx.lineWidth = 3;
+  // Crown rim: twelve spikes around the ring.
+  ctx.beginPath();
+  for (let i = 0; i < 12; i += 1) {
+    const angle = (i / 12) * Math.PI * 2;
+    const outer = r * 1.25 * throb;
+    const inner = r * 0.85;
+    const tipX = Math.cos(angle) * outer;
+    const tipY = Math.sin(angle) * outer;
+    const baseAngle = angle + Math.PI / 12;
+    const baseX = Math.cos(baseAngle) * inner;
+    const baseY = Math.sin(baseAngle) * inner;
+    if (i === 0) ctx.moveTo(tipX, tipY);
+    else ctx.lineTo(tipX, tipY);
+    ctx.lineTo(baseX, baseY);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#7e22ce';
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.62, 0, Math.PI * 2);
+  ctx.fill();
+  glow(ctx, MAGENTA, 20);
+  ctx.fillStyle = MAGENTA;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.34 * throb, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fdf2f8';
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 0.14, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBossBar(ctx, boss, width) {
+  // Boss HP bar, top-centre (the HUD owns it; the field only draws the
+  // boss itself). Name above, bar below.
+  const barW = 320;
+  const barX = (width - barW) / 2;
+  const barY = 34;
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  glow(ctx, '#c084fc', 10);
+  ctx.fillStyle = '#e9d5ff';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText(`BOSS  ${boss.name ?? 'VOID WARDEN'}`, width / 2, barY - 8);
+  noGlow(ctx);
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.fillRect(barX, barY, barW, 12);
+  const frac = Math.max(0, Math.min(1, (boss.hp ?? 0) / (boss.maxHp || 1)));
+  ctx.fillStyle = '#c084fc';
+  ctx.fillRect(barX, barY, barW * frac, 12);
+  ctx.strokeStyle = '#e9d5ff';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(barX, barY, barW, 12);
+  ctx.restore();
+}
+
 function drawShieldCell(ctx, x, y, pulse) {
   ctx.save();
   ctx.translate(x, y);
@@ -2436,7 +3563,7 @@ function drawShieldCell(ctx, x, y, pulse) {
   ctx.restore();
 }
 
-function drawShip(ctx, state, skin = SKINS[0]) {
+function drawShip(ctx, state, skin = SKINS[0], shape = 'skiff') {
   const ship = state.ship;
   const blink = ship.invulnerable > 0 && Math.floor(state.time * 14) % 2 === 0;
   ctx.save();
@@ -2455,18 +3582,38 @@ function drawShip(ctx, state, skin = SKINS[0]) {
   ctx.lineTo(-12, 5);
   ctx.closePath();
   ctx.fill();
-  // Hull: a swept light-skiff. The skin changes hull, glow and trail
-  // colours only — the shape (and the hitbox) never change.
+  // Hull: the skin changes hull, glow and trail colours only — the shape
+  // (and the hitbox) never change. Three silhouettes, one per ship:
+  // 'skiff' the current swept hull, 'dart' a narrow hull with a longer
+  // nose, 'wing' a wider hull with swept wings.
   glow(ctx, skin.glow, 18);
   ctx.fillStyle = skin.hull;
   ctx.strokeStyle = skin.glow;
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(22, 0);
-  ctx.lineTo(-10, -13);
-  ctx.lineTo(-16, -5);
-  ctx.lineTo(-16, 5);
-  ctx.lineTo(-10, 13);
+  if (shape === 'dart') {
+    ctx.moveTo(28, 0);
+    ctx.lineTo(-8, -9);
+    ctx.lineTo(-16, -4);
+    ctx.lineTo(-16, 4);
+    ctx.lineTo(-8, 9);
+  } else if (shape === 'wing') {
+    ctx.moveTo(20, 0);
+    ctx.lineTo(-6, -18);
+    ctx.lineTo(-14, -18);
+    ctx.lineTo(-10, -6);
+    ctx.lineTo(-18, -5);
+    ctx.lineTo(-18, 5);
+    ctx.lineTo(-10, 6);
+    ctx.lineTo(-14, 18);
+    ctx.lineTo(-6, 18);
+  } else {
+    ctx.moveTo(22, 0);
+    ctx.lineTo(-10, -13);
+    ctx.lineTo(-16, -5);
+    ctx.lineTo(-16, 5);
+    ctx.lineTo(-10, 13);
+  }
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
@@ -2492,10 +3639,10 @@ function drawShip(ctx, state, skin = SKINS[0]) {
 }
 
 function drawGate(ctx, state, width, height) {
-  // The Aurora Gate: a glowing ring that opens as the score approaches
-  // 1,200, then shines wide open on the win screen. It sits high on the
-  // screen (centre at 20% of the height) so it never covers the title
-  // text below it.
+  // The Aurora Gate: a glowing ring that opens as the stage fills with
+  // light, then shines wide open on the clear screen. It sits high on
+  // the screen (centre at 20% of the height) so it never covers the
+  // title text below it.
   const cx = width / 2;
   const cy = height * 0.20;
   const progress = state.gateOpen ? 1 : state.gateProgress;
@@ -2593,11 +3740,12 @@ function drawHud(ctx, state, best, width) {
     ctx.fill();
     ctx.restore();
   }
-  // Level and dash, top centre-right.
+  // Stage, top right — one slot per max heart sits under it (upgrades
+  // can add to 5). LEVEL lives on the upgrade screen only now.
   ctx.textAlign = 'right';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 19px sans-serif';
-  ctx.fillText(`LEVEL ${state.level}`, width - pad, 66);
+  ctx.fillText(state.endless ? 'ENDLESS' : `STAGE ${state.stage ?? 1}`, width - pad, 66);
   const dashReady = state.ship.dashCooldown <= 0;
   const dashBase = effectiveDashCooldown(state);
   const dashFrac = dashReady ? 1 : 1 - state.ship.dashCooldown / dashBase;
@@ -2613,19 +3761,26 @@ function drawHud(ctx, state, best, width) {
     ctx.font = 'bold 14px sans-serif';
     ctx.fillText('SHIELD UP', width - pad, 120);
   }
-  // Progress bar to the Aurora Gate, bottom centre — lifted off the edge.
-  // In endless mode the gate is already open: the bar tracks progress to
-  // the next level instead.
+  // Progress bar, bottom centre — lifted off the edge. In endless mode
+  // the bar tracks progress to the next level; on a boss stage it is the
+  // boss's name (the HP bar lives top-centre); otherwise it is the
+  // stage target.
   const barWidth = 420;
   const barX = (width - barWidth) / 2;
   const barY = 682;
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 15px sans-serif';
+  const boss = state.boss ?? null;
+  const target = state.stageTarget;
   if (state.endless) {
     ctx.fillText(`ENDLESS DRIFT  •  LEVEL ${state.level}`, width / 2, barY - 8);
+  } else if (boss) {
+    ctx.fillText(`BOSS  ${boss.name ?? 'VOID WARDEN'}`, width / 2, barY - 8);
+  } else if (typeof target === 'number' && target > 0) {
+    ctx.fillText(`STAGE ${state.stage ?? 1}  —  ${state.score} / ${target}`, width / 2, barY - 8);
   } else {
-    ctx.fillText(`AURORA GATE  ${state.score} / ${WIN_SCORE}`, width / 2, barY - 8);
+    ctx.fillText(`STAGE ${state.stage ?? 1}  —  ${state.score}`, width / 2, barY - 8);
   }
   ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
   ctx.fillRect(barX, barY, barWidth, 12);
@@ -2635,8 +3790,12 @@ function drawHud(ctx, state, best, width) {
   ctx.fillStyle = gateGradient;
   const barFrac = state.endless
     ? (state.score % LEVEL_EVERY) / LEVEL_EVERY
-    : state.gateProgress;
+    : (boss
+      ? Math.max(0, Math.min(1, 1 - (boss.hp ?? 0) / (boss.maxHp || 1)))
+      : (typeof target === 'number' && target > 0 ? state.gateProgress : 0));
   ctx.fillRect(barX, barY, barWidth * barFrac, 12);
+  // Boss HP bar, top-centre.
+  if (boss) drawBossBar(ctx, boss, width);
 }
 
 function panel(ctx, width, height) {
@@ -2723,6 +3882,17 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   ctx.textBaseline = 'middle';
   ctx.fillText(`◆ ${save ? (save.shardBalance ?? 0) : 0}`, BALANCE_RECT.x + BALANCE_RECT.w / 2, BALANCE_RECT.y + BALANCE_RECT.h / 2 + 1);
   ctx.restore();
+  // Coins purse (top right, next to the shard balance, display only).
+  ctx.save();
+  ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(COINS_RECT.x, COINS_RECT.y, COINS_RECT.w, COINS_RECT.h);
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`🪙 ${save ? (save.coins ?? 0) : 0}`, COINS_RECT.x + COINS_RECT.w / 2, COINS_RECT.y + COINS_RECT.h / 2 + 1);
+  ctx.restore();
   bigTitle(ctx, 'LUMEN DRIFT', 240, width, CYAN, 72);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fbbf24';
@@ -2769,13 +3939,26 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   if (save && save.endlessUnlocked) {
     ctx.fillStyle = GREEN;
     ctx.font = 'bold 18px sans-serif';
-    ctx.fillText('∞  ENDLESS UNLOCKED — win again to keep drifting past the gate!', width / 2, 548);
+    ctx.fillText('∞  ENDLESS UNLOCKED — clear a stage, then keep drifting past it!', width / 2, 548);
+  }
+  // Stage progress: the campaign's next step, always visible.
+  if (save) {
+    const cleared = save.highestCleared ?? 0;
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText(
+      cleared > 0
+        ? `STAGE ${cleared} CLEARED — next: STAGE ${Math.min(100, cleared + 1)}`
+        : 'STAGE 1 awaits — clear 100 stages, defeat the bosses!',
+      width / 2, 578,
+    );
   }
   // Bottom tab bar (after the first run only — progressive disclosure:
   // a brand-new player sees nothing but PLAY).
   if (hasPlayed) {
     const tabs = [
       [HANGAR_TAB_RECT, 'HANGAR', CYAN],
+      [SHOP_TAB_RECT, 'SHOP', GOLD],
       [MISSIONS_TAB_RECT, 'MISSIONS', GOLD],
       [SCORES_TAB_RECT, 'SCORES', '#e2e8f0'],
     ];
@@ -3001,7 +4184,7 @@ function drawSettingsPanel(ctx, save, width, height, extra = {}) {
   ctx.fillText('DASH  —  dodge mines (SPACE / DASH button)', width / 2, 564);
   ctx.fillStyle = '#94a3b8';
   ctx.font = '15px sans-serif';
-  ctx.fillText('Reach 1,200 to open the Aurora Gate — then keep drifting, endless.', width / 2, 600);
+  ctx.fillText('Clear 100 stages and defeat the bosses — stage 10 opens endless mode.', width / 2, 600);
 }
 
 function drawRewardPanel(ctx, save, width, height) {
@@ -3068,7 +4251,7 @@ function drawRewardPanel(ctx, save, width, height) {
   ctx.fillText('Missed a day? Your streak survives once per week — the freeze is automatic.', width / 2, 560);
 }
 
-function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
+function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null, extra = {}) {
   panel(ctx, width, height);
   bigTitle(ctx, 'HANGAR', 64, width, CYAN, 46);
   ctx.textAlign = 'center';
@@ -3083,7 +4266,7 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
     time: state ? state.time : 0,
     shield: false,
   };
-  drawShip(ctx, preview, skin);
+  drawShip(ctx, preview, skin, extra.shipShape ?? equippedShip(save)?.shape ?? 'skiff');
   for (const [rect, dir] of [[HANGAR_SKIN_LEFT, -1], [HANGAR_SKIN_RIGHT, 1]]) {
     ctx.save();
     ctx.strokeStyle = CYAN;
@@ -3138,6 +4321,14 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 21px sans-serif';
   ctx.fillText(`BALANCE  ${balance} shards — tap a part to buy it (keys 1–5 work too)`, 500, 172);
+  // Equipped ship + level (from main's extra, else the save's ships).
+  const shipInfo = extra.ship ?? null;
+  const shipDef = equippedShip(save);
+  const shipLevelNow = shipInfo?.level ?? Math.max(1, shipLevel(save, shipDef.id));
+  const shipName = shipInfo?.name ?? shipDef.name;
+  ctx.fillStyle = CYAN;
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText(`SHIP ${shipName}  Lv ${shipLevelNow}`, 500, 204);
   // One row per part: name, effect, level pips, buy button.
   for (const row of layoutHangarParts()) {
     const level = save ? hangarLevel(save, row.part.id) : 0;
@@ -3357,11 +4548,15 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
     );
     y += 36;
   }
-  // Near-miss line (Zeigarnik): how close the gate was.
-  if (state.score >= 800 && state.score < WIN_SCORE) {
+  // Near-miss line (Zeigarnik): how close the stage target was. Only
+  // when the player died within 100 points of clearing the stage.
+  const stageTarget = state.stageTarget;
+  const stage = state.stage ?? 1;
+  if (!state.endless && typeof stageTarget === 'number' && stageTarget > 0
+    && state.score < stageTarget && stageTarget - state.score <= 100) {
     ctx.fillStyle = '#a5f3fc';
     ctx.font = 'bold 22px sans-serif';
-    ctx.fillText(`You died at ${state.score} — just ${WIN_SCORE - state.score} more to the gate!`, width / 2, y);
+    ctx.fillText(`You died at ${state.score} — just ${stageTarget - state.score} more to clear stage ${stage}!`, width / 2, y);
     y += 36;
   }
   // Missions, one compact line instead of one line per mission.
@@ -3372,15 +4567,20 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
     ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
     y += 36;
   }
-  // The visible next goal: the next locked skin, else the gate, else the best.
+  // The visible next goal: in a campaign run it is the stage itself —
+  // a boss stage names the boss. In endless (or with no stage yet) it
+  // falls back to the next skin, else the best score.
   const save = extra.save ?? null;
   const next = nextUnlock(save ? save.lifetime.shards : 0);
   ctx.fillStyle = '#a5f3fc';
   ctx.font = 'bold 20px sans-serif';
-  if (next) {
+  if (!state.endless && (isBossStage(stage) || isMidbossStage(stage))) {
+    const boss = bossFor(stage) ?? state.boss;
+    ctx.fillText(`NEXT GOAL: defeat the ${boss ? boss.name : 'BOSS'}`, width / 2, y);
+  } else if (!state.endless && stage >= 1) {
+    ctx.fillText(`NEXT GOAL: clear STAGE ${stage}`, width / 2, y);
+  } else if (next) {
     ctx.fillText(`NEXT GOAL: ${next.skin.name} skin — ${next.have} / ${next.need} ◆`, width / 2, y);
-  } else if (state.score < WIN_SCORE) {
-    ctx.fillText(`NEXT GOAL: Aurora Gate — ${WIN_SCORE - state.score} points to go`, width / 2, y);
   } else {
     ctx.fillText(`NEXT GOAL: beat your best ${best}`, width / 2, y);
   }
@@ -3393,56 +4593,285 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
   ctx.fillText('R retry  •  H hangar  •  Esc menu', width / 2, 622);
 }
 
-function drawWin(ctx, state, best, width, height, summary = null) {
+function drawClear(ctx, state, best, width, height, summary = null, extra = {}) {
   panel(ctx, width, height);
   drawGate(ctx, state, width, height);
-  bigTitle(ctx, 'AURORA GATE OPEN!', 250, width, GREEN, 56);
+  const stage = summary?.stage ?? state.stage ?? 1;
+  const coins = summary?.coins ?? 0;
+  const firstClear = summary?.firstClear ?? false;
+  bigTitle(ctx, `STAGE ${stage} CLEAR!`, 150, width, GREEN, 56);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fef9c3';
   ctx.font = 'bold 26px sans-serif';
-  ctx.fillText(`You gathered ${WIN_SCORE} light and rode the storm home.`, width / 2, 320);
-  ctx.fillStyle = '#e2e8f0';
+  ctx.fillText(`You cleared stage ${stage} — the storm bows to you.`, width / 2, 210);
+  ctx.fillStyle = GOLD;
   ctx.font = 'bold 24px sans-serif';
-  ctx.fillText(`SCORE  ${state.score}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 370);
-  let y = 415;
+  ctx.fillText(
+    `+${coins} COINS${firstClear ? '  •  FIRST CLEAR!' : '  •  replay reward'}`,
+    width / 2, 252,
+  );
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText(
+    stage >= 100
+      ? 'ALL 100 STAGES CLEAR — YOU ARE THE STORM!'
+      : `STAGE ${stage + 1} UNLOCKED!`,
+    width / 2, 290,
+  );
+  let y = 312;
   if (summary && summary.rank > 0) {
     ctx.fillStyle = GOLD;
-    ctx.font = 'bold 22px sans-serif';
+    ctx.font = 'bold 20px sans-serif';
     ctx.fillText(
       summary.rank === 1
         ? '#1 ON TOP SCORES — a new top score!'
         : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
       width / 2, y,
     );
-    y += 40;
+    y += 28;
   }
   if (summary && summary.completed.length) {
     const total = summary.completed.reduce((n, m) => n + m.reward, 0);
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 20px sans-serif';
     ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
-    y += 40;
+    y += 28;
   }
-  drawPlayAgain(ctx);
-  // Keep drifting: the run continues past the gate, endless.
-  const r = ENDLESS_RECT;
-  ctx.save();
-  ctx.fillStyle = GREEN;
-  ctx.fillRect(r.x, r.y, r.w, r.h);
-  ctx.fillStyle = INK;
-  ctx.font = 'bold 20px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('▶  CONTINUE — ENDLESS', r.x + r.w / 2, r.y + r.h / 2 + 1);
-  ctx.restore();
-  ctx.textAlign = 'center';
+  // NEXT is the gold primary (only while a next stage exists); REPLAY,
+  // STAGES and HANGAR are the outlined exits. CONTINUE — ENDLESS shows
+  // only once endless is unlocked.
+  if (stage < 100) {
+    const r = CLEAR_NEXT_RECT;
+    ctx.save();
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = INK;
+    ctx.font = 'bold 24px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`▶  NEXT — STAGE ${stage + 1}`, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
+  }
   ctx.textBaseline = 'alphabetic';
-  // Win screen is not a trap either: the player can bank the win and go
-  // spend in the hangar instead of continuing endless.
-  drawButton(ctx, WIN_HANGAR_RECT, 'HANGAR  [H]');
+  drawButton(ctx, CLEAR_REPLAY_RECT, '↻  REPLAY  [R]');
+  drawButton(ctx, CLEAR_STAGES_RECT, 'STAGES');
+  drawButton(ctx, CLEAR_HANGAR_RECT, 'HANGAR  [H]');
+  const save = extra.save ?? null;
+  if (save && save.endlessUnlocked) {
+    const r = CLEAR_ENDLESS_RECT;
+    ctx.save();
+    ctx.fillStyle = GREEN;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = INK;
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('▶  CONTINUE — ENDLESS', r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
+    ctx.textBaseline = 'alphabetic';
+  }
   ctx.fillStyle = '#94a3b8';
   ctx.font = '17px sans-serif';
-  ctx.fillText('R retry  •  E endless  •  H hangar', width / 2, 692);
+  ctx.fillText('N next  •  R replay  •  H hangar  •  E endless', width / 2, 692);
+}
+
+function drawStages(ctx, save, width, height, page = 0, extra = {}) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'STAGES', 64, width, CYAN, 46);
+  const cleared = save ? (save.highestCleared ?? 0) : 0;
+  const coins = save ? (save.coins ?? 0) : 0;
+  const shipInfo = extra.ship ?? null;
+  const shipDef = equippedShip(save);
+  const shipLevelNow = shipInfo?.level ?? Math.max(1, shipLevel(save, shipDef.id));
+  const shipName = shipInfo?.name ?? shipDef.name;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 21px sans-serif';
+  ctx.fillText(`🪙 ${coins} coins`, width / 2, 108);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = 'bold 19px sans-serif';
+  ctx.fillText(`SHIP ${shipName}  Lv ${shipLevelNow}   •   ${cleared > 0 ? `STAGE ${cleared} CLEARED` : 'NO STAGE CLEARED YET'}`, width / 2, 138);
+  const layout = layoutStageTiles(page);
+  const lo = layout.page * STAGES_PER_PAGE + 1;
+  const hi = lo + STAGES_PER_PAGE - 1;
+  // Band label with page arrows.
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillText(`STAGES ${lo}–${hi}`, width / 2, 180);
+  for (const [rect, dir, enabled] of [
+    [layout.prevArrow, -1, layout.prevEnabled],
+    [layout.nextArrow, 1, layout.nextEnabled],
+  ]) {
+    ctx.save();
+    ctx.strokeStyle = enabled ? CYAN : 'rgba(148, 163, 184, 0.35)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = enabled ? CYAN : '#64748b';
+    ctx.beginPath();
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + rect.h / 2;
+    if (dir < 0) {
+      ctx.moveTo(cx + 10, cy - 14);
+      ctx.lineTo(cx - 10, cy);
+      ctx.lineTo(cx + 10, cy + 14);
+    } else {
+      ctx.moveTo(cx - 10, cy - 14);
+      ctx.lineTo(cx + 10, cy);
+      ctx.lineTo(cx - 10, cy + 14);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  // The tiles: number, state, coin reward.
+  const nextStage = Math.min(100, cleared + 1);
+  for (const tile of layout.tiles) {
+    const n = tile.stage;
+    const isCleared = n <= cleared;
+    const isNext = n === nextStage;
+    const accessible = stageAccessible(save ?? { highestCleared: 0 }, n);
+    const reward = stageCoins(n);
+    ctx.save();
+    ctx.fillStyle = isCleared
+      ? 'rgba(52, 211, 153, 0.16)'
+      : (isNext ? 'rgba(34, 211, 238, 0.18)' : 'rgba(20, 27, 61, 0.96)');
+    ctx.fillRect(tile.x, tile.y, tile.w, tile.h);
+    ctx.strokeStyle = isCleared ? GREEN : (isNext ? CYAN : 'rgba(148, 163, 184, 0.45)');
+    ctx.lineWidth = isNext ? 3 : 2;
+    ctx.strokeRect(tile.x, tile.y, tile.w, tile.h);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = accessible ? '#e2e8f0' : '#64748b';
+    ctx.font = 'bold 30px sans-serif';
+    ctx.fillText(String(n), tile.x + tile.w / 2, tile.y + 34);
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillStyle = isCleared ? GREEN : (isNext ? CYAN : '#94a3b8');
+    ctx.fillText(
+      isCleared ? '✓ CLEAR' : (isNext ? '▶ NEXT' : '🔒 LOCKED'),
+      tile.x + tile.w / 2, tile.y + 70,
+    );
+    ctx.fillStyle = GOLD;
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`🪙 ${isCleared ? reward.replay : reward.first}`, tile.x + tile.w / 2, tile.y + 94);
+    ctx.restore();
+  }
+  ctx.textBaseline = 'alphabetic';
+  // Big PLAY STAGE button for the next uncleared stage.
+  if (cleared < 100) {
+    const r = layout.play;
+    ctx.save();
+    ctx.fillStyle = GOLD;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = INK;
+    ctx.font = 'bold 26px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`▶  PLAY STAGE ${nextStage}`, r.x + r.w / 2, r.y + r.h / 2 + 1);
+    ctx.restore();
+    ctx.textBaseline = 'alphabetic';
+  } else {
+    ctx.fillStyle = GOLD;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('★ ALL 100 STAGES CLEAR ★', width / 2, 512);
+  }
+  drawButton(ctx, layout.back, '◀  BACK  [H]');
+}
+
+function drawShop(ctx, save, width, height) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'SHIP SHOP', 64, width, GOLD, 46);
+  const coins = save ? (save.coins ?? 0) : 0;
+  const equippedId = equippedShip(save).id;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 21px sans-serif';
+  ctx.fillText(`🪙 ${coins} coins — clear stages to earn more`, width / 2, 108);
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '17px sans-serif';
+  ctx.fillText('Ships level up with coins too — higher stages demand a stronger ship.', width / 2, 136);
+  for (const card of layoutShopCards()) {
+    const def = card.ship;
+    const level = shipLevel(save, def.id);
+    const owned = level > 0;
+    const isEquipped = def.id === equippedId && owned;
+    const stats = shipStats(def, Math.max(1, level));
+    const color = RARITY_COLORS[def.rarity] ?? '#e2e8f0';
+    ctx.save();
+    ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+    ctx.fillRect(card.x, card.y, card.w, card.h);
+    ctx.strokeStyle = isEquipped ? GOLD : color;
+    ctx.lineWidth = isEquipped ? 3 : 2;
+    ctx.strokeRect(card.x, card.y, card.w, card.h);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = color;
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText(def.name, card.x + 18, card.y + 36);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(def.rarity.toUpperCase(), card.x + 18, card.y + 58);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '17px sans-serif';
+    ctx.fillText(`♥ ${stats.hearts} hearts   •   speed ×${stats.speedMult.toFixed(2)}`, card.x + 18, card.y + 88);
+    ctx.fillText(`Blaster ${stats.blasterDamage} dmg   •   ${stats.blasterRate.toFixed(1)}/s`, card.x + 18, card.y + 112);
+    // Level pips.
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText(owned ? `Lv ${level}/10` : 'Not owned', card.x + 18, card.y + 138);
+    if (owned) {
+      const pipGap = 22;
+      const startX = card.x + 130;
+      for (let p = 0; p < 10; p += 1) {
+        ctx.beginPath();
+        ctx.arc(startX + p * pipGap, card.y + 132, 6, 0, Math.PI * 2);
+        ctx.fillStyle = p < level ? GOLD : 'rgba(148, 163, 184, 0.35)';
+        ctx.fill();
+      }
+    }
+    // Lock line, or the action button.
+    const b = card.action;
+    if (!owned && (save?.highestCleared ?? 0) < def.unlockStage) {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 17px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`🔒 Clear stage ${def.unlockStage}`, b.x + b.w / 2, b.y + b.h / 2 + 1);
+    } else {
+      // No save (a bare screenshot draw): nothing can be bought.
+      const buy = save ? canBuyShip(save, def.id) : { ok: false, reason: 'broke' };
+      const lvl = save ? canLevelShip(save, def.id) : { ok: false, reason: 'not-owned' };
+      let label;
+      let active = false;
+      let gold = false;
+      if (!owned) {
+        label = buy.ok ? `BUY  🪙 ${def.price}` : `NEED  🪙 ${def.price}`;
+        active = buy.ok;
+        gold = buy.ok;
+      } else if (isEquipped && !lvl.ok && lvl.reason === 'maxed') {
+        label = 'EQUIPPED ★';
+      } else if (isEquipped) {
+        label = lvl.ok ? `LEVEL UP  🪙 ${lvl.cost}` : `NEED  🪙 ${shipLevelCost(level)}`;
+        active = lvl.ok;
+        gold = lvl.ok;
+      } else {
+        label = 'EQUIP';
+        active = true;
+      }
+      ctx.fillStyle = gold ? GOLD : (active ? 'rgba(34, 211, 238, 0.20)' : 'rgba(148, 163, 184, 0.18)');
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = gold ? GOLD : (active ? CYAN : 'rgba(148, 163, 184, 0.35)');
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = gold ? INK : (active ? CYAN : '#94a3b8');
+      ctx.font = 'bold 18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+    }
+    ctx.restore();
+  }
+  ctx.textBaseline = 'alphabetic';
+  drawButton(ctx, SHOP_BACK_RECT, '◀  BACK  [H]');
 }
 
 function createRenderer(canvas) {
@@ -3532,12 +4961,16 @@ function createRenderer(canvas) {
     }
     ctx.globalAlpha = 1;
 
-    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_OVER || screen === SCREEN_WIN || screen === SCREEN_UPGRADE) {
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_OVER || screen === SCREEN_CLEAR || screen === SCREEN_UPGRADE) {
       for (const s of state.shards) drawShard(ctx, s.x, s.y, s.spin, s.pulse, s.golden);
       for (const s of state.shields) drawShieldCell(ctx, s.x, s.y, s.pulse);
       for (const m of state.mines) drawMine(ctx, m.x, m.y, m.radius, m.spin, m.pulse, m.age);
       for (const s of state.storms) drawStorm(ctx, s.x, s.y, s.spin, s.age);
-      if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawShip(ctx, state, skin);
+      for (const e of state.enemies ?? []) drawEnemy(ctx, e);
+      for (const b of state.bullets ?? []) drawBullet(ctx, b);
+      for (const b of state.enemyBullets ?? []) drawEnemyBullet(ctx, b);
+      if (state.boss) drawBoss(ctx, state.boss);
+      if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawShip(ctx, state, skin, extra.shipShape ?? 'skiff');
     }
     if (screen === SCREEN_PLAY && pointer && pointer.down && pointer.mode === 'relative') {
       drawJoystick(ctx, pointer);
@@ -3602,10 +5035,12 @@ function createRenderer(canvas) {
 
     if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width);
     if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
-    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state);
+    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape });
+    if (screen === SCREEN_STAGES) drawStages(ctx, save, FIELD.width, FIELD.height, extra.stagesPage ?? 0, { ship: extra.ship });
+    if (screen === SCREEN_SHOP) drawShop(ctx, save, FIELD.width, FIELD.height);
     if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
     if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
-    if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height, summary);
+    if (screen === SCREEN_CLEAR) drawClear(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
     if (screen === SCREEN_STATS) drawStats(ctx, save, FIELD.width, FIELD.height);
     if (screen === SCREEN_MISSIONS) drawMissionsPanel(ctx, save, FIELD.width, FIELD.height);
     if (screen === SCREEN_SETTINGS) drawSettingsPanel(ctx, save, FIELD.width, FIELD.height, { fullscreenOn: extra.fullscreenOn ?? false });
@@ -3618,6 +5053,31 @@ function createRenderer(canvas) {
   return { draw };
 }
 
+// ---- src/touchbtn.js ----
+// Lumen Drift — on-screen touch buttons (DASH / pause). Pure logic:
+// which buttons a screen shows, and the DOM call that shows or hides
+// them. The buttons exist only while playing — on every menu screen
+// they are hidden, so a thumb can never dash from the title or tap
+// pause over a shop card. main.js calls applyTouchButtons every frame.
+
+/** Which touch buttons are visible on `screen` (both only while playing). */
+function touchButtonsFor(screen) {
+  const visible = screen === SCREEN_PLAY;
+  return { dash: visible, pause: visible };
+}
+
+/**
+ * Show or hide the DASH / pause buttons. Touch devices only: on a
+ * mouse/keyboard setup this is a no-op and CSS owns the buttons.
+ * Missing elements are skipped, never thrown on.
+ */
+function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
+  if (!isTouch) return;
+  const { dash, pause } = touchButtonsFor(screen);
+  if (dashBtn && dashBtn.style) dashBtn.style.display = dash ? 'block' : 'none';
+  if (pauseBtn && pauseBtn.style) pauseBtn.style.display = pause ? 'block' : 'none';
+}
+
 // ---- src/shots.js ----
 // Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win.
 // Each scene plays the real rules forward from a fresh world for a fixed
@@ -3628,7 +5088,7 @@ function createRenderer(canvas) {
 // - start: the title screen over a live, drifting field.
 // - play: a busy mid-game — score ~340, combo x3, 2 hearts left.
 // - end: the autopilot flies carelessly and the storm takes the skiff.
-// - win: the gate opens at 1,200 points.
+// - win: stage 1 clears at its target (300 points).
 
 const START_SECONDS = 6;
 const PLAY_TARGET = 340;
@@ -3667,19 +5127,21 @@ function autopilot(state, careless) {
 
 /** Set `world` to the named scene and return the screen to draw over it. */
 function stageShot(name, world) {
+  // Stage 1 by default.
+  world.setStage(1);
   world.reset();
   const state = world.state;
   if (name === 'win') {
-    // Play forward until the gate opens, then let the victory settle.
+    // Play forward until stage 1 clears, then let the victory settle.
     for (let i = 0; i < 60 * 240; i += 1) {
       const events = world.step(STEP, autopilot(state, false), null, false);
-      if (events & EVENT_WIN) break;
+      if (events & EVENT_CLEAR) break;
     }
-    state.score = Math.max(state.score, WIN_SCORE);
+    state.score = Math.max(state.score, stageTarget(1));
     state.gateOpen = true;
     state.gateProgress = 1;
     for (let i = 0; i < 30; i += 1) world.step(STEP, { x: 0, y: 0 }, null, false);
-    return { screen: SCREEN_WIN, best: state.score };
+    return { screen: SCREEN_CLEAR, best: state.score };
   }
   if (name === 'play') {
     for (let i = 0; i < 60 * 240; i += 1) {
@@ -3689,13 +5151,15 @@ function stageShot(name, world) {
     // Let the field settle for a moment, then stage the exact HUD the
     // brief asks for: ~340 points, combo x3, two hearts. The autopilot
     // keeps the skiff alive; the numbers below are the scene's floor.
+    // (A stage-1 clear event may fire mid-scene once the score passes
+    // 300 — it is ignored here; the render stays 'play'.)
     for (let i = 0; i < 12; i += 1) world.step(STEP, autopilot(state, false), null, false);
     state.score = PLAY_TARGET;
     state.combo = 3;
     state.comboCount = 6;
     state.bestCombo = Math.max(3, state.bestCombo);
     state.hearts = 2;
-    state.gateProgress = Math.min(1, state.score / WIN_SCORE);
+    state.gateProgress = Math.min(1, state.score / stageTarget(1));
     return { screen: SCREEN_PLAY, best: state.score };
   }
   if (name === 'end') {
@@ -3727,14 +5191,15 @@ function stageShot(name, world) {
 // Lumen Drift — boot and the one loop. Input is read every frame, the world
 // advances in fixed 1/60 s steps (several in a slow frame, none in a fast
 // one), and the renderer paints what is there. The game moves between
-// eleven screens: title, hangar, play, upgrade (level-up choice), paused,
-// game over and win (which can continue into endless mode), plus the
-// panels over Home — top scores, daily missions, settings and daily reward.
+// fourteen screens: title, stage select, ship shop, hangar, play, upgrade
+// (level-up choice), paused, game over and stage clear (which can continue
+// into endless mode), plus the panels over Home — top scores, daily
+// missions, settings and daily reward.
 //
 // ?seed=N fixes the storm's pattern. ?shot=start|play|end|win (with
 // &seed=N) stages that scene instead of running the loop, paints it twice
 // and sets window.__shotReady for a screenshot. ?debug=win starts a live
-// game one shard away from the Aurora Gate, for testing the win path.
+// game one shard away from the stage-1 target, for testing the clear path.
 
 /** The longest frame the loop catches up on; a longer stall is dropped. */
 const MAX_FRAME = 0.25;
@@ -3841,11 +5306,15 @@ function runGame() {
   let last = performance.now();
   // Seconds since the LEVEL UP cards appeared (drives their animation).
   let upgradeAge = 0;
+  // Which 10-stage band the stage select is showing (0 = stages 1–10).
+  let stagesPage = 0;
 
-  // Debug hook for testing the win path: one shard from the gate.
+  // Debug hook for testing the clear path: one shard away from the
+  // stage-1 target. (Stage is 1 by default.)
   if (params.get('debug') === 'win') {
-    world.state.score = WIN_SCORE - 10;
-    world.state.gateProgress = (WIN_SCORE - 10) / WIN_SCORE;
+    world.setStage(1);
+    world.state.score = stageTarget(1) - 10;
+    world.state.gateProgress = (stageTarget(1) - 10) / stageTarget(1);
     screen = SCREEN_PLAY;
   }
 
@@ -3853,7 +5322,16 @@ function runGame() {
     status.textContent = text;
   }
 
+  // Pick up the equipped ship's stats (a shop purchase between runs
+  // changes them).
+  function applyEquippedShip() {
+    const stats = equippedShipStats(save);
+    world.setShip(stats);
+  }
+
   function startGame() {
+    // Restart the current stage (world.reset keeps the stage).
+    applyEquippedShip();
     world.reset();
     screen = SCREEN_PLAY;
     runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
@@ -3866,12 +5344,32 @@ function runGame() {
     announce('Lumen Drift started. Collect star shards, dodge the mines.');
   }
 
+  // Start a fresh run of stage n (from the stage select or the clear
+  // screen's NEXT / REPLAY). Resets the run stats and the endless
+  // bookkeeping, and clears the input so a stale tap cannot dash.
+  function startStage(n) {
+    const stage = Math.max(1, Math.min(100, n));
+    world.setStage(stage);
+    applyEquippedShip();
+    world.reset();
+    screen = SCREEN_PLAY;
+    runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
+    lastBanked = null;
+    endlessRun = false;
+    input.clearPressed();
+    input.clearTap();
+    audio.unlock();
+    audio.click();
+    announce(`Stage ${stage} — clear it to earn coins for the ship shop.`);
+  }
+
   function endGame(won) {
-    screen = won ? SCREEN_WIN : SCREEN_OVER;
+    screen = won ? SCREEN_CLEAR : SCREEN_OVER;
     input.clearPressed();
     input.clearTap();
     // Bank the run into the local save: top-5, history, lifetime stats,
     // and today's missions (which pay their shard rewards immediately).
+    const stage = world.state.endless ? 0 : (world.state.stage ?? 1);
     const run = {
       score: world.state.score,
       level: world.state.level,
@@ -3883,14 +5381,17 @@ function runGame() {
       playSeconds: Math.round(runStats.playSeconds),
       date: today,
       endless: world.state.endless,
+      stage,
     };
     let result;
-    if (won) {
-      // Beating the gate unlocks endless mode from now on. The win is
-      // banked now — if the player continues into endless, the death at
-      // the end of that same run REPLACES this bank (see below), so the
-      // run is counted exactly once, with its final score.
-      save.endlessUnlocked = true;
+    let clear = null;
+    if (won && !world.state.endless) {
+      // A stage clear pays coins (first clear, or the smaller replay
+      // reward) and may unlock the next stage — and endless at stage 10.
+      // The clear is banked now — if the player continues into endless,
+      // the death at the end of that same run REPLACES this bank (see
+      // below), so the run is counted exactly once, with its final score.
+      clear = recordStageClear(save, stage);
       result = recordRun(save, run);
       lastBanked = { entry: result.entry, historyEntry: result.historyEntry, shards: run.shards };
     } else if (endlessRun && lastBanked) {
@@ -3909,11 +5410,17 @@ function runGame() {
     // The legacy best/shards keys stay in sync for older readers.
     saveBest(best);
     saveLifetimeShards(window.localStorage, lifetimeShards);
-    lastSummary = { rank: result.rank, gapToFirst: result.gapToFirst, completed, endless: world.state.endless };
+    lastSummary = {
+      rank: result.rank, gapToFirst: result.gapToFirst, completed,
+      endless: world.state.endless, stage,
+      coins: clear ? clear.coins : 0,
+      firstClear: clear ? clear.firstClear : false,
+      unlockedEndless: clear ? clear.unlockedEndless : false,
+    };
     if (won) audio.win();
     else audio.over();
     announce(won
-      ? `You win! Aurora Gate open with ${world.state.score} points. Press R or tap PLAY AGAIN.`
+      ? `Stage ${stage} clear! +${clear ? clear.coins : 0} coins${clear && clear.firstClear ? ' — first clear!' : ''}. Press N for the next stage, R to replay.`
       : `Game over. Score ${world.state.score}. Press R or tap PLAY AGAIN.`);
   }
 
@@ -3958,6 +5465,75 @@ function runGame() {
     input.armGate();
     audio.click();
     announce('Hangar. Buy permanent ship upgrades with your shards. Press H to go back.');
+  }
+
+  // Open the stage select from the title. The input gate stops the tap
+  // that opened it from also starting a stage on the first frame.
+  function enterStages() {
+    stagesPage = Math.floor(((save.highestCleared ?? 0)) / 10);
+    screen = SCREEN_STAGES;
+    input.clearPressed();
+    input.clearTap();
+    input.armGate();
+    audio.click();
+    announce('Stage select. Tap a stage to play it — clear stages to earn coins.');
+  }
+
+  // Open the ship shop from the title tab bar.
+  function enterShop() {
+    screen = SCREEN_SHOP;
+    input.clearPressed();
+    input.clearTap();
+    input.armGate();
+    audio.click();
+    announce('Ship shop. Buy ships and level them up with coins. Press H to go back.');
+  }
+
+  // One tap on a ship card's action button: buy it, level it up, or
+  // equip it — whichever the button offered. Failures are announced,
+  // never silent.
+  function tryShopAction(index) {
+    const cards = layoutShopCards();
+    const card = cards[index];
+    if (!card) return;
+    const def = card.ship;
+    const owned = (save.ships?.owned?.[def.id]?.level ?? 0) > 0;
+    const isEquipped = equippedShip(save).id === def.id && owned;
+    if (!owned) {
+      const bought = buyShip(save, def.id);
+      if (bought.ok) {
+        applyEquippedShip();
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Bought ${def.name} for ${bought.cost} coins — equipped!`);
+      } else if (bought.reason === 'locked') {
+        announce(`${def.name} unlocks when you clear stage ${def.unlockStage}.`);
+      } else if (bought.reason === 'broke') {
+        announce(`Not enough coins for ${def.name} — ${def.price} needed.`);
+      }
+      return;
+    }
+    if (!isEquipped) {
+      const equipped = equipShip(save, def.id);
+      if (equipped.ok) {
+        applyEquippedShip();
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Equipped ${def.name}.`);
+      }
+      return;
+    }
+    const levelled = levelUpShip(save, def.id);
+    if (levelled.ok) {
+      applyEquippedShip();
+      saveSave(window.localStorage, save);
+      audio.click();
+      announce(`${def.name} is now Lv ${levelled.level} — ${levelled.cost} coins.`);
+    } else if (levelled.reason === 'maxed') {
+      announce(`${def.name} is already maxed at Lv 10.`);
+    } else if (levelled.reason === 'broke') {
+      announce(`Not enough coins to level ${def.name}.`);
+    }
   }
 
   // Cycle the ship skin through the skins already unlocked (title only).
@@ -4065,9 +5641,11 @@ function runGame() {
       } else if (inRect(tap, FLAME_RECT) && save.streak.count > 0) {
         openPanel(SCREEN_REWARD, 'Daily reward');
       } else if (inRect(tap, PLAY_RECT)) {
-        startGame();
+        enterStages();
       } else if (inRect(tap, HANGAR_TAB_RECT) && save.lifetime.runs > 0) {
         enterHangar();
+      } else if (inRect(tap, SHOP_TAB_RECT) && save.lifetime.runs > 0) {
+        enterShop();
       } else if (inRect(tap, MISSIONS_TAB_RECT) && save.lifetime.runs > 0) {
         openPanel(SCREEN_MISSIONS, 'Daily missions');
       } else if (inRect(tap, SCORES_TAB_RECT) && save.lifetime.runs > 0) {
@@ -4077,7 +5655,7 @@ function runGame() {
       } else if (input.consume('KeyH')) {
         enterHangar();
       } else if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) {
-        startGame();
+        enterStages();
       }
     } else if (screen === SCREEN_HANGAR) {
       // Buy with keys 1-5 or by tapping a part's BUY button; ◀ ▶ (or
@@ -4112,6 +5690,77 @@ function runGame() {
           else if (input.consume('Digit5')) tryBuyHangar(4);
           else if (input.consume('ArrowLeft') || input.consume('KeyA')) cycleSkin(-1);
           else if (input.consume('ArrowRight') || input.consume('KeyD')) cycleSkin(1);
+          else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+            screen = SCREEN_TITLE;
+            input.clearPressed();
+            input.clearTap();
+            announce('Lumen Drift. Press Enter or click to launch.');
+          }
+        }
+      }
+    } else if (screen === SCREEN_STAGES) {
+      // Stage select: tap a tile to play it (locked tiles announce why
+      // they are locked), ◀ ▶ flip the 10-stage band, PLAY STAGE starts
+      // the next uncleared stage, BACK returns to the title. While the
+      // input gate is closed, swallow everything — a stale tap must
+      // never start a stage.
+      if (!input.gateOpen()) {
+        input.takeTap();
+        input.clearPressed();
+      } else {
+        const tap = input.takeTap();
+        const layout = layoutStageTiles(stagesPage);
+        const tile = layout.tiles.findIndex((t) => inRect(tap, t));
+        if (inRect(tap, layout.back)) {
+          screen = SCREEN_TITLE;
+          input.clearPressed();
+          input.clearTap();
+          announce('Lumen Drift. Press Enter or click to launch.');
+        } else if (inRect(tap, layout.prevArrow) && layout.prevEnabled) {
+          stagesPage -= 1;
+          input.clearPressed();
+          audio.click();
+        } else if (inRect(tap, layout.nextArrow) && layout.nextEnabled) {
+          stagesPage += 1;
+          input.clearPressed();
+          audio.click();
+        } else if (inRect(tap, layout.play) && (save.highestCleared ?? 0) < 100) {
+          startStage((save.highestCleared ?? 0) + 1);
+        } else if (tile >= 0) {
+          const n = layout.tiles[tile].stage;
+          if (n <= (save.highestCleared ?? 0) + 1) startStage(n);
+          else announce(`Stage ${n} is locked — clear stage ${(save.highestCleared ?? 0) + 1} first.`);
+        } else if (input.consume('ArrowLeft') && stagesPage > 0) {
+          stagesPage -= 1;
+          audio.click();
+        } else if (input.consume('ArrowRight') && stagesPage < 9) {
+          stagesPage += 1;
+          audio.click();
+        } else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+          screen = SCREEN_TITLE;
+          input.clearPressed();
+          input.clearTap();
+          announce('Lumen Drift. Press Enter or click to launch.');
+        }
+      }
+    } else if (screen === SCREEN_SHOP) {
+      // Ship shop: tap a card's action button to buy / level / equip.
+      // BACK (or H / Esc) returns to the title. Same input-gate
+      // discipline as the hangar: no stale tap may spend coins.
+      if (!input.gateOpen()) {
+        input.takeTap();
+        input.clearPressed();
+      } else {
+        const tap = input.takeTap();
+        if (inRect(tap, SHOP_BACK_RECT)) {
+          screen = SCREEN_TITLE;
+          input.clearPressed();
+          input.clearTap();
+          announce('Lumen Drift. Press Enter or click to launch.');
+        } else {
+          const cards = layoutShopCards();
+          const acted = cards.findIndex((card) => inRect(tap, card.action));
+          if (acted >= 0) tryShopAction(acted);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
             screen = SCREEN_TITLE;
             input.clearPressed();
@@ -4205,7 +5854,7 @@ function runGame() {
           if (events & EVENT_DASH) { audio.dash(); runStats.dashes += 1; }
           if (events & EVENT_SHIELD) audio.shield();
           if (events & EVENT_HIT) audio.hit();
-          if (events & EVENT_WIN) { endGame(true); break; }
+          if (events & EVENT_CLEAR) { endGame(true); break; }
           if (events & EVENT_OVER) { endGame(false); break; }
         }
         runStats.maxLevel = Math.max(runStats.maxLevel, world.state.level);
@@ -4299,34 +5948,61 @@ function runGame() {
       } else if (input.consume('KeyH')) {
         enterHangar();
       }
-    } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
+    } else if (screen === SCREEN_OVER) {
       // Deliberate restart only: the PLAY AGAIN button, or the R key.
       // A tap anywhere else no longer restarts — the player gets to read
-      // the score, the rank and the near-miss line first. On the win
-      // screen, E (or the green button) keeps the run going, endless.
-      // H (or the HANGAR button) banks the run and goes to the hangar
-      // to spend — the endless trap is closed from both screens.
+      // the score, the rank and the near-miss line first. H (or the
+      // HANGAR button) banks the run and goes to the hangar to spend —
+      // the endless trap is closed from this screen.
       const tap = input.takeTap();
       if (input.consume(ACTION_RESTART)) {
         startGame();
-      } else if (screen === SCREEN_WIN && input.consume('KeyE')) {
-        continueEndless();
       } else if (input.consume('KeyH')) {
         enterHangar();
       } else if (inRect(tap, PLAY_AGAIN_RECT)) {
         input.clearPressed();
         startGame();
-      } else if (screen === SCREEN_WIN && inRect(tap, ENDLESS_RECT)) {
-        input.clearPressed();
-        continueEndless();
       } else if (inRect(tap, OVER_HANGAR_RECT)) {
         input.clearPressed();
         enterHangar();
-      } else if (screen === SCREEN_WIN && inRect(tap, WIN_HANGAR_RECT)) {
+      }
+    } else if (screen === SCREEN_CLEAR) {
+      // Stage clear: NEXT starts the next stage, REPLAY the same one,
+      // STAGES opens the select, HANGAR banks the coins and goes to
+      // spend, E (or the green button) keeps the run going, endless —
+      // only once endless is unlocked. Keys: N next, R replay, H hangar.
+      const tap = input.takeTap();
+      const stage = lastSummary?.stage ?? world.state.stage ?? 1;
+      if (input.consume('KeyN') && stage < 100) {
+        startStage(stage + 1);
+      } else if (input.consume(ACTION_RESTART)) {
+        startStage(stage);
+      } else if (input.consume('KeyE') && save.endlessUnlocked) {
+        continueEndless();
+      } else if (input.consume('KeyH')) {
+        enterHangar();
+      } else if (inRect(tap, CLEAR_NEXT_RECT) && stage < 100) {
+        input.clearPressed();
+        startStage(stage + 1);
+      } else if (inRect(tap, CLEAR_REPLAY_RECT)) {
+        input.clearPressed();
+        startStage(stage);
+      } else if (inRect(tap, CLEAR_STAGES_RECT)) {
+        input.clearPressed();
+        enterStages();
+      } else if (inRect(tap, CLEAR_HANGAR_RECT)) {
         input.clearPressed();
         enterHangar();
+      } else if (save.endlessUnlocked && inRect(tap, CLEAR_ENDLESS_RECT)) {
+        input.clearPressed();
+        continueEndless();
       }
     }
+
+    // Touch buttons (DASH / pause) exist only while playing; on every
+    // other screen they hide. Touch devices only — off touch this is a
+    // no-op and CSS owns the buttons.
+    applyTouchButtons(dashBtn, pauseBtn, screen, isTouchDevice());
 
     renderer.draw(world.state, screen, best, {
       skin: skinById(skinId),
@@ -4340,6 +6016,9 @@ function runGame() {
       firstRun: save.lifetime.runs === 0,
       dashCue,
       fullscreenOn: !!document.fullscreenElement,
+      shipShape: equippedShip(save).shape,
+      ship: { name: equippedShip(save).name, level: Math.max(1, save.ships?.owned?.[equippedShip(save).id]?.level ?? 1) },
+      stagesPage,
     });
   }
 
