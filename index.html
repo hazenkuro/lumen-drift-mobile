@@ -156,6 +156,15 @@ const DRIFT = {
   speedGrowth: 0.12,
 };
 
+// Endless mode (after the Aurora Gate opens): difficulty keeps scaling
+// past level 5, gently — one extra mine cap per level up to 22, one extra
+// storm cap every two levels up to 6, spawn rates stop quickening past
+// level 9, drift speed caps at 2x. The run ends only when the ship dies.
+const ENDLESS_MINE_CAP_MAX = 22;
+const ENDLESS_STORM_CAP_MAX = 6;
+const ENDLESS_RATE_LEVEL_MAX = 9;
+const ENDLESS_SPEED_MAX = 2.0;
+
 // Best score is kept in local storage under this key.
 const BEST_KEY = 'lumen-drift-best';
 // Lifetime star shards (all runs) and the chosen ship skin.
@@ -230,7 +239,7 @@ const UPGRADES = [
     name: 'HULL HEART',
     desc: '+1 hull heart (max 5).',
     max: 2,
-    available: (state) => state.maxHearts < MAX_HEARTS,
+    available: (state) => state.maxHearts < MAX_HEARTS + (state.hangar?.hull ?? 0),
     apply: (state) => {
       state.maxHearts += 1;
       state.hearts = Math.min(state.maxHearts, state.hearts + 1);
@@ -304,20 +313,29 @@ function effectiveDashCooldown(state) {
 }
 
 function effectiveDashSpeed(state) {
-  return SHIP.dashSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG));
+  return SHIP.dashSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG))
+    * (1 + 0.08 * (state.hangar?.engine ?? 0));
 }
 
 function effectiveMaxSpeed(state) {
-  return SHIP.maxSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG));
+  return SHIP.maxSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG))
+    * (1 + 0.08 * (state.hangar?.engine ?? 0));
 }
 
 /** Base points one shard is worth, before the combo multiplier. */
 function shardPointsFor(state) {
-  return SHARD_POINTS + GOLDEN_POINTS * stacksOf(state, UPGRADE_GOLDEN);
+  return SHARD_POINTS
+    + GOLDEN_POINTS * stacksOf(state, UPGRADE_GOLDEN)
+    + 2 * (state.hangar?.collector ?? 0);
 }
 
 function magnetRadiusFor(state) {
   return MAGNET_RADII[stacksOf(state, UPGRADE_MAGNET)] || 0;
+}
+
+/** Hangar magnet: +80 pickup radius per TRACTOR MAGNET level. */
+function hangarMagnetRadius(state) {
+  return 80 * (state.hangar?.magnet ?? 0);
 }
 
 // --- Picking ---------------------------------------------------------------
@@ -403,7 +421,7 @@ function makeShip() {
   };
 }
 
-function createWorld(random) {
+function createWorld(random, hangarLevels = {}) {
   const state = {
     time: 0,
     score: 0,
@@ -420,6 +438,10 @@ function createWorld(random) {
     pendingLevelUps: 0,
     level: 1,
     shield: false,
+    // Permanent hangar bonuses (levels per part; all 0 for a fresh ship).
+    hangar: { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0, ...hangarLevels },
+    // Endless mode: true once the player continues past the Aurora Gate.
+    endless: false,
     ship: makeShip(),
     shards: [],
     mines: [],
@@ -431,6 +453,7 @@ function createWorld(random) {
     gateOpen: false,
     gateProgress: 0,
     spawnTimers: { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 },
+    shieldEvery: SPAWN.shieldEvery,
     flashes: 0,
     // Juice state (Stage 4): floating score texts, the animated score,
     // hit-stop freeze, screen shake, and the combo pop pulse.
@@ -459,15 +482,37 @@ function createWorld(random) {
   }
 
   function levelFor(score) {
+    // The campaign caps at level 5; endless keeps counting past it, one
+    // level per 200 points, so upgrade picks keep coming.
+    if (state.endless) return 1 + Math.floor(score / LEVEL_EVERY);
     return Math.min(LEVEL_MAX, 1 + Math.floor(score / LEVEL_EVERY));
   }
 
   function speedScale() {
-    return 1 + (state.level - 1) * DRIFT.speedGrowth;
+    // Drift speed grows with level but caps at 2x, even in endless.
+    return Math.min(ENDLESS_SPEED_MAX, 1 + (state.level - 1) * DRIFT.speedGrowth);
   }
 
   function spawnRate(base) {
-    return base * Math.pow(SPAWN.growth, state.level - 1);
+    // Spawn pacing stops quickening past level 9, even in endless.
+    const rateLevel = Math.min(state.level, ENDLESS_RATE_LEVEL_MAX);
+    return base * Math.pow(SPAWN.growth, rateLevel - 1);
+  }
+
+  // Max concurrent threats at the current level. In endless the mine cap
+  // climbs +1 per level (to 22) and the storm cap +1 every two levels
+  // (to 6) — the field keeps getting busier, but never saturates.
+  function mineCap() {
+    if (state.level <= LEVEL_MAX) return SPAWN_CAPS.mine[state.level - 1];
+    return Math.min(SPAWN_CAPS.mine[LEVEL_MAX - 1] + (state.level - LEVEL_MAX), ENDLESS_MINE_CAP_MAX);
+  }
+
+  function stormCap() {
+    if (state.level <= LEVEL_MAX) return SPAWN_CAPS.storm[state.level - 1];
+    return Math.min(
+      SPAWN_CAPS.storm[LEVEL_MAX - 1] + Math.floor((state.level - LEVEL_MAX) / 2),
+      ENDLESS_STORM_CAP_MAX,
+    );
   }
 
   // True when a candidate spawn point is clear of the ship.
@@ -572,15 +617,18 @@ function createWorld(random) {
     state.bestCombo = 0;
     state.combo = 0;
     state.comboCount = 0;
-    state.hearts = HEARTS;
-    state.maxHearts = HEARTS;
+    // Hangar bonuses apply from the start of every run: extra max hearts
+    // (and the hearts to fill them), a starting shield at AEGIS Lv1.
+    state.hearts = HEARTS + (state.hangar.hull || 0);
+    state.maxHearts = HEARTS + (state.hangar.hull || 0);
     state.upgrades = freshUpgrades();
     state.shardsCollected = 0;
     state.magnetRadius = 0;
     state.shardBonus = 0;
     state.pendingLevelUps = 0;
     state.level = 1;
-    state.shield = false;
+    state.shield = (state.hangar.shield || 0) >= 1;
+    state.endless = false;
     state.ship = makeShip();
     state.shards = [];
     state.mines = [];
@@ -592,6 +640,8 @@ function createWorld(random) {
     state.gateProgress = 0;
     state.goldenCollected = 0;
     state.spawnTimers = { shard: 0.2, mine: 1.2, storm: 2.0, shield: 8 };
+    // AEGIS PLATING Lv2: shield cells spawn twice as often.
+    state.shieldEvery = (state.hangar.shield || 0) >= 2 ? SPAWN.shieldEvery / 2 : SPAWN.shieldEvery;
     state.flashes = 0;
     state.floaters = [];
     state.displayScore = 0;
@@ -612,8 +662,9 @@ function createWorld(random) {
     state.level = levelFor(state.score);
     const levelAtStart = state.level;
     // Derived upgrade numbers are re-computed every step from the stack
-    // counts, so they can never go stale.
-    state.magnetRadius = magnetRadiusFor(state);
+    // counts, so they can never go stale. The magnet radius is the hangar
+    // magnet plus the in-run SHARD MAGNET stacks.
+    state.magnetRadius = hangarMagnetRadius(state) + magnetRadiusFor(state);
     state.shardBonus = shardPointsFor(state) - SHARD_POINTS;
     const ship = state.ship;
 
@@ -625,15 +676,16 @@ function createWorld(random) {
     if (state.spawnTimers.shard <= 0) { spawnShard(); state.spawnTimers.shard = spawnRate(SPAWN.shardEvery); }
     // Spawn caps: the field never holds more than the per-level max.
     if (state.spawnTimers.mine <= 0) {
-      if (state.mines.length < SPAWN_CAPS.mine[state.level - 1]) spawnMine();
+      if (state.mines.length < mineCap()) spawnMine();
       state.spawnTimers.mine = spawnRate(SPAWN.mineEvery);
     }
     if (state.spawnTimers.storm <= 0) {
-      if (state.storms.length < SPAWN_CAPS.storm[state.level - 1]) spawnStorm();
-      // Storms are gated early (nearly none at level 1-2).
-      state.spawnTimers.storm = spawnRate(SPAWN.stormEvery) * STORM_GATE[state.level - 1];
+      if (state.storms.length < stormCap()) spawnStorm();
+      // Storms are gated early (nearly none at level 1-2); past level 5
+      // the gate stays at its level-5 value.
+      state.spawnTimers.storm = spawnRate(SPAWN.stormEvery) * STORM_GATE[Math.min(state.level, LEVEL_MAX) - 1];
     }
-    if (state.spawnTimers.shield <= 0 && !state.shield) { spawnShield(); state.spawnTimers.shield = SPAWN.shieldEvery; }
+    if (state.spawnTimers.shield <= 0 && !state.shield) { spawnShield(); state.spawnTimers.shield = state.shieldEvery; }
 
     // --- Ship steering ----------------------------------------------------
     // Keyboard steers directly. With no keys, a held pointer steers:
@@ -910,7 +962,22 @@ function createWorld(random) {
     state.ship.invulnerable = Math.max(state.ship.invulnerable, seconds);
   }
 
-  return { state, reset, step, burst, grantGrace };
+  // Replace the hangar levels (e.g. after loading the save) — they apply
+  // on the next reset(), i.e. at the start of the next run.
+  function setHangar(levels) {
+    state.hangar = { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0, ...levels };
+  }
+
+  // Continue past the Aurora Gate: the run goes endless. The gate is
+  // already open, so the win can never re-trigger; levels keep rising
+  // one per 200 points and upgrade picks keep coming with them.
+  function enterEndless() {
+    state.endless = true;
+    state.gateOpen = true;
+    state.gateProgress = 1;
+  }
+
+  return { state, reset, step, burst, grantGrace, setHangar, enterEndless };
 }
 
 // ---- src/skins.js ----
@@ -1407,7 +1474,7 @@ function createAudio() {
 // each consecutive day (day 7 is the milestone). Dates are local calendar
 // dates (YYYY-MM-DD), so a missed day breaks the streak.
 const SAVE_KEY = 'lumen-drift-save';
-const SAVE_VERSION = 1;
+const SAVE_VERSION = 2;
 
 // Daily missions: fixed set, progress is counted per run and banked when
 // the run ends. `stat` names the run-stat field they read.
@@ -1447,6 +1514,15 @@ function freshSave(today) {
     top5: [],
     history: [],
     lifetime: { runs: 0, shards: 0, playSeconds: 0 },
+    // Spendable shard purse (hangar purchases deduct from this only).
+    // `lifetime.shards` counts every shard ever earned and never drops —
+    // it is what unlocks ship skins, so spending can never lock a skin.
+    shardBalance: 0,
+    // Permanent per-part ship upgrades (see hangar.js).
+    hangar: { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0 },
+    // True once the player has beaten the Aurora Gate: endless mode is
+    // offered on every win screen after that.
+    endlessUnlocked: false,
     streak: { lastDate: null, count: 0, visitedDays: [] },
     missions: freshMissions(today),
   };
@@ -1457,8 +1533,34 @@ function isSaveShape(save) {
     && save.version === SAVE_VERSION
     && Array.isArray(save.top5) && Array.isArray(save.history)
     && save.lifetime && typeof save.lifetime === 'object'
+    && typeof save.shardBalance === 'number'
+    && save.hangar && typeof save.hangar === 'object'
+    && typeof save.endlessUnlocked === 'boolean'
     && save.streak && typeof save.streak === 'object'
     && save.missions && Array.isArray(save.missions.list);
+}
+
+// The v1 shape (before the hangar): same core, no hangar fields.
+function isSaveShapeV1(save) {
+  return save && typeof save === 'object'
+    && save.version === 1
+    && Array.isArray(save.top5) && Array.isArray(save.history)
+    && save.lifetime && typeof save.lifetime === 'object'
+    && save.streak && typeof save.streak === 'object'
+    && save.missions && Array.isArray(save.missions.list);
+}
+
+/**
+ * Migrate a v1 save to v2. Nothing earned is lost: the spendable purse
+ * starts at the full lifetime total (every shard the player ever earned
+ * is theirs to spend), the hangar starts empty, endless starts locked.
+ */
+function migrateSave(save) {
+  const migrated = { ...save, version: SAVE_VERSION };
+  migrated.hangar = { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0 };
+  migrated.shardBalance = Math.max(0, save.lifetime.shards || 0);
+  migrated.endlessUnlocked = false;
+  return migrated;
 }
 
 /**
@@ -1473,6 +1575,7 @@ function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (isSaveShape(parsed)) save = parsed;
+      else if (isSaveShapeV1(parsed)) save = migrateSave(parsed);
     }
   } catch {
     save = null;
@@ -1481,6 +1584,7 @@ function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
     save = freshSave(today);
     save.best = Math.max(0, legacy.best || 0);
     save.lifetime.shards = Math.max(0, legacy.shards || 0);
+    save.shardBalance = save.lifetime.shards;
     if (save.best > 0) {
       save.top5 = [{ score: save.best, level: 1, bestCombo: 1, date: today }];
     }
@@ -1517,6 +1621,7 @@ function touchStreak(save, today) {
   }
   const bonus = Math.min(10 * save.streak.count, 100);
   save.lifetime.shards += bonus;
+  save.shardBalance = (save.shardBalance ?? 0) + bonus;
   return {
     bonus,
     isNewDay: true,
@@ -1527,30 +1632,51 @@ function touchStreak(save, today) {
 
 /**
  * Record a finished run. `run` is { score, level, bestCombo, shards,
- * dashes, upgrades, playSeconds, date }. Returns { rank, gapToFirst }:
- * rank is the 1-based top-5 position (0 when the run did not make it),
- * gapToFirst is the points to #1 (0 at #1).
+ * dashes, upgrades, playSeconds, date, endless }. Returns
+ * { rank, gapToFirst, entry, historyEntry }: rank is the 1-based top-5
+ * position (0 when the run did not make it), gapToFirst is the points to
+ * #1, and entry/historyEntry are the stored objects (the caller keeps
+ * them to replace a mid-run bank — see below).
+ *
+ * `opts.replace` is for a run that was already banked once mid-run and
+ * then kept going: the endless continuation of a win. The earlier banked
+ * entry is removed from the top-5/history first, and its shards are
+ * taken back out of the counters before the full final run is banked —
+ * so the run is counted exactly once, with its final score.
  */
-function recordRun(save, run) {
+function recordRun(save, run, opts = {}) {
+  if (opts.replace) {
+    const { entry, historyEntry, shards: oldShards } = opts.replace;
+    const ti = save.top5.indexOf(entry);
+    if (ti >= 0) save.top5.splice(ti, 1);
+    const hi = save.history.indexOf(historyEntry);
+    if (hi >= 0) save.history.splice(hi, 1);
+    save.lifetime.shards -= oldShards || 0;
+    save.shardBalance = (save.shardBalance ?? 0) - (oldShards || 0);
+    save.lifetime.runs -= 1;
+  }
   save.lifetime.runs += 1;
   save.lifetime.shards += run.shards;
+  save.shardBalance = (save.shardBalance ?? 0) + run.shards;
   save.lifetime.playSeconds += run.playSeconds || 0;
   if (run.score > save.best) save.best = run.score;
   const entry = {
-    score: run.score, level: run.level, bestCombo: run.bestCombo, date: run.date,
+    score: run.score, level: run.level, bestCombo: run.bestCombo,
+    date: run.date, endless: !!run.endless,
   };
   save.top5.push(entry);
   save.top5.sort((a, b) => b.score - a.score);
   save.top5 = save.top5.slice(0, 5);
   const rank = save.top5.indexOf(entry) + 1;
-  save.history.unshift({
+  const historyEntry = {
     score: run.score, level: run.level, bestCombo: run.bestCombo,
     shards: run.shards, dashes: run.dashes, upgrades: run.upgrades || [],
-    date: run.date,
-  });
+    date: run.date, endless: !!run.endless,
+  };
+  save.history.unshift(historyEntry);
   save.history = save.history.slice(0, 20);
   const gapToFirst = save.top5.length ? save.top5[0].score - run.score : 0;
-  return { rank, gapToFirst };
+  return { rank, gapToFirst, entry, historyEntry };
 }
 
 /**
@@ -1567,6 +1693,7 @@ function updateMissions(save, run) {
     if (mission.progress >= def.target) {
       mission.done = true;
       save.lifetime.shards += mission.reward;
+      save.shardBalance = (save.shardBalance ?? 0) + mission.reward;
       completed.push({ id: mission.id, name: mission.name, reward: mission.reward });
     }
   }
@@ -1585,6 +1712,113 @@ function streakCalendar(save, today) {
     });
   }
   return days;
+}
+
+// ---- src/hangar.js ----
+// Lumen Drift — the hangar: permanent per-part ship upgrades bought with
+// lifetime star shards. Unlike the in-run upgrade picks (which reset every
+// run), hangar parts stay bought forever, so the ship visibly grows
+// stronger run after run — that is the point of this screen.
+//
+// Economy: two shard counters. `lifetime.shards` counts every shard ever
+// earned and NEVER decreases — it is what unlocks ship skins. `shardBalance`
+// is the spendable purse: every shard earned adds to it, every hangar
+// purchase deducts from it. Spending can therefore never lock a skin.
+//
+// Balance: a good run earns ~60-120 shards, plus the daily streak bonus
+// (10-100) and mission rewards (100/day). The first level of every part
+// costs 150-300, so each is affordable after a few runs; maxing all five
+// parts costs 9,400 shards — weeks of play, not a day. A fully kitted
+// ship is much stronger (up to 6 hearts, +24% speed, a starting shield,
+// a wide magnet, +6 points per shard) but the early levels stay hard:
+// the first levels only add a little, and the endless ramp (Part 2)
+// keeps scaling past anything the hangar can give.
+const HANGAR_PARTS = [
+  {
+    id: 'hull',
+    name: 'REINFORCED HULL',
+    desc: '+1 max hull heart per level.',
+    max: 3,
+    costs: [250, 700, 1500],
+  },
+  {
+    id: 'engine',
+    name: 'ION ENGINE',
+    desc: '+8% top speed and dash speed per level.',
+    max: 3,
+    costs: [200, 600, 1200],
+  },
+  {
+    id: 'shield',
+    name: 'AEGIS PLATING',
+    desc: 'Lv1: start each run with a shield. Lv2: shield cells spawn twice as often.',
+    max: 2,
+    costs: [300, 800],
+  },
+  {
+    id: 'magnet',
+    name: 'TRACTOR MAGNET',
+    desc: '+80 shard pickup radius per level.',
+    max: 3,
+    costs: [150, 500, 1100],
+  },
+  {
+    id: 'collector',
+    name: 'LIGHT COLLECTOR',
+    desc: '+2 points per star shard per level.',
+    max: 3,
+    costs: [200, 600, 1300],
+  },
+];
+
+function hangarPartById(id) {
+  return HANGAR_PARTS.find((p) => p.id === id) || null;
+}
+
+/** Current level of one part (0 when never bought). */
+function hangarLevel(save, id) {
+  return (save && save.hangar && save.hangar[id]) || 0;
+}
+
+/** Every part's level, for the world (missing parts read as 0). */
+function hangarBonuses(save) {
+  const out = {};
+  for (const part of HANGAR_PARTS) out[part.id] = hangarLevel(save, part.id);
+  return out;
+}
+
+/** Shards the next level costs, or null when the part is maxed. */
+function hangarNextCost(part, level) {
+  if (!part || level >= part.max) return null;
+  return part.costs[level];
+}
+
+/**
+ * Can this part be bought right now? Returns { ok } or { ok: false,
+ * reason } where reason is 'maxed', 'broke' or 'unknown'.
+ */
+function canBuyHangarPart(save, part) {
+  if (!part) return { ok: false, reason: 'unknown' };
+  const level = hangarLevel(save, part.id);
+  const cost = hangarNextCost(part, level);
+  if (cost === null) return { ok: false, reason: 'maxed' };
+  if ((save.shardBalance ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Buy the next level of one part. Mutates save.hangar and
+ * save.shardBalance. Returns { ok: true, cost, level } or
+ * { ok: false, reason } — the caller shows the reason, never crashes.
+ */
+function buyHangarPart(save, partId) {
+  const part = hangarPartById(partId);
+  const check = canBuyHangarPart(save, part);
+  if (!check.ok) return check;
+  if (!save.hangar) save.hangar = {};
+  save.hangar[part.id] = hangarLevel(save, part.id) + 1;
+  save.shardBalance = (save.shardBalance ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.hangar[part.id] };
 }
 
 // ---- src/render.js ----
@@ -1607,6 +1841,16 @@ const SCREEN_OVER = 'over';
 const SCREEN_WIN = 'win';
 const SCREEN_UPGRADE = 'upgrade';
 const SCREEN_STATS = 'stats';
+const SCREEN_HANGAR = 'hangar';
+
+// Title-screen button that opens the hangar (top left).
+const HANGAR_BUTTON_RECT = { x: 30, y: 30, w: 170, h: 44 };
+// The deliberate restart button on the game-over / win screens.
+const PLAY_AGAIN_RECT = { x: 510, y: 480, w: 260, h: 56 };
+// Win-screen button that continues the run into endless mode.
+const ENDLESS_RECT = { x: 510, y: 600, w: 260, h: 56 };
+// Back button on the hangar screen.
+const HANGAR_BACK_RECT = { x: 540, y: 622, w: 200, h: 44 };
 
 // Title-screen skin arrows (◀ ▶) beside the ship preview: tapping an
 // arrow cycles skins — tapping the preview itself no longer does, so a
@@ -1615,14 +1859,26 @@ const SKIN_ARROW_LEFT = { x: 380, y: 560, w: 36, h: 56 };
 const SKIN_ARROW_RIGHT = { x: 524, y: 560, w: 36, h: 56 };
 // Title-screen button that opens the stats / top-5 screen.
 const STATS_BUTTON_RECT = { x: 1060, y: 30, w: 190, h: 44 };
-// The deliberate restart button on the game-over / win screens.
-const PLAY_AGAIN_RECT = { x: 510, y: 480, w: 260, h: 56 };
 
 // The title-screen ship preview the player taps to cycle skins
 // (field coordinates; the preview ship is drawn at its centre).
 const SKIN_PREVIEW_RECT = { x: 425, y: 550, w: 95, h: 75 };
 
-/** Card rectangles for the level-up choice, in field coordinates. */
+/** Row rectangles for the hangar parts, in field coordinates. */
+function layoutHangarParts() {
+  const x = 140;
+  const w = 1000;
+  const h = 74;
+  const gap = 8;
+  const y0 = 195;
+  return HANGAR_PARTS.map((part, i) => {
+    const y = y0 + i * (h + gap);
+    return {
+      x, y, w, h, part,
+      buy: { x: x + w - 170, y: y + 13, w: 150, h: 48 },
+    };
+  });
+}
 function layoutUpgradeCards(offers) {
   const cardW = 340;
   const cardH = 230;
@@ -1998,20 +2254,29 @@ function drawHud(ctx, state, best, width) {
     ctx.fillText('SHIELD UP', width - pad, 120);
   }
   // Progress bar to the Aurora Gate, bottom centre — lifted off the edge.
+  // In endless mode the gate is already open: the bar tracks progress to
+  // the next level instead.
   const barWidth = 420;
   const barX = (width - barWidth) / 2;
   const barY = 682;
   ctx.textAlign = 'center';
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 15px sans-serif';
-  ctx.fillText(`AURORA GATE  ${state.score} / ${WIN_SCORE}`, width / 2, barY - 8);
+  if (state.endless) {
+    ctx.fillText(`ENDLESS DRIFT  •  LEVEL ${state.level}`, width / 2, barY - 8);
+  } else {
+    ctx.fillText(`AURORA GATE  ${state.score} / ${WIN_SCORE}`, width / 2, barY - 8);
+  }
   ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
   ctx.fillRect(barX, barY, barWidth, 12);
   const gateGradient = ctx.createLinearGradient(barX, 0, barX + barWidth, 0);
   gateGradient.addColorStop(0, CYAN);
   gateGradient.addColorStop(1, GREEN);
   ctx.fillStyle = gateGradient;
-  ctx.fillRect(barX, barY, barWidth * state.gateProgress, 12);
+  const barFrac = state.endless
+    ? (state.score % LEVEL_EVERY) / LEVEL_EVERY
+    : state.gateProgress;
+  ctx.fillRect(barX, barY, barWidth * barFrac, 12);
 }
 
 function panel(ctx, width, height) {
@@ -2049,6 +2314,17 @@ function wrapText(ctx, text, maxWidth) {
 function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeShards = 0, extra = {}) {
   panel(ctx, width, height);
   drawGate(ctx, state, width, height);
+  // Hangar button, top left — the ship's permanent upgrades.
+  ctx.save();
+  ctx.strokeStyle = CYAN;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(HANGAR_BUTTON_RECT.x, HANGAR_BUTTON_RECT.y, HANGAR_BUTTON_RECT.w, HANGAR_BUTTON_RECT.h);
+  ctx.fillStyle = CYAN;
+  ctx.font = 'bold 17px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('HANGAR  [H]', HANGAR_BUTTON_RECT.x + HANGAR_BUTTON_RECT.w / 2, HANGAR_BUTTON_RECT.y + 23);
+  ctx.restore();
   // Top-scores button, top right.
   ctx.save();
   ctx.strokeStyle = GOLD;
@@ -2092,6 +2368,12 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 18px sans-serif';
     ctx.fillText(`BEST SCORE  ${best}`, width / 2, 542);
+  }
+  // Endless unlocked: the player has beaten the Aurora Gate once.
+  if (save && save.endlessUnlocked) {
+    ctx.fillStyle = GREEN;
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('∞  ENDLESS UNLOCKED — win again to keep drifting past the gate!', width / 2, 566);
   }
   // Ship skin selector: a preview of the ship in the selected skin,
   // its name, and progress to the next unlock. Tap the preview (or
@@ -2172,7 +2454,7 @@ function drawStats(ctx, save, width, height) {
         ctx.fillStyle = i === 0 ? GOLD : '#e2e8f0';
         ctx.font = i === 0 ? 'bold 24px sans-serif' : '20px sans-serif';
         ctx.fillText(
-          `#${i + 1}   ${entry.score}   —   LEVEL ${entry.level}   •   COMBO x${Math.max(1, entry.bestCombo)}   •   ${entry.date}`,
+          `#${i + 1}   ${entry.score}   —   LEVEL ${entry.level}   •   COMBO x${Math.max(1, entry.bestCombo)}${entry.endless ? '   ∞ ENDLESS' : ''}   •   ${entry.date}`,
           width / 2, 200 + i * 38,
         );
       });
@@ -2221,6 +2503,102 @@ function drawStats(ctx, save, width, height) {
   ctx.fillStyle = '#94a3b8';
   ctx.font = '17px sans-serif';
   ctx.fillText('Press T or tap to go back', width / 2, 680);
+}
+
+function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null) {
+  panel(ctx, width, height);
+  bigTitle(ctx, 'HANGAR', 72, width, CYAN, 48);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#a5f3fc';
+  ctx.font = '19px sans-serif';
+  ctx.fillText('Your ship, upgraded part by part — every purchase stays forever.', width / 2, 108);
+  // Ship preview in the selected skin, and the profile summary beside it.
+  const preview = {
+    ship: { x: 130, y: 158, angle: -Math.PI / 2, vx: 0, vy: 0, invulnerable: 0 },
+    time: state ? state.time : 0,
+    shield: false,
+  };
+  drawShip(ctx, preview, skin);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 19px sans-serif';
+  const balance = save ? (save.shardBalance ?? 0) : 0;
+  const lifetime = save ? save.lifetime.shards : 0;
+  ctx.fillText(
+    `BEST ${save ? save.best : 0}   •   RUNS ${save ? save.lifetime.runs : 0}   •   LIFETIME SHARDS ${lifetime}   •   🔥 ${save ? save.streak.count : 0}-DAY STREAK`,
+    210, 140,
+  );
+  ctx.fillStyle = GOLD;
+  ctx.font = 'bold 21px sans-serif';
+  ctx.fillText(`BALANCE  ${balance} shards — tap a part to buy it (keys 1–5 work too)`, 210, 172);
+  // One row per part: name, effect, level pips, buy button.
+  for (const row of layoutHangarParts()) {
+    const level = save ? hangarLevel(save, row.part.id) : 0;
+    const cost = hangarNextCost(row.part, level);
+    const affordable = cost !== null && balance >= cost;
+    ctx.save();
+    ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+    ctx.fillRect(row.x, row.y, row.w, row.h);
+    ctx.strokeStyle = affordable ? GOLD : 'rgba(148, 163, 184, 0.45)';
+    ctx.lineWidth = affordable ? 2 : 1.5;
+    ctx.strokeRect(row.x, row.y, row.w, row.h);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = CYAN;
+    ctx.font = 'bold 21px sans-serif';
+    ctx.fillText(row.part.name, row.x + 16, row.y + 30);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '16px sans-serif';
+    const descLines = wrapText(ctx, row.part.desc, 600);
+    descLines.forEach((line, li) => {
+      ctx.fillText(line, row.x + 16, row.y + 56 + li * 20);
+    });
+    // Level pips, ending just left of the buy button.
+    const pipGap = 26;
+    const totalW = (row.part.max - 1) * pipGap;
+    const pipEndX = row.buy.x - 24;
+    const pipStartX = pipEndX - totalW;
+    for (let p = 0; p < row.part.max; p += 1) {
+      ctx.beginPath();
+      ctx.arc(pipStartX + p * pipGap, row.y + row.h / 2, 8, 0, Math.PI * 2);
+      ctx.fillStyle = p < level ? GOLD : 'rgba(148, 163, 184, 0.35)';
+      ctx.fill();
+    }
+    // Buy button: gold when affordable, grey when maxed or too expensive.
+    const b = row.buy;
+    if (cost === null) {
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.25)';
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = '#94a3b8';
+    } else if (affordable) {
+      ctx.fillStyle = GOLD;
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = INK;
+    } else {
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.18)';
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = '#94a3b8';
+    }
+    ctx.font = 'bold 18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(
+      cost === null ? 'MAXED' : (affordable ? `BUY ${cost}` : `NEED ${cost}`),
+      b.x + b.w / 2, b.y + b.h / 2 + 1,
+    );
+    ctx.restore();
+  }
+  // Back button, bottom centre.
+  ctx.save();
+  ctx.strokeStyle = CYAN;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(HANGAR_BACK_RECT.x, HANGAR_BACK_RECT.y, HANGAR_BACK_RECT.w, HANGAR_BACK_RECT.h);
+  ctx.fillStyle = CYAN;
+  ctx.font = 'bold 18px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('◀  BACK  [H]', HANGAR_BACK_RECT.x + HANGAR_BACK_RECT.w / 2, HANGAR_BACK_RECT.y + 23);
+  ctx.restore();
 }
 
 function drawPlayAgain(ctx) {
@@ -2338,6 +2716,12 @@ function drawOver(ctx, state, best, width, height, summary = null) {
   ctx.font = 'bold 26px sans-serif';
   ctx.fillText(`SCORE  ${state.score}    •    LEVEL ${state.level}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 300);
   let y = 348;
+  if (summary && summary.endless) {
+    ctx.fillStyle = GREEN;
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('∞  ENDLESS RUN — you drifted past the Aurora Gate!', width / 2, y);
+    y += 40;
+  }
   if (state.score >= best && state.score > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 22px sans-serif';
@@ -2405,6 +2789,22 @@ function drawWin(ctx, state, best, width, height, summary = null) {
     }
   }
   drawPlayAgain(ctx);
+  // Keep drifting: the run continues past the gate, endless.
+  const r = ENDLESS_RECT;
+  ctx.save();
+  ctx.fillStyle = GREEN;
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = INK;
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('▶  CONTINUE — ENDLESS', r.x + r.w / 2, r.y + r.h / 2 + 1);
+  ctx.restore();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '17px sans-serif';
+  ctx.fillText('or press E', r.x + r.w / 2, r.y + r.h + 28);
 }
 
 function createRenderer(canvas) {
@@ -2517,6 +2917,7 @@ function createRenderer(canvas) {
 
     if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width);
     if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
+    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state);
     if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
     if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary);
     if (screen === SCREEN_WIN) drawWin(ctx, state, best, FIELD.width, FIELD.height, summary);
@@ -2637,8 +3038,9 @@ function stageShot(name, world) {
 // ---- src/main.js ----
 // Lumen Drift — boot and the one loop. Input is read every frame, the world
 // advances in fixed 1/60 s steps (several in a slow frame, none in a fast
-// one), and the renderer paints what is there. The game moves between six
-// screens: title, play, upgrade (level-up choice), paused, game over and win.
+// one), and the renderer paints what is there. The game moves between
+// seven screens: title, hangar, play, upgrade (level-up choice), paused,
+// game over and win (which can continue into endless mode).
 //
 // ?seed=N fixes the storm's pattern. ?shot=start|play|end|win (with
 // &seed=N) stages that scene instead of running the loop, paints it twice
@@ -2728,8 +3130,15 @@ function runGame() {
   let best = save.best;
   let lifetimeShards = save.lifetime.shards;
   let skinId = loadSkinId(window.localStorage, lifetimeShards);
+  // Hangar bonuses apply from the start of every run.
+  world.setHangar(hangarBonuses(save));
   // The last run's summary (top-5 rank, missions) for the game-over screen.
   let lastSummary = null;
+  // The win bank of the current run: when a win continues into endless,
+  // the endless death replaces this bank instead of adding a second one.
+  let lastBanked = null;
+  // True while the current run is an endless continuation of a win.
+  let endlessRun = false;
   // Per-run stats for missions and the run history.
   let runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
   let offers = [];
@@ -2753,6 +3162,8 @@ function runGame() {
     world.reset();
     screen = SCREEN_PLAY;
     runStats = { dashes: 0, maxLevel: 1, playSeconds: 0 };
+    lastBanked = null;
+    endlessRun = false;
     input.clearPressed();
     input.clearTap();
     audio.unlock();
@@ -2776,8 +3187,23 @@ function runGame() {
         .filter(([, n]) => n > 0).map(([id]) => id),
       playSeconds: Math.round(runStats.playSeconds),
       date: today,
+      endless: world.state.endless,
     };
-    const result = recordRun(save, run);
+    let result;
+    if (won) {
+      // Beating the gate unlocks endless mode from now on. The win is
+      // banked now — if the player continues into endless, the death at
+      // the end of that same run REPLACES this bank (see below), so the
+      // run is counted exactly once, with its final score.
+      save.endlessUnlocked = true;
+      result = recordRun(save, run);
+      lastBanked = { entry: result.entry, historyEntry: result.historyEntry, shards: run.shards };
+    } else if (endlessRun && lastBanked) {
+      result = recordRun(save, run, { replace: lastBanked });
+      lastBanked = null;
+    } else {
+      result = recordRun(save, run);
+    }
     const completed = updateMissions(save, run);
     saveSave(window.localStorage, save);
     best = save.best;
@@ -2785,12 +3211,55 @@ function runGame() {
     // The legacy best/shards keys stay in sync for older readers.
     saveBest(best);
     saveLifetimeShards(window.localStorage, lifetimeShards);
-    lastSummary = { rank: result.rank, gapToFirst: result.gapToFirst, completed };
+    lastSummary = { rank: result.rank, gapToFirst: result.gapToFirst, completed, endless: world.state.endless };
     if (won) audio.win();
     else audio.over();
     announce(won
       ? `You win! Aurora Gate open with ${world.state.score} points. Press R or tap PLAY AGAIN.`
       : `Game over. Score ${world.state.score}. Press R or tap PLAY AGAIN.`);
+  }
+
+  // Keep drifting past the Aurora Gate: the run goes endless — no reset,
+  // the score keeps counting and the difficulty keeps scaling.
+  function continueEndless() {
+    world.enterEndless();
+    screen = SCREEN_PLAY;
+    endlessRun = true;
+    accumulator = 0;
+    input.clearPressed();
+    input.clearTap();
+    world.grantGrace(UPGRADE_GRACE);
+    audio.levelup();
+    announce('Endless drift — the storm never ends now. Keep collecting!');
+  }
+
+  // Buy one hangar part level with lifetime shards. The world picks the
+  // new bonuses up on the next reset (the next run).
+  function tryBuyHangar(index) {
+    const part = HANGAR_PARTS[index];
+    if (!part) return;
+    const bought = buyHangarPart(save, part.id);
+    if (bought.ok) {
+      world.setHangar(hangarBonuses(save));
+      saveSave(window.localStorage, save);
+      audio.click();
+      announce(`Bought ${part.name} level ${bought.level} for ${bought.cost} shards.`);
+    } else if (bought.reason === 'broke') {
+      announce(`Not enough shards for ${part.name}.`);
+    } else if (bought.reason === 'maxed') {
+      announce(`${part.name} is already maxed.`);
+    }
+  }
+
+  // Open the hangar from the title. The input gate stops the tap that
+  // opened it from also buying a part on the first frame.
+  function enterHangar() {
+    screen = SCREEN_HANGAR;
+    input.clearPressed();
+    input.clearTap();
+    input.armGate();
+    audio.click();
+    announce('Hangar. Buy permanent ship upgrades with your shards. Press H to go back.');
   }
 
   // Cycle the ship skin through the skins already unlocked (title only).
@@ -2897,6 +3366,8 @@ function runGame() {
       } else if (inRect(tap, SKIN_ARROW_RIGHT)) {
         cycleSkin(1);
         input.clearPressed();
+      } else if (inRect(tap, HANGAR_BUTTON_RECT)) {
+        enterHangar();
       } else if (inRect(tap, STATS_BUTTON_RECT)) {
         screen = SCREEN_STATS;
         input.clearPressed();
@@ -2913,8 +3384,42 @@ function runGame() {
         input.clearPressed();
         input.clearTap();
         announce('Top scores. Press T or tap to go back.');
+      } else if (input.consume('KeyH')) {
+        enterHangar();
       } else if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) {
         startGame();
+      }
+    } else if (screen === SCREEN_HANGAR) {
+      // Buy with keys 1-5 or by tapping a part's BUY button; H, Esc or
+      // the BACK button returns to the title. While the input gate is
+      // closed (the tap that opened the hangar, or its first 400 ms),
+      // swallow everything — a stale tap must never buy a part.
+      if (!input.gateOpen()) {
+        input.takeTap();
+        input.clearPressed();
+      } else {
+        const tap = input.takeTap();
+        if (inRect(tap, HANGAR_BACK_RECT)) {
+          screen = SCREEN_TITLE;
+          input.clearPressed();
+          input.clearTap();
+          announce('Lumen Drift. Press Enter or click to launch.');
+        } else {
+          const rows = layoutHangarParts();
+          const bought = rows.findIndex((row) => inRect(tap, row.buy));
+          if (bought >= 0) tryBuyHangar(bought);
+          else if (input.consume(ACTION_PICK_1)) tryBuyHangar(0);
+          else if (input.consume(ACTION_PICK_2)) tryBuyHangar(1);
+          else if (input.consume(ACTION_PICK_3)) tryBuyHangar(2);
+          else if (input.consume('Digit4')) tryBuyHangar(3);
+          else if (input.consume('Digit5')) tryBuyHangar(4);
+          else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+            screen = SCREEN_TITLE;
+            input.clearPressed();
+            input.clearTap();
+            announce('Lumen Drift. Press Enter or click to launch.');
+          }
+        }
       }
     } else if (screen === SCREEN_STATS) {
       // Any tap (or T / Esc) goes back to the title.
@@ -2994,13 +3499,19 @@ function runGame() {
     } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
       // Deliberate restart only: the PLAY AGAIN button, or the R key.
       // A tap anywhere else no longer restarts — the player gets to read
-      // the score, the rank and the near-miss line first.
+      // the score, the rank and the near-miss line first. On the win
+      // screen, E (or the green button) keeps the run going, endless.
       const tap = input.takeTap();
       if (input.consume(ACTION_RESTART)) {
         startGame();
+      } else if (screen === SCREEN_WIN && input.consume('KeyE')) {
+        continueEndless();
       } else if (inRect(tap, PLAY_AGAIN_RECT)) {
         input.clearPressed();
         startGame();
+      } else if (screen === SCREEN_WIN && inRect(tap, ENDLESS_RECT)) {
+        input.clearPressed();
+        continueEndless();
       }
     }
 
