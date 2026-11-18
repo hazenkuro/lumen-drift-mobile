@@ -70,7 +70,7 @@
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, clear 100 stages and defeat the bosses"></canvas>
+<canvas id="game" aria-label="Lumen Drift: steer the light-skiff, collect star shards, dodge void mines and storm shards, clear 100 stages and defeat the bosses. Buy weapons and chips in the shop, check your pilot level, loadout and achievements on the profile screen."></canvas>
 <p id="status" role="status" aria-live="polite"></p>
 <div id="rotate-hint">📱 Rotate to landscape — the field is much bigger sideways!</div>
 <button id="btn-dash" class="touch-btn" type="button" aria-label="Dash">DASH</button>
@@ -298,6 +298,9 @@ const UPGRADES = [
     available: (state) => !state.shield,
     apply: (state) => {
       state.shield = true;
+      // An Aegis shield supersedes a ward shield (the ward timer
+      // keeps ticking, but its expiry must not clear this shield).
+      state.wardShield = false;
     },
   },
   {
@@ -323,16 +326,22 @@ function stacksOf(state, id) {
 // --- Derived numbers (config constants as bases) -------------------------
 
 function effectiveDashCooldown(state) {
+  // Swift Recovery chip: dash cooldown × its multiplier (0.8 = −20%).
+  // Phantom Dash merge: a further −30%.
   return Math.max(
     DASH_COOLDOWN_FLOOR,
-    SHIP.dashCooldown * Math.pow(0.75, stacksOf(state, UPGRADE_SWIFT)),
+    SHIP.dashCooldown * Math.pow(0.75, stacksOf(state, UPGRADE_SWIFT))
+    * (state.chipEffects?.dashCooldownMult ?? 1)
+    * (state.merged?.['phantom-dash'] ? 0.7 : 1),
   );
 }
 
 function effectiveDashSpeed(state) {
   return SHIP.dashSpeed * (1 + 0.12 * stacksOf(state, UPGRADE_LONG))
     * (1 + 0.08 * (state.hangar?.engine ?? 0))
-    * (state.shipStats?.speedMult ?? 1);
+    * (state.shipStats?.speedMult ?? 1)
+    // Phantom Dash merge: dash distance +40% (via dash speed).
+    * (state.merged?.['phantom-dash'] ? 1.4 : 1);
 }
 
 function effectiveMaxSpeed(state) {
@@ -345,11 +354,97 @@ function effectiveMaxSpeed(state) {
 function shardPointsFor(state) {
   return SHARD_POINTS
     + GOLDEN_POINTS * stacksOf(state, UPGRADE_GOLDEN)
-    + 2 * (state.hangar?.collector ?? 0);
+    + 2 * (state.hangar?.collector ?? 0)
+    // Golden Touch chip: +N points per shard.
+    + (state.chipEffects?.shardBonus ?? 0)
+    // Midas Field merge: shards worth +2 each (replaces GOLDEN SHARDS).
+    + (state.merged?.['midas-field'] ? 2 : 0);
 }
 
 function magnetRadiusFor(state) {
-  return MAGNET_RADII[stacksOf(state, UPGRADE_MAGNET)] || 0;
+  // Midas Field merge: magnet radius +50 (replaces SHARD MAGNET).
+  return (MAGNET_RADII[stacksOf(state, UPGRADE_MAGNET)] || 0)
+    + (state.merged?.['midas-field'] ? 50 : 0);
+}
+
+// --- Merges (Stage 2, Spekter "merge skill cards" model) ------------------
+//
+// In-run upgrade cards can evolve: when a level-up offers its picks
+// and two components are already owned, one pick card is replaced by
+// a MERGE card. Picking it grants the merged effect and retires the
+// two components — their stacks stop counting (set to 0) and they are
+// never offered again while the merge is owned. Exactly three merges
+// exist; their components are disjoint, so one merge never blocks
+// another. This is what keeps picks meaningful past the caps in
+// endless runs (the "boring after 5 minutes" complaint).
+const MERGES = [
+  {
+    id: 'midas-field', name: 'MIDAS FIELD', kind: 'merge', isMerge: true,
+    components: ['magnet', 'golden'],
+    desc: 'Shards are worth +2 pts each and the magnet radius grows +50.',
+  },
+  {
+    id: 'fortress-hull', name: 'FORTRESS HULL', kind: 'merge', isMerge: true,
+    components: ['heart', 'aegis'],
+    desc: '+1 max heart and a shield, right now.',
+  },
+  {
+    id: 'phantom-dash', name: 'PHANTOM DASH', kind: 'merge', isMerge: true,
+    components: ['swift', 'long'],
+    desc: 'Dash cooldown −30% and dash distance +40%.',
+  },
+];
+
+function mergeById(id) {
+  return MERGES.find((m) => m.id === id) || null;
+}
+
+/**
+ * Merges whose prerequisites are met and that are not yet owned.
+ * `upgrades` is the stacks object ({ magnet: 1, ... }); `merged` the
+ * owned-merges object ({ 'midas-field': true }). A merge needs both
+ * components owned (stacks > 0).
+ */
+function availableMerges(upgrades, merged = {}) {
+  const counts = upgrades || {};
+  const owned = merged || {};
+  return MERGES.filter((m) => !owned[m.id]
+    && m.components.every((c) => (counts[c] || 0) > 0));
+}
+
+/** True when upgrade `id` is retired by an owned merge. */
+function isUpgradeRetired(state, id) {
+  const merged = state.merged || {};
+  return MERGES.some((m) => merged[m.id] && m.components.includes(id));
+}
+
+/**
+ * Apply a merge to the world state. Returns false when the merge is
+ * unknown, already owned, or its components are not both owned.
+ * Components retire (stacks zeroed — the merged effect replaces
+ * them); Fortress Hull also grants its heart + shield immediately.
+ */
+function applyMerge(state, mergeId) {
+  const def = mergeById(mergeId);
+  if (!def) return false;
+  if (!state.upgrades) state.upgrades = {};
+  if (!state.merged) state.merged = {};
+  if (state.merged[mergeId]) return false;
+  if (!def.components.every((c) => (state.upgrades[c] || 0) > 0)) return false;
+  for (const c of def.components) state.upgrades[c] = 0;
+  state.merged[mergeId] = true;
+  if (mergeId === 'fortress-hull') {
+    // +1 max heart (and heal 1 now), plus a shield. "Start each stage
+    // with a shield" is realised as the shield now: merges are per-run
+    // picks, so the next stage starts fresh like every other in-run
+    // upgrade — the shield is the pick's immediate value.
+    state.maxHearts = (state.maxHearts ?? 3) + 1;
+    state.hearts = Math.min(state.maxHearts, (state.hearts ?? 0) + 1);
+    state.shield = true;
+    // A fresh shield from the merge supersedes a ward shield.
+    state.wardShield = false;
+  }
+  return true;
 }
 
 /** Hangar magnet: +30 pickup radius per TRACTOR MAGNET level (was +80 —
@@ -361,19 +456,20 @@ function hangarMagnetRadius(state) {
 
 // --- Picking ---------------------------------------------------------------
 
-/** True when this upgrade may currently be offered. */
+/** True when this upgrade may currently be offered (never a retired component). */
 function isAvailable(state, def) {
-  return def.available(state);
+  return def.available(state) && !isUpgradeRetired(state, def.id);
 }
 
 /**
  * Apply one upgrade pick to the world state. Returns false when the
  * upgrade is not currently available (maxed out, shield already held,
- * hearts at cap) — the caller then offers something else instead.
+ * hearts at cap, or retired by a merge) — the caller then offers
+ * something else instead.
  */
 function applyUpgrade(state, id) {
   const def = upgradeById(id);
-  if (!def || !def.available(state)) return false;
+  if (!def || !isAvailable(state, def)) return false;
   if (!state.upgrades) state.upgrades = {};
   state.upgrades[id] = (state.upgrades[id] || 0) + 1;
   def.apply(state);
@@ -385,16 +481,33 @@ function applyUpgrade(state, id) {
  * `rng` is a () => [0,1) function (defaults to Math.random); passing a
  * seeded one keeps draws deterministic in tests. Returns fewer than 3
  * only when fewer are available — never crashes, never repeats an id.
+ *
+ * Merges: when a merge's prerequisites are met and it is not yet
+ * owned, one of the drawn cards is replaced by the MERGE card (gold
+ * border, "MERGE" tag — the renderer draws it distinctly). When no
+ * upgrade is available at all but a merge is, the hand is just the
+ * merge — a level-up is never an empty choice while an evolution
+ * waits.
  */
 function drawUpgrades(state, rng = Math.random) {
-  const pool = UPGRADES.filter((def) => def.available(state));
+  const pool = UPGRADES.filter((def) => isAvailable(state, def));
   for (let i = pool.length - 1; i > 0; i -= 1) {
     const j = Math.floor(rng() * (i + 1));
     const tmp = pool[i];
     pool[i] = pool[j];
     pool[j] = tmp;
   }
-  return pool.slice(0, 3);
+  const picks = pool.slice(0, 3);
+  const merges = availableMerges(state.upgrades || {}, state.merged || {});
+  if (merges.length > 0) {
+    const merge = merges[Math.floor(rng() * merges.length)];
+    if (picks.length > 0) {
+      picks[Math.floor(rng() * picks.length)] = { ...merge };
+    } else {
+      picks.push({ ...merge });
+    }
+  }
+  return picks;
 }
 
 // ---- src/stages.js ----
@@ -536,22 +649,54 @@ function recordStageClear(save, n) {
 }
 
 // ---- src/weapons.js ----
-// Lumen Drift — the starter Blaster (stage 1; the full weapon roster
-// is stage 2). Pure logic over a plain world state — no DOM, no storage,
-// no import of world.js (Wave B owns the world; it calls these with its
-// state). The state shape used here:
+// Lumen Drift — the weapon roster (stage 2, Wave A). Pure logic over a
+// plain world state — no DOM, no storage, no import of world.js (Wave C
+// owns the world; it calls these with its state). The state shape used
+// here:
 //   ship { x, y }, enemies [{ x, y, kind, hp, radius }], boss null or
-//   { x, y, kind, hp, radius }, bullets [], score, floaters [],
-//   gateProgress, shipStats { blasterDamage, blasterRate },
-//   blasterCooldown. Bounds come from state.width/height when present,
-//   else the FIELD size from config.js.
+//   { x, y, kind, hp, radius }, bullets [], enemyBullets [], score,
+//   floaters [], gateProgress, shipStats { blasterDamage, blasterRate },
+//   blasterCooldown, weaponCooldown, weaponId, weaponLevels { id: level },
+//   chipEffects (see chips.js chipEffectsFor), hearts, maxHearts,
+//   shield, shieldTimer, pulseFx []. Bounds come from
+//   state.width/height when present, else the FIELD size from config.js.
+//
+// Weapon model: weapon damage = def.baseDamage + def.damagePerLevel *
+// (level-1). The ship's blasterDamage/blasterRate apply ONLY to the
+// Blaster (as in stage 1); the other three weapons use their own def +
+// level. Ship hearts/speed still matter for all weapons (survival is
+// what the balance gate measures).
+//
+// `pierce` semantics: pierce N means that AFTER its first hit, a bolt
+// can pass through N more enemies (total hits = 1 + pierce). The
+// Blaster's base pierce is 0 (one hit, as before); the Piercing Rounds
+// chip adds +1 to every bolt's pierce, so it is never a no-op.
+//
+// Chip hooks (effects arrive on state.chipEffects; Wave C sets it from
+// chipEffectsFor(equipped chip ids) — see chips.js):
+//   pierce:        extra pierce on blaster + laser bolts.
+//   overdrive:     +25% weapon damage while hearts == maxHearts
+//                  (only when maxHearts is a number; unknown -> off).
+//   bulletWard:    destroying an enemy bullet sets state.shield = true
+//                  and state.shieldTimer = 2 (Wave C's world step
+//                  decays shieldTimer and clears shield at 0).
+//   chainSpark:    on an enemy kill, a roll (state.random, else
+//                  Math.random) under the chance chains 1 damage to the
+//                  nearest other enemy within CHAIN_RADIUS, and records
+//                  a pulseFx segment. A chain-spark kill never chains
+//                  again.
+// Pulse Beam visuals: fireWeapon records each jump in state.pulseFx
+// as { x1, y1, x2, y2, ttl } (ttl PULSE_FX_TTL); updateBullets decays
+// them. Wave C's renderer reads state.pulseFx.
+
+// --- The roster -------------------------------------------------------
 
 const BLASTER = {
   id: 'blaster', name: 'BLASTER', range: 460, bulletSpeed: 950, bulletRadius: 5,
 };
 
 // Enemy bullets (the magenta orbs) are shootable: an orb inside this
-// radius of the ship is an immediate threat, so the Blaster shoots it
+// radius of the ship is an immediate threat, so a weapon shoots it
 // before anything else. Farther orbs are only mopped up when no enemy
 // or boss is in range — shooting orbs must stay defensive, never the
 // main job, or boss fights would lose all their pressure. The radius
@@ -560,22 +705,211 @@ const BLASTER = {
 // times in the sim.
 const BULLET_DEFENSE_RADIUS = 140;
 
+// Chain-lightning jump radius, shared by Pulse Beam and the Chain
+// Spark chip: a chained hit only reaches an enemy this close to the
+// last hit.
+const CHAIN_RADIUS = 120;
+
+// How long a pulse-beam segment stays visible (seconds). updateBullets
+// decays state.pulseFx by dt.
+const PULSE_FX_TTL = 0.15;
+
+const WEAPON_LEVEL_MAX = 10;
+
+const WEAPONS = [
+  {
+    id: 'blaster', name: 'BLASTER', desc: 'The starter auto-fire. Damage and rate come from the equipped ship.',
+    range: 460, unlockPilotLevel: 1, price: 0,
+    baseDamage: 1, damagePerLevel: 0, rate: 2.0, bulletSpeed: 950, bulletRadius: 5,
+  },
+  {
+    id: 'mortar', name: 'MORTAR', desc: 'Slow lobbed shells that burst on impact or at max range, damaging everything nearby.',
+    range: 520, unlockPilotLevel: 3, price: 300,
+    baseDamage: 3, damagePerLevel: 1, rate: 0.8, bulletSpeed: 420, bulletRadius: 8,
+    blastRadius: 60,
+  },
+  {
+    id: 'laser', name: 'LASER', desc: 'A piercing beam. Each bolt passes through several enemies in a line.',
+    range: 460, unlockPilotLevel: 5, price: 800,
+    baseDamage: 1.5, damagePerLevel: 0.5, rate: 1.5, bulletSpeed: 1200, bulletRadius: 5,
+    pierce: 1,
+  },
+  {
+    id: 'pulse', name: 'PULSE BEAM', desc: 'Instant chain lightning: zaps the nearest enemy, then jumps to nearby ones.',
+    range: 300, unlockPilotLevel: 8, price: 1500,
+    baseDamage: 3, damagePerLevel: 1, rate: 1.0, bulletSpeed: 0, bulletRadius: 0,
+    chains: 1,
+  },
+];
+
 const ENEMY_KILL_POINTS = { drifter: 25, dart: 30, bulwark: 50, spitter: 40 };
+
+function weaponById(id) {
+  return WEAPONS.find((w) => w.id === id) || null;
+}
+
+/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
+function weaponLevelCost(level) {
+  return 100 * level;
+}
+
+/**
+ * Derived stats for a weapon definition at a level (clamped 1..10):
+ *   damage      = baseDamage + damagePerLevel * (level-1)
+ *                 — except the Blaster, whose damage/rate come from the
+ *                 equipped ship when `shipStats` is passed (the def's
+ *                 nominal 1 / 2.0 are the fallback).
+ *   rate        = def.rate (Blaster: shipStats.blasterRate when given).
+ *   pierce      = extra enemies a bolt passes through after its first
+ *                 hit: Laser 1 + floor((level-1)/4) (1 at Lv 1 → 3 at
+ *                 Lv 10); 0 for the others (Blaster: 0).
+ *   blastRadius = Mortar 60 + floor(20*(level-1)/9) (60 → 80 by Lv 10).
+ *   chains      = Pulse 1 + floor((level-1)/3) (1 → 4 by Lv 10).
+ *   shells      = Mortar 2 from Lv 5, else 1.
+ * Always returns { damage, rate, range, pierce, blastRadius, chains,
+ * shells, level }.
+ */
+function weaponStats(def, level, shipStats) {
+  const lv = Math.max(1, Math.min(WEAPON_LEVEL_MAX, level || 1));
+  const stats = {
+    damage: def.baseDamage + (def.damagePerLevel ?? 0) * (lv - 1),
+    rate: def.rate,
+    range: def.range,
+    pierce: 0,
+    blastRadius: 0,
+    chains: 0,
+    shells: 1,
+    level: lv,
+  };
+  if (def.id === 'blaster') {
+    if (shipStats) {
+      stats.damage = shipStats.blasterDamage ?? stats.damage;
+      stats.rate = shipStats.blasterRate ?? stats.rate;
+    }
+  } else if (def.id === 'mortar') {
+    stats.blastRadius = 60 + Math.floor((20 * (lv - 1)) / 9);
+    stats.shells = lv >= 5 ? 2 : 1;
+  } else if (def.id === 'laser') {
+    stats.pierce = 1 + Math.floor((lv - 1) / 4);
+  } else if (def.id === 'pulse') {
+    stats.chains = 1 + Math.floor((lv - 1) / 3);
+  }
+  return stats;
+}
+
+// --- Save shape (weapons live in save.weapons) ------------------------
+// save.weapons = { owned: { blaster: { level: 1 } }, equipped: 'blaster' }
+// Pilot level lives in save.pilot.level (Wave B owns pilot.js); read
+// it defensively as save.pilot?.level ?? 1 everywhere below.
+
+function weaponsOf(save) {
+  if (save && save.weapons && save.weapons.owned) return save.weapons;
+  return { owned: { blaster: { level: 1 } }, equipped: 'blaster' };
+}
+
+function pilotLevel(save) {
+  return (save && save.pilot && save.pilot.level) || 1;
+}
+
+/** Current level of a weapon (0 when not owned; Blaster is owned from the start). */
+function weaponLevel(save, id) {
+  const owned = weaponsOf(save).owned;
+  return (owned[id] && owned[id].level) || 0;
+}
+
+/** The equipped weapon's definition (defaults to BLASTER when unset). */
+function equippedWeapon(save) {
+  const id = weaponsOf(save).equipped || 'blaster';
+  return weaponById(id) || weaponById('blaster');
+}
+
+/**
+ * Can this weapon be bought right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
+ * | 'unknown'. Locked = pilot level < unlockPilotLevel.
+ */
+function canBuyWeapon(save, id) {
+  const def = weaponById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  if (weaponLevel(save, id) > 0) return { ok: false, reason: 'owned' };
+  if (pilotLevel(save) < def.unlockPilotLevel) return { ok: false, reason: 'locked' };
+  if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
+  return { ok: true, cost: def.price };
+}
+
+/**
+ * Buy a weapon. Deducts the price from save.coins, owns it at Lv 1
+ * and equips it. Returns { ok: true, cost, level: 1 } or the canBuy
+ * reason.
+ */
+function buyWeapon(save, id) {
+  const check = canBuyWeapon(save, id);
+  if (!check.ok) return check;
+  if (!save.weapons) save.weapons = { owned: {}, equipped: 'blaster' };
+  if (!save.weapons.owned) save.weapons.owned = {};
+  save.coins = (save.coins ?? 0) - check.cost;
+  save.weapons.owned[id] = { level: 1 };
+  save.weapons.equipped = id;
+  return { ok: true, cost: check.cost, level: 1 };
+}
+
+/**
+ * Can this weapon be levelled up right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
+ * 'broke' | 'unknown'.
+ */
+function canLevelWeapon(save, id) {
+  const def = weaponById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const level = weaponLevel(save, id);
+  if (level === 0) return { ok: false, reason: 'not-owned' };
+  if (level >= WEAPON_LEVEL_MAX) return { ok: false, reason: 'maxed' };
+  const cost = weaponLevelCost(level);
+  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Level a weapon up one level. Deducts weaponLevelCost(level) from
+ * save.coins. Returns { ok: true, cost, level } or the reason.
+ */
+function levelUpWeapon(save, id) {
+  const check = canLevelWeapon(save, id);
+  if (!check.ok) return check;
+  save.weapons.owned[id].level += 1;
+  save.coins = (save.coins ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.weapons.owned[id].level };
+}
+
+/**
+ * Equip an owned weapon. Returns { ok } or
+ * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
+ */
+function equipWeapon(save, id) {
+  if (!weaponById(id)) return { ok: false, reason: 'unknown' };
+  if (weaponLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
+  if (!save.weapons) save.weapons = { owned: {}, equipped: 'blaster' };
+  save.weapons.equipped = id;
+  return { ok: true };
+}
+
+// --- Targeting ---------------------------------------------------------
 
 function distTo(ship, t) {
   return Math.hypot(t.x - ship.x, t.y - ship.y);
 }
 
 /**
- * Nearest target for the Blaster, in priority order:
+ * Nearest target, in priority order:
  *   1. an enemy bullet (magenta orb) inside BULLET_DEFENSE_RADIUS —
  *      self-defense: the orb about to hit the ship is shot first;
- *   2. the nearest enemy or boss inside BLASTER.range;
- *   3. the nearest enemy bullet inside BLASTER.range (idle cleanup).
- * Returns { x, y, kind, ref } or null. Bullet targets carry
- * kind 'enemyBullet' and ref the orb object (1 HP — see updateBullets).
+ *   2. the nearest enemy or boss inside `range`;
+ *   3. the nearest enemy bullet inside `range` (idle cleanup).
+ * `range` defaults to BLASTER.range. Returns { x, y, kind, ref } or
+ * null. Bullet targets carry kind 'enemyBullet' and ref the orb
+ * object (1 HP — see updateBullets).
  */
-function nearestTarget(state) {
+function nearestTarget(state, range = BLASTER.range) {
   const ship = state.ship;
   if (!ship) return null;
   let closeBullet = null;
@@ -589,7 +923,7 @@ function nearestTarget(state) {
   }
   if (closeBullet) return closeBullet;
   let best = null;
-  let bestDist = BLASTER.range;
+  let bestDist = range;
   for (const enemy of state.enemies || []) {
     const d = distTo(ship, enemy);
     if (d <= bestDist) {
@@ -605,7 +939,7 @@ function nearestTarget(state) {
   }
   if (best) return best;
   let farBullet = null;
-  let farDist = BLASTER.range;
+  let farDist = range;
   for (const b of state.enemyBullets || []) {
     const d = distTo(ship, b);
     if (d <= farDist) {
@@ -616,37 +950,294 @@ function nearestTarget(state) {
   return farBullet;
 }
 
+// --- Firing ------------------------------------------------------------
+
+function hitRadius(target) {
+  return target.radius ?? target.r ?? 15;
+}
+
+function blasterCooldownLeft(state) {
+  return state.blasterCooldown ?? state.weaponCooldown ?? 0;
+}
+
+function weaponCooldownLeft(state) {
+  return state.weaponCooldown ?? state.blasterCooldown ?? 0;
+}
+
+function setCooldown(state, rate) {
+  const cd = 1 / rate;
+  state.weaponCooldown = cd;
+  state.blasterCooldown = cd;
+}
+
+/** +25% damage while at full hearts with the Overdrive chip, else 1x. */
+function overdriveMult(state) {
+  if (!state.chipEffects?.overdrive) return 1;
+  if (typeof state.maxHearts !== 'number') return 1;
+  return (state.hearts ?? 0) >= state.maxHearts ? 1.25 : 1;
+}
+
+function pushBullet(state, bullet) {
+  if (!state.bullets) state.bullets = [];
+  state.bullets.push(bullet);
+}
+
+function aimAt(state, target, speed) {
+  const dx = target.x - state.ship.x;
+  const dy = target.y - state.ship.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return { vx: (dx / len) * speed, vy: (dy / len) * speed };
+}
+
 /**
  * Fire one blaster bolt at the nearest target, when the cooldown has
  * expired and a target exists. The bolt starts at the ship and flies
  * toward the target at BLASTER.bulletSpeed, carrying the ship's
- * blaster damage. Sets state.blasterCooldown = 1 / blasterRate.
- * Returns true when a bolt was fired, false otherwise.
+ * blaster damage (times the Overdrive multiplier when active).
+ * Sets both state.blasterCooldown and state.weaponCooldown to
+ * 1 / blasterRate. Returns true when a bolt was fired, false otherwise.
  */
 function fireBlaster(state) {
-  if ((state.blasterCooldown ?? 0) > 0) return false;
+  if (blasterCooldownLeft(state) > 0) return false;
   const target = nearestTarget(state);
   if (!target) return false;
-  const dx = target.x - state.ship.x;
-  const dy = target.y - state.ship.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const speed = BLASTER.bulletSpeed;
   const stats = state.shipStats || {};
-  if (!state.bullets) state.bullets = [];
-  state.bullets.push({
+  const damage = (stats.blasterDamage ?? 1) * overdriveMult(state);
+  const { vx, vy } = aimAt(state, target, BLASTER.bulletSpeed);
+  pushBullet(state, {
     x: state.ship.x,
     y: state.ship.y,
-    vx: (dx / len) * speed,
-    vy: (dy / len) * speed,
-    damage: stats.blasterDamage ?? 1,
+    vx, vy,
+    damage,
     radius: BLASTER.bulletRadius,
+    kind: 'bolt',
+    pierce: 1 + (state.chipEffects?.pierce ?? 0),
+    hitRefs: [],
   });
-  state.blasterCooldown = 1 / (stats.blasterRate ?? 2);
+  setCooldown(state, stats.blasterRate ?? 2);
   return true;
 }
 
-function hitRadius(target) {
-  return target.radius ?? target.r ?? 15;
+function fireMortar(state, level) {
+  if (weaponCooldownLeft(state) > 0) return false;
+  const def = weaponById('mortar');
+  const stats = weaponStats(def, level);
+  const target = nearestTarget(state, stats.range);
+  if (!target) return false;
+  const damage = stats.damage * overdriveMult(state);
+  const baseAngle = Math.atan2(target.y - state.ship.y, target.x - state.ship.x);
+  // Two shells (Lv 5+) fan out slightly so they do not stack on one line.
+  const spread = stats.shells > 1 ? [-0.1, 0.1] : [0];
+  for (const off of spread) {
+    const angle = baseAngle + off;
+    pushBullet(state, {
+      x: state.ship.x,
+      y: state.ship.y,
+      vx: Math.cos(angle) * def.bulletSpeed,
+      vy: Math.sin(angle) * def.bulletSpeed,
+      damage,
+      radius: def.bulletRadius,
+      kind: 'shell',
+      blastRadius: stats.blastRadius,
+      dist: 0,
+      maxDist: stats.range,
+    });
+  }
+  setCooldown(state, stats.rate);
+  return true;
+}
+
+function fireLaser(state, level) {
+  if (weaponCooldownLeft(state) > 0) return false;
+  const def = weaponById('laser');
+  const stats = weaponStats(def, level);
+  const target = nearestTarget(state, stats.range);
+  if (!target) return false;
+  const damage = stats.damage * overdriveMult(state);
+  const { vx, vy } = aimAt(state, target, def.bulletSpeed);
+  pushBullet(state, {
+    x: state.ship.x,
+    y: state.ship.y,
+    vx, vy,
+    damage,
+    radius: def.bulletRadius,
+    kind: 'laser',
+    pierce: 1 + stats.pierce + (state.chipEffects?.pierce ?? 0),
+    hitRefs: [],
+  });
+  setCooldown(state, stats.rate);
+  return true;
+}
+
+function pushPulseFx(state, x1, y1, x2, y2) {
+  if (!state.pulseFx) state.pulseFx = [];
+  state.pulseFx.push({ x1, y1, x2, y2, ttl: PULSE_FX_TTL });
+}
+
+function firePulse(state, level) {
+  if (weaponCooldownLeft(state) > 0) return false;
+  const def = weaponById('pulse');
+  const stats = weaponStats(def, level);
+  const first = nearestTarget(state, stats.range);
+  if (!first) return false;
+  const mult = overdriveMult(state);
+  const hitRefs = [first.ref];
+  pushPulseFx(state, state.ship.x, state.ship.y, first.x, first.y);
+  applyPulseHit(state, first, stats.damage * mult);
+  let from = first;
+  for (let jump = 0; jump < stats.chains; jump += 1) {
+    const next = nearestChainTarget(state, from, hitRefs);
+    if (!next) break;
+    hitRefs.push(next.ref);
+    pushPulseFx(state, from.x, from.y, next.x, next.y);
+    applyPulseHit(state, next, stats.damage * 0.7 * mult);
+    from = next;
+  }
+  setCooldown(state, stats.rate);
+  return true;
+}
+
+/** Nearest enemy/boss/orb within CHAIN_RADIUS of `from`, excluding already-hit refs. */
+function nearestChainTarget(state, from, hitRefs) {
+  let best = null;
+  let bestDist = CHAIN_RADIUS;
+  const consider = (x, y, kind, ref) => {
+    if (hitRefs.includes(ref)) return;
+    const d = Math.hypot(x - from.x, y - from.y);
+    if (d <= bestDist) {
+      bestDist = d;
+      best = { x, y, kind, ref };
+    }
+  };
+  for (const enemy of state.enemies || []) consider(enemy.x, enemy.y, enemy.kind || 'drifter', enemy);
+  if (state.boss) consider(state.boss.x, state.boss.y, state.boss.kind || 'boss', state.boss);
+  for (const orb of state.enemyBullets || []) consider(orb.x, orb.y, 'enemyBullet', orb);
+  return best;
+}
+
+/** Apply one pulse hit: enemies take damage (kills score, chain spark may fire), the boss loses hp, orbs pop. */
+function applyPulseHit(state, target, damage) {
+  const effects = state.chipEffects ?? null;
+  if (target.kind === 'enemyBullet') {
+    destroyOrb(state, target.ref, null, effects);
+  } else if (target.ref === state.boss) {
+    state.boss.hp -= damage;
+  } else {
+    damageEnemy(state, target.ref, damage, null, true, effects);
+  }
+}
+
+/**
+ * Fire the equipped weapon (state.weaponId, default 'blaster').
+ * Weapon level comes from state.weaponLevels[id] (default 1 — Wave C
+ * fills it from save.weapons). Blaster delegates to fireBlaster.
+ * Sets both cooldown fields. Returns true when a shot fired.
+ */
+function fireWeapon(state) {
+  const id = state.weaponId ?? 'blaster';
+  const def = weaponById(id);
+  if (!def) return false;
+  const level = (state.weaponLevels && state.weaponLevels[id]) || 1;
+  if (id === 'blaster') return fireBlaster(state);
+  if (id === 'mortar') return fireMortar(state, level);
+  if (id === 'laser') return fireLaser(state, level);
+  if (id === 'pulse') return firePulse(state, level);
+  return false;
+}
+
+// --- Bullet updates ----------------------------------------------------
+
+function rollRandom(state) {
+  const r = state.random;
+  if (typeof r === 'function') return r();
+  if (r && typeof r.next === 'function') return r.next();
+  return Math.random();
+}
+
+/** Destroy one enemy bullet (orb). With the Bullet Ward chip, grants a shield (see header). */
+function destroyOrb(state, orb, burst, effects) {
+  const orbs = state.enemyBullets || [];
+  const idx = orbs.indexOf(orb);
+  if (idx < 0) return false;
+  orbs.splice(idx, 1);
+  if (burst) burst(orb.x, orb.y);
+  if (effects?.bulletWard) {
+    state.shield = true;
+    state.shieldTimer = 2;
+  }
+  return true;
+}
+
+/**
+ * Damage one enemy; on death remove it, award its kill points (plus a
+ * floater and gate progress), and — when allowChainSpark and the Chain
+ * Spark chip is equipped — roll to chain 1 damage to the nearest
+ * other enemy within CHAIN_RADIUS (with a pulseFx segment). A
+ * chain-spark kill never chains again.
+ */
+function damageEnemy(state, enemy, damage, burst, allowChainSpark, effects) {
+  if (!state.enemies || !state.enemies.includes(enemy)) return false;
+  enemy.hp -= damage;
+  if (burst) burst(enemy.x, enemy.y);
+  if (enemy.hp > 0) return false;
+  const idx = state.enemies.indexOf(enemy);
+  if (idx >= 0) state.enemies.splice(idx, 1);
+  const points = ENEMY_KILL_POINTS[enemy.kind] ?? 25;
+  state.score = (state.score ?? 0) + points;
+  if (!state.floaters) state.floaters = [];
+  state.floaters.push({ x: enemy.x, y: enemy.y, text: `+${points}` });
+  if (typeof state.stageTarget === 'number' && state.stageTarget > 0) {
+    state.gateProgress = Math.min(1, state.score / state.stageTarget);
+  }
+  if (allowChainSpark && (effects?.chainSpark ?? 0) > 0 && rollRandom(state) < effects.chainSpark) {
+    let best = null;
+    let bestDist = CHAIN_RADIUS;
+    for (const other of state.enemies) {
+      const d = Math.hypot(other.x - enemy.x, other.y - enemy.y);
+      if (d <= bestDist) {
+        bestDist = d;
+        best = other;
+      }
+    }
+    if (best) {
+      pushPulseFx(state, enemy.x, enemy.y, best.x, best.y);
+      damageEnemy(state, best, 1, burst, false, effects);
+    }
+  }
+  return true;
+}
+
+/** A shell bursts: everything within blastRadius takes its damage (enemies, boss, orbs). */
+function explodeShell(state, shell, burst, effects) {
+  const radius = shell.blastRadius ?? 60;
+  if (burst) burst(shell.x, shell.y);
+  for (const enemy of [...(state.enemies || [])]) {
+    if (Math.hypot(enemy.x - shell.x, enemy.y - shell.y) <= radius + hitRadius(enemy)) {
+      damageEnemy(state, enemy, shell.damage, burst, true, effects);
+    }
+  }
+  if (state.boss && Math.hypot(state.boss.x - shell.x, state.boss.y - shell.y) <= radius + hitRadius(state.boss)) {
+    state.boss.hp -= shell.damage;
+    if (burst) burst(state.boss.x, state.boss.y);
+  }
+  for (const orb of [...(state.enemyBullets || [])]) {
+    if (Math.hypot(orb.x - shell.x, orb.y - shell.y) <= radius + (orb.radius ?? 6)) {
+      destroyOrb(state, orb, burst, effects);
+    }
+  }
+}
+
+/**
+ * Consume one hit of a piercing bolt/laser: record the ref so the
+ * same target is never hit twice, decrement pierce, and return true
+ * when the bolt is spent.
+ */
+function consumePierce(bullet, ref) {
+  if (typeof bullet.pierce !== 'number') return true;
+  if (!bullet.hitRefs) bullet.hitRefs = [];
+  bullet.hitRefs.push(ref);
+  bullet.pierce -= 1;
+  return bullet.pierce <= 0;
 }
 
 /**
@@ -659,43 +1250,71 @@ function hitRadius(target) {
  * watches state.boss.hp <= 0). A hit on an enemy bullet (magenta orb)
  * destroys the orb with a spark and no score — shooting orbs is
  * defensive, not a farm. `burst` is an optional (x, y) callback.
+ *
+ * Extended for the stage-2 roster (bullet.kind 'bolt' | 'shell' |
+ * 'laser'; bullets without a kind behave as plain 'bolt's):
+ *   bolt/laser: pierce — bullet.pierce is the remaining hits (1 for a
+ *     plain bolt); each hit consumes one and the bolt is spent at 0.
+ *     A bolt never hits the same target twice (bullet.hitRefs).
+ *   shell: bursts on impact (AoE damage within bullet.blastRadius)
+ *     and on fuse expiry (bullet.dist >= bullet.maxDist). Offscreen
+ *     shells just despawn.
+ * Also decays state.pulseFx entries by dt.
  */
 function updateBullets(state, dt, burst) {
   const width = state.width ?? FIELD.width;
   const height = state.height ?? FIELD.height;
   const margin = 60;
+  const effects = state.chipEffects ?? null;
+  if (state.pulseFx) {
+    state.pulseFx = state.pulseFx
+      .map((seg) => ({ ...seg, ttl: seg.ttl - dt }))
+      .filter((seg) => seg.ttl > 0);
+  }
   const bullets = state.bullets || [];
   const kept = [];
   for (const b of bullets) {
     b.x += b.vx * dt;
     b.y += b.vy * dt;
+    if (typeof b.dist === 'number') b.dist += Math.hypot(b.vx, b.vy) * dt;
     if (b.x < -margin || b.x > width + margin || b.y < -margin || b.y > height + margin) continue;
     let spent = false;
-    for (const enemy of state.enemies || []) {
-      if (Math.hypot(enemy.x - b.x, enemy.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(enemy)) {
-        enemy.hp -= b.damage;
-        if (burst) burst(b.x, b.y);
-        if (enemy.hp <= 0) {
-          const idx = state.enemies.indexOf(enemy);
-          if (idx >= 0) state.enemies.splice(idx, 1);
-          const points = ENEMY_KILL_POINTS[enemy.kind] ?? 25;
-          state.score = (state.score ?? 0) + points;
-          if (!state.floaters) state.floaters = [];
-          state.floaters.push({ x: enemy.x, y: enemy.y, text: `+${points}` });
-          if (typeof state.stageTarget === 'number' && state.stageTarget > 0) {
-            state.gateProgress = Math.min(1, state.score / state.stageTarget);
+    // Shell fuse expiry: burst where the shell ends its flight.
+    if (!spent && b.kind === 'shell' && typeof b.dist === 'number'
+      && typeof b.maxDist === 'number' && b.dist >= b.maxDist) {
+      explodeShell(state, b, burst, effects);
+      spent = true;
+    }
+    // Enemies first (snapshot: kills splice state.enemies mid-loop).
+    if (!spent) {
+      for (const enemy of [...(state.enemies || [])]) {
+        if (spent) break;
+        if (!state.enemies.includes(enemy)) continue;
+        if (b.hitRefs && b.hitRefs.includes(enemy)) continue;
+        if (Math.hypot(enemy.x - b.x, enemy.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(enemy)) {
+          if (b.kind === 'shell') {
+            explodeShell(state, b, burst, effects);
+            spent = true;
+            break;
           }
+          damageEnemy(state, enemy, b.damage, burst, true, effects);
+          spent = consumePierce(b, enemy);
         }
-        spent = true;
-        break;
       }
     }
+    // Then the boss.
     if (!spent && state.boss) {
       const boss = state.boss;
-      if (Math.hypot(boss.x - b.x, boss.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(boss)) {
-        boss.hp -= b.damage;
-        if (burst) burst(b.x, b.y);
-        spent = true;
+      if (!(b.hitRefs && b.hitRefs.includes(boss))
+        && Math.hypot(boss.x - b.x, boss.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + hitRadius(boss)) {
+        if (b.kind === 'shell') {
+          explodeShell(state, b, burst, effects);
+          spent = true;
+        } else {
+          boss.hp -= b.damage;
+          if (burst) burst(b.x, b.y);
+          spent = consumePierce(b, boss);
+        }
       }
     }
     // Last: an enemy bullet (magenta orb) is 1 HP — the bolt pops it
@@ -703,19 +1322,208 @@ function updateBullets(state, dt, burst) {
     // first, so one bolt never wastes itself on an orb in their way.
     if (!spent) {
       const orbs = state.enemyBullets || [];
-      for (let i = 0; i < orbs.length; i += 1) {
-        const orb = orbs[i];
+      for (const orb of [...orbs]) {
+        if (spent) break;
+        if (!orbs.includes(orb)) continue;
+        if (b.hitRefs && b.hitRefs.includes(orb)) continue;
         if (Math.hypot(orb.x - b.x, orb.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + (orb.radius ?? 6)) {
-          orbs.splice(i, 1);
-          if (burst) burst(b.x, b.y);
-          spent = true;
-          break;
+          if (b.kind === 'shell') {
+            explodeShell(state, b, burst, effects);
+            spent = true;
+            break;
+          }
+          destroyOrb(state, orb, burst, effects);
+          spent = consumePierce(b, orb);
         }
       }
     }
     if (!spent) kept.push(b);
   }
   state.bullets = kept;
+}
+
+// ---- src/ships.js ----
+// Lumen Drift — the ship shop: six ships, their levels, and the coin
+// economy. Pure logic: every function takes the save and returns plain
+// data or a { ok } / { ok: false, reason } result, like hangar.js.
+// Coins are save.coins (spendable); shards (shardBalance) are untouched.
+//
+// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
+// ship level + a better ship. A ship's level is bought with coins in
+// the shop (cap Lv 10); each level boosts stats, so the loop is:
+// clear stages -> earn coins -> level up / buy a better ship -> clear
+// higher stages.
+//
+// Unique power (Stage 2, Spekter "Agents" model): each ship has ONE
+// power beyond its base stats — the thing that makes it play
+// differently, not just bigger numbers. Powers never duplicate a
+// hangar part or a chip (no dash-recharge power, no start-with-shield,
+// no pierce, no drone — those live elsewhere).
+const SHIP_LEVEL_MAX = 10;
+
+const SHIPS = [
+  {
+    id: 'spark', name: 'SPARK', rarity: 'common', unlockStage: 0, price: 0,
+    hearts: 3, speedMult: 1.00, blasterDamage: 1, blasterRate: 2.0,
+    shape: 'skiff', desc: 'The starter skiff. Reliable, nothing fancy.',
+    power: { id: 'second-wind', name: 'SECOND WIND', desc: 'Survive a fatal hit once per run at 1 heart.' },
+  },
+  {
+    id: 'comet', name: 'COMET', rarity: 'common', unlockStage: 3, price: 150,
+    hearts: 3, speedMult: 1.05, blasterDamage: 1, blasterRate: 2.2,
+    shape: 'dart', desc: 'A quick dart. Fires a little faster.',
+    power: { id: 'dual-dash', name: 'DUAL DASH', desc: 'Dash twice before recharging.' },
+  },
+  {
+    id: 'nebula', name: 'NEBULA', rarity: 'rare', unlockStage: 10, price: 500,
+    hearts: 4, speedMult: 1.10, blasterDamage: 2, blasterRate: 2.2,
+    shape: 'wing', desc: 'A winged cruiser with a heavier blaster.',
+    power: { id: 'slow-field', name: 'SLOW FIELD', desc: 'Enemies within 120 px move 25% slower.' },
+  },
+  {
+    id: 'pulsar', name: 'PULSAR', rarity: 'epic', unlockStage: 25, price: 1500,
+    hearts: 4, speedMult: 1.15, blasterDamage: 2, blasterRate: 2.6,
+    shape: 'dart', desc: 'An epic dart that spits blaster fire.',
+    power: { id: 'rapid-fire', name: 'RAPID FIRE', desc: 'Weapon fires 20% faster.' },
+  },
+  {
+    id: 'aurora', name: 'AURORA', rarity: 'legendary', unlockStage: 50, price: 4000,
+    hearts: 5, speedMult: 1.20, blasterDamage: 3, blasterRate: 2.6,
+    shape: 'wing', desc: 'A legendary wing — the stage-50 gate-breaker.',
+    power: { id: 'renewal', name: 'RENEWAL', desc: 'Regain 1 heart when a stage is cleared.' },
+  },
+  {
+    id: 'novaprime', name: 'NOVA PRIME', rarity: 'mythic', unlockStage: 75, price: 8000,
+    hearts: 6, speedMult: 1.25, blasterDamage: 4, blasterRate: 3.0,
+    shape: 'skiff', desc: 'The mythic skiff. The final storm fears it.',
+    power: { id: 'nova-dash', name: 'NOVA DASH', desc: 'Dashing through an enemy deals 1 damage.' },
+  },
+];
+
+/** Every ship's unique power, as { ship, id, name, desc }. */
+const SHIP_POWERS = SHIPS.map((s) => ({ ship: s.id, ...s.power }));
+
+function shipById(id) {
+  return SHIPS.find((s) => s.id === id) || null;
+}
+
+/** A ship's unique power def (or null for a power-less def). */
+function shipPowerById(id) {
+  const def = shipById(id);
+  return (def && def.power) || null;
+}
+
+/** The ship that carries power `powerId` (or null). */
+function shipForPower(powerId) {
+  return SHIPS.find((s) => s.power && s.power.id === powerId) || null;
+}
+
+/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
+function shipLevelCost(level) {
+  return 100 * level;
+}
+
+/**
+ * Derived stats for a ship definition at a level:
+ * hearts +1 at Lv 5 and Lv 10, +2% speed per level, +1 blaster damage
+ * per level (flat), blaster rate unchanged.
+ */
+function shipStats(def, level) {
+  return {
+    hearts: def.hearts + (level >= 5 ? 1 : 0) + (level >= 10 ? 1 : 0),
+    speedMult: def.speedMult * (1 + 0.02 * (level - 1)),
+    blasterDamage: def.blasterDamage + (level - 1),
+    blasterRate: def.blasterRate,
+    level,
+  };
+}
+
+/** Current level of a ship (0 when not owned). */
+function shipLevel(save, id) {
+  return (save && save.ships && save.ships.owned && save.ships.owned[id]
+    && save.ships.owned[id].level) || 0;
+}
+
+/** The equipped ship's definition (defaults to SPARK when unset). */
+function equippedShip(save) {
+  const id = (save && save.ships && save.ships.equipped) || 'spark';
+  return shipById(id) || shipById('spark');
+}
+
+/** Derived stats of the equipped ship at its owned level. */
+function equippedShipStats(save) {
+  const def = equippedShip(save);
+  return shipStats(def, Math.max(1, shipLevel(save, def.id)));
+}
+
+/**
+ * Can this ship be bought right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
+ * | 'unknown'. Locked = highestCleared < unlockStage (spark, unlock 0,
+ * is always available; it starts owned).
+ */
+function canBuyShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) > 0) return { ok: false, reason: 'owned' };
+  if ((save.highestCleared || 0) < def.unlockStage) return { ok: false, reason: 'locked' };
+  if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
+  return { ok: true, cost: def.price };
+}
+
+/**
+ * Buy a ship. Deducts the price from save.coins, owns it at Lv 1 and
+ * equips it. Returns { ok: true, cost, level: 1 } or the canBuy reason.
+ */
+function buyShip(save, id) {
+  const check = canBuyShip(save, id);
+  if (!check.ok) return check;
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  if (!save.ships.owned) save.ships.owned = {};
+  save.coins = (save.coins ?? 0) - check.cost;
+  save.ships.owned[id] = { level: 1 };
+  save.ships.equipped = id;
+  return { ok: true, cost: check.cost, level: 1 };
+}
+
+/**
+ * Can this ship be levelled up right now? Returns { ok } or
+ * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
+ * 'broke' | 'unknown'.
+ */
+function canLevelShip(save, id) {
+  const def = shipById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const level = shipLevel(save, id);
+  if (level === 0) return { ok: false, reason: 'not-owned' };
+  if (level >= SHIP_LEVEL_MAX) return { ok: false, reason: 'maxed' };
+  const cost = shipLevelCost(level);
+  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
+  return { ok: true, cost };
+}
+
+/**
+ * Level a ship up one level. Deducts shipLevelCost(level) from
+ * save.coins. Returns { ok: true, cost, level } or the reason.
+ */
+function levelUpShip(save, id) {
+  const check = canLevelShip(save, id);
+  if (!check.ok) return check;
+  save.ships.owned[id].level += 1;
+  save.coins = (save.coins ?? 0) - check.cost;
+  return { ok: true, cost: check.cost, level: save.ships.owned[id].level };
+}
+
+/**
+ * Equip an owned ship. Returns { ok } or
+ * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
+ */
+function equipShip(save, id) {
+  if (!shipById(id)) return { ok: false, reason: 'unknown' };
+  if (shipLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
+  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
+  save.ships.equipped = id;
+  return { ok: true };
 }
 
 // ---- src/world.js ----
@@ -789,8 +1597,30 @@ function makeShip() {
   };
 }
 
-function createWorld(random, hangarLevels = {}, shipStats = null) {
+// No chip equipped: every effect off (chipEffectsFor returns this
+// shape too — see chips.js).
+function zeroChipEffects() {
+  return {
+    pierce: 0,
+    dashMine: false,
+    shardBonus: 0,
+    dashCooldownMult: 1,
+    chainSpark: 0,
+    bulletWard: false,
+    heartSiphon: 0,
+    overdrive: false,
+  };
+}
+
+function freshRunStats() {
+  return { kills: 0, bulletsDestroyed: 0, bossKilled: false, noDamage: true };
+}
+
+function createWorld(random, hangarLevels = {}, shipStats = null, loadout = {}) {
   const state = {
+    // The seeded random source, kept on state so weapons.js can roll
+    // the Chain Spark chance deterministically (state.random).
+    random,
     time: 0,
     score: 0,
     bestCombo: 0,
@@ -832,6 +1662,40 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     enemyBullets: [],
     boss: null,
     blasterCooldown: 0,
+    // The equipped weapon (Wave A roster): id, level, and every owned
+    // weapon's level — fireWeapon reads weaponLevels[id].
+    weaponId: 'blaster',
+    weaponLevel: 1,
+    weaponLevels: { blaster: 1 },
+    weaponCooldown: 0,
+    // The equipped ship's unique power (ships.js) and its id.
+    shipId: 'spark',
+    powerId: 'second-wind',
+    // Slotted chips' live effects (chips.js chipEffectsFor). Pierce,
+    // Overdrive, Chain Spark and Bullet Ward are applied inside
+    // weapons.js from this object; the world applies the rest.
+    chipEffects: zeroChipEffects(),
+    // Chain-lightning visuals (pulseFx segments, ttl-decayed by
+    // updateBullets) and dash mines (traps: {x, y, r, damage, ttl}).
+    pulseFx: [],
+    traps: [],
+    // Bullet Ward (chip): weapons.js sets shield + shieldTimer = 2
+    // when an orb is destroyed. wardShield marks the current shield
+    // as the ward's — only the ward's shield is cleared when the
+    // timer runs out (a cell / Aegis / hangar shield supersedes it).
+    shieldTimer: 0,
+    wardShield: false,
+    // Ship-power state: Second Wind used, dash charges (Dual Dash),
+    // per-dash Nova Dash hit set, shards since the last Heart Siphon
+    // heal, and the per-run counters for XP / achievements.
+    secondWindUsed: false,
+    dashCharges: 1,
+    dashMaxCharges: 1,
+    novaHit: new Set(),
+    shardsSinceHeal: 0,
+    runStats: freshRunStats(),
+    // Merged in-run upgrades (upgrades.js MERGES), cleared per run.
+    merged: {},
     cleared: false,
     bossSpawnTimer: 0,
     particles: [],
@@ -854,6 +1718,10 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     hitTimes: [],
     lastMercyAt: -999,
   };
+
+  // The loadout (weapon, chips, ship) applies on top of the defaults
+  // above; setLoadout is hoisted, so this runs before any step.
+  setLoadout(loadout);
 
   // Three parallax star layers, seeded once per world.
   for (let layer = 0; layer < 3; layer += 1) {
@@ -933,6 +1801,50 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
         color,
       });
     }
+  }
+
+  // Damage one enemy outside the bullet path (Nova Dash, dash-mine
+  // traps, chain lightning): same kill handling as weapons.js —
+  // remove it, award its kill points plus a floater and gate
+  // progress, count the kill for the run stats. A kill may chain
+  // (Chain Spark chip): the chained hit never chains again.
+  function damageEnemy(enemy, dmg, allowChain = true) {
+    const idx = state.enemies.indexOf(enemy);
+    if (idx < 0) return false;
+    enemy.hp -= dmg;
+    if (enemy.hp > 0) return false;
+    state.enemies.splice(idx, 1);
+    const points = ENEMY_KILL_POINTS[enemy.kind] ?? 25;
+    state.score += points;
+    state.runStats.kills += 1;
+    state.floaters.push({ x: enemy.x, y: enemy.y, text: `+${points}` });
+    if (typeof state.stageTarget === 'number' && state.stageTarget > 0) {
+      state.gateProgress = Math.min(1, state.score / state.stageTarget);
+    }
+    if (allowChain && (state.chipEffects?.chainSpark ?? 0) > 0) {
+      const roll = state.random && typeof state.random.next === 'function'
+        ? state.random.next()
+        : Math.random();
+      if (roll < state.chipEffects.chainSpark) {
+        let best = null;
+        let bestDist = CHAIN_RADIUS;
+        for (const other of state.enemies) {
+          const d = Math.hypot(other.x - enemy.x, other.y - enemy.y);
+          if (d <= bestDist) {
+            bestDist = d;
+            best = other;
+          }
+        }
+        if (best) {
+          state.pulseFx.push({
+            x1: enemy.x, y1: enemy.y, x2: best.x, y2: best.y, ttl: PULSE_FX_TTL,
+          });
+          burst(best.x, best.y, '#a78bfa', 8, 200);
+          damageEnemy(best, 1, false);
+        }
+      }
+    }
+    return true;
   }
 
   // Progress toward clearing the stage: score/target on a normal stage,
@@ -1195,6 +2107,19 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     state.enemyBullets = [];
     state.boss = null;
     state.blasterCooldown = 0;
+    state.weaponCooldown = 0;
+    state.shieldTimer = 0;
+    state.wardShield = false;
+    state.pulseFx = [];
+    state.traps = [];
+    state.secondWindUsed = false;
+    state.shardsSinceHeal = 0;
+    state.runStats = freshRunStats();
+    state.merged = {};
+    // Dash charges refill from the ship's power (Dual Dash: 2).
+    state.dashMaxCharges = state.powerId === 'dual-dash' ? 2 : 1;
+    state.dashCharges = state.dashMaxCharges;
+    state.novaHit = new Set();
     state.cleared = false;
     state.bossSpawnTimer = (isBossStage(state.stage) || isMidbossStage(state.stage))
       ? BOSS_SPAWN_DELAY
@@ -1232,6 +2157,12 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     // of the step, after every score change).
     const fireClear = () => {
       if (state.cleared) return;
+      // Renewal (AURORA): regain 1 heart on a stage clear (up to
+      // max). It matters because a clear can continue into endless
+      // on the same run — the healed heart carries over.
+      if (state.powerId === 'renewal') {
+        state.hearts = Math.min(state.maxHearts, state.hearts + 1);
+      }
       state.cleared = true;
       state.gateProgress = 1;
       events |= EVENT_CLEAR;
@@ -1251,6 +2182,23 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
       state.prevMagnetRadius = state.magnetRadius;
     }
     state.magnetFlash = Math.max(0, state.magnetFlash - dt);
+    // Bullet Ward (chip): weapons.js sets shield + shieldTimer = 2
+    // when an enemy bullet is destroyed. While the ward shield lives
+    // it holds the shield; when the timer runs out it clears ONLY
+    // the ward's shield — a shield from a cell, the Aegis pick or
+    // the hangar supersedes it (those set wardShield = false).
+    if ((state.shieldTimer ?? 0) > 0) {
+      state.shieldTimer -= dt;
+      if (state.shieldTimer <= 0) {
+        state.shieldTimer = 0;
+        if (state.wardShield) {
+          state.shield = false;
+          state.wardShield = false;
+        }
+      } else if (state.wardShield) {
+        state.shield = true;
+      }
+    }
     const ship = state.ship;
 
     // --- Spawning ---------------------------------------------------------
@@ -1323,7 +2271,10 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
         ship.vy = (ship.vy / speed) * maxSpeed;
       }
     }
-    if (dash && ship.dashCooldown <= 0 && ship.dashTime <= 0) {
+    // A dash spends one charge (Dual Dash: 2). Charges recharge one
+    // at a time on the dash cooldown, so a second dash is ready
+    // sooner than a full recharge from empty.
+    if (dash && (state.dashCharges ?? 1) > 0 && ship.dashTime <= 0) {
       let dx = steer.x;
       let dy = steer.y;
       if (dx === 0 && dy === 0) {
@@ -1336,10 +2287,22 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
       ship.dashTime = SHIP.dashTime;
       ship.dashCooldown = effectiveDashCooldown(state);
       ship.invulnerable = Math.max(ship.invulnerable, SHIP.dashTime + 0.08);
+      state.dashCharges -= 1;
+      state.novaHit = new Set();
+      // Dash Mine (chip): leave a damaging mine at the dash start.
+      if (state.chipEffects?.dashMine) {
+        state.traps.push({ x: ship.x, y: ship.y, r: 36, damage: 2, ttl: 8 });
+      }
       events |= EVENT_DASH;
       burst(ship.x, ship.y, '#22d3ee', 10, 160);
     }
     ship.dashCooldown = Math.max(0, ship.dashCooldown - dt);
+    if (ship.dashCooldown <= 0 && (state.dashCharges ?? 1) < (state.dashMaxCharges ?? 1)) {
+      state.dashCharges += 1;
+      if (state.dashCharges < state.dashMaxCharges) {
+        ship.dashCooldown = effectiveDashCooldown(state);
+      }
+    }
     ship.invulnerable = Math.max(0, ship.invulnerable - dt);
     ship.x += ship.vx * dt;
     ship.y += ship.vy * dt;
@@ -1347,6 +2310,21 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     ship.y = Math.max(SHIP.radius, Math.min(FIELD.height - SHIP.radius, ship.y));
     if (Math.hypot(ship.vx, ship.vy) > 40) {
       ship.angle = Math.atan2(ship.vy, ship.vx);
+    }
+
+    // Nova Dash (NOVA PRIME): dashing through an enemy damages it
+    // (1 damage, once per enemy per dash — the novaHit set resets on
+    // every dash). The boss is not an enemy for this power.
+    if (state.powerId === 'nova-dash' && ship.dashTime > 0) {
+      if (!state.novaHit) state.novaHit = new Set();
+      for (const e of [...state.enemies]) {
+        if (state.novaHit.has(e)) continue;
+        if (Math.hypot(e.x - ship.x, e.y - ship.y) < SHIP.radius * 0.8 + e.radius * 0.85) {
+          state.novaHit.add(e);
+          burst(e.x, e.y, '#f472b6', 10, 200);
+          damageEnemy(e, 1);
+        }
+      }
     }
 
     // Engine trail: a fading ribbon behind the skiff.
@@ -1416,8 +2394,11 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
         e.vx += ((dx / d) * spd - e.vx) * 0.6 * dt;
         e.vy += ((dy / d) * spd - e.vy) * 0.6 * dt;
       }
-      e.x += e.vx * dt;
-      e.y += e.vy * dt;
+      // Slow Field (NEBULA): enemies within 120 px move 25% slower.
+      const slow = state.powerId === 'slow-field'
+        && Math.hypot(e.x - ship.x, e.y - ship.y) < 120 ? 0.75 : 1;
+      e.x += e.vx * dt * slow;
+      e.y += e.vy * dt * slow;
       e.spin += e.spinSpeed * dt;
       e.pulse += dt;
       e.age = (e.age ?? 0) + dt;
@@ -1481,16 +2462,62 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     state.enemies = state.enemies.filter((e) => !offscreen(e));
     state.enemyBullets = state.enemyBullets.filter((e) => !offscreen(e));
 
-    // --- Blaster ----------------------------------------------------------
-    // Auto-fires at the nearest enemy or boss in range — or at an enemy
-    // bullet when that is all there is to shoot; bullets resolve hits
-    // (and kill points) in updateBullets. A dead boss clears the stage.
+    // Dash mines (chip): traps decay, and an enemy touching one takes
+    // its damage — then the trap vanishes (single use).
+    for (const t of state.traps) t.ttl -= dt;
+    state.traps = state.traps.filter((t) => t.ttl > 0);
+    for (let ti = state.traps.length - 1; ti >= 0; ti -= 1) {
+      const trap = state.traps[ti];
+      let spentTrap = false;
+      for (const e of [...state.enemies]) {
+        if (Math.hypot(e.x - trap.x, e.y - trap.y) < trap.r + e.radius) {
+          burst(e.x, e.y, '#fb923c', 10, 200);
+          damageEnemy(e, trap.damage);
+          spentTrap = true;
+          break;
+        }
+      }
+      if (spentTrap) state.traps.splice(ti, 1);
+    }
+
+    // --- Weapons ----------------------------------------------------------
+    // Auto-fires the equipped weapon at the nearest enemy or boss in
+    // range — or at an enemy bullet when that is all there is to
+    // shoot. fireWeapon dispatches by state.weaponId (Blaster,
+    // Mortar, Laser, Pulse Beam) and applies the Overdrive chip and
+    // the Piercing Rounds chip itself. Rapid Fire (PULSAR) shortens
+    // the cooldown just set, whatever the weapon. Bullets resolve
+    // hits (and kill points) in updateBullets. A dead boss clears
+    // the stage. Kills and popped orbs in this section are counted
+    // for the run stats (snapshots: nothing else removes enemies or
+    // orbs between them).
     state.blasterCooldown = Math.max(0, (state.blasterCooldown ?? 0) - dt);
-    if (state.enemies.length > 0 || state.boss || state.enemyBullets.length > 0) fireBlaster(state);
+    state.weaponCooldown = state.blasterCooldown;
+    const enemiesBefore = state.enemies.length;
+    const orbsBefore = state.enemyBullets.length;
+    if (state.enemies.length > 0 || state.boss || state.enemyBullets.length > 0) {
+      const fired = fireWeapon(state);
+      if (fired && state.powerId === 'rapid-fire') {
+        state.weaponCooldown = (state.weaponCooldown ?? 0) / 1.2;
+        state.blasterCooldown = (state.blasterCooldown ?? 0) / 1.2;
+      }
+      state.blasterCooldown = state.weaponCooldown ?? state.blasterCooldown;
+    }
+    const wardTimerBefore = state.shieldTimer ?? 0;
     updateBullets(state, dt, (x, y) => burst(x, y, '#67e8f9', 8, 200));
+    const kills = Math.max(0, enemiesBefore - state.enemies.length);
+    const orbsPopped = Math.max(0, orbsBefore - state.enemyBullets.length);
+    if (kills > 0) state.runStats.kills += kills;
+    if (orbsPopped > 0) state.runStats.bulletsDestroyed += orbsPopped;
+    // Bullet Ward (chip): weapons.js sets shield + shieldTimer = 2
+    // when an orb is destroyed. The timer rising marks a fresh grant.
+    if ((state.shieldTimer ?? 0) > wardTimerBefore && state.chipEffects?.bulletWard) {
+      state.wardShield = true;
+    }
     if (state.boss && state.boss.hp <= 0) {
       burst(state.boss.x, state.boss.y, '#f472b6', 40, 420);
       state.boss = null;
+      state.runStats.bossKilled = true;
       fireClear();
     }
 
@@ -1542,6 +2569,17 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     collect(state.shards, SHIP.radius, (e) => {
       state.comboCount += 1;
       state.shardsCollected += 1;
+      // Heart Siphon (chip): every N shards collected restores 1
+      // heart (up to max). The counter caps at N while full, so the
+      // next shard after a hit heals at once.
+      const siphon = state.chipEffects?.heartSiphon ?? 0;
+      if (siphon > 0) {
+        state.shardsSinceHeal = Math.min((state.shardsSinceHeal ?? 0) + 1, siphon);
+        if (state.shardsSinceHeal >= siphon && state.hearts < state.maxHearts) {
+          state.hearts += 1;
+          state.shardsSinceHeal = 0;
+        }
+      }
       state.combo = Math.min(COMBO_MAX, 1 + Math.floor(state.comboCount / 3));
       state.bestCombo = Math.max(state.bestCombo, state.combo);
       // A golden shard pays a flat 30 (no combo multiplier) — the rare
@@ -1568,6 +2606,9 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     }
     collect(state.shields, SHIP.radius, (e) => {
       state.shield = true;
+      // A shield cell supersedes a ward shield (the ward timer keeps
+      // ticking, but its expiry must not clear this shield).
+      state.wardShield = false;
       burst(e.x, e.y, '#34d399', 14, 180);
       events |= EVENT_SHIELD;
     });
@@ -1604,10 +2645,26 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
       burst(ship.x, ship.y, '#f472b6', 22, 320);
       if (state.shield) {
         state.shield = false;
+        // A spent shield is spent — including a ward shield.
+        state.wardShield = false;
         ship.invulnerable = SHIP.invulnerableTime;
         events |= EVENT_SHIELD;
+      } else if (state.powerId === 'second-wind' && !state.secondWindUsed
+        && state.hearts - 1 <= 0) {
+        // Second Wind (SPARK): survive a fatal hit once per run at 1
+        // heart, with brief invulnerability. Still a hit — the combo
+        // resets and the flawless run ends — just not a death.
+        state.secondWindUsed = true;
+        state.hearts = 1;
+        state.runStats.noDamage = false;
+        ship.invulnerable = Math.max(ship.invulnerable, 2);
+        burst(ship.x, ship.y, '#fbbf24', 26, 320);
+        events |= EVENT_HIT;
+        state.hitTimes.push(state.time);
+        state.hitTimes = state.hitTimes.filter((t) => state.time - t <= DDA_HIT_WINDOW);
       } else {
         state.hearts -= 1;
+        state.runStats.noDamage = false;
         ship.invulnerable = SHIP.invulnerableTime;
         events |= EVENT_HIT;
         if (state.hearts <= 0) events |= EVENT_OVER;
@@ -1679,6 +2736,35 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     state.shipStats = { ...DEFAULT_SHIP_STATS, ...(stats || {}) };
   }
 
+  // Replace the loadout: the equipped weapon (id + level + every owned
+  // weapon's level for fireWeapon), the slotted chips' live effects,
+  // and the equipped ship (whose unique power resolves here).
+  // Everything here applies at once; hearts still apply on reset().
+  function setLoadout(loadout = {}) {
+    const weaponId = loadout.weaponId ?? state.weaponId ?? 'blaster';
+    const weaponLevel = loadout.weaponLevel ?? state.weaponLevel ?? 1;
+    state.weaponId = weaponId;
+    state.weaponLevel = weaponLevel;
+    if (loadout.weaponLevels && typeof loadout.weaponLevels === 'object') {
+      state.weaponLevels = { ...loadout.weaponLevels };
+    } else {
+      state.weaponLevels = { ...(state.weaponLevels || {}), [weaponId]: weaponLevel };
+    }
+    if (!state.weaponLevels.blaster) state.weaponLevels.blaster = 1;
+    state.chipEffects = loadout.chipEffects ?? state.chipEffects ?? zeroChipEffects();
+    const shipId = loadout.shipId ?? state.shipId ?? 'spark';
+    state.shipId = shipId;
+    state.powerId = (shipPowerById(shipId)?.id) ?? 'second-wind';
+    state.dashMaxCharges = state.powerId === 'dual-dash' ? 2 : 1;
+    state.dashCharges = Math.min(state.dashCharges ?? 1, state.dashMaxCharges);
+  }
+
+  // Per-run counters for XP and achievements (a copy — the live
+  // object keeps changing while the run goes on).
+  function getRunStats() {
+    return { ...state.runStats };
+  }
+
   // Play a stage: sets the stage and its score target (boss stages have
   // target 0 — they clear on the boss kill). The run itself starts on
   // the next reset(). A boss stage also re-arms its 1.5 s spawn timer.
@@ -1700,7 +2786,7 @@ function createWorld(random, hangarLevels = {}, shipStats = null) {
     refreshGateProgress();
   }
 
-  return { state, reset, step, burst, grantGrace, setHangar, setShip, setStage, spawnEnemy, enterEndless };
+  return { state, reset, step, burst, grantGrace, setHangar, setShip, setLoadout, getRunStats, setStage, spawnEnemy, enterEndless };
 }
 
 // ---- src/skins.js ----
@@ -2216,7 +3302,7 @@ function createAudio() {
 // rewards above the passive earn rate, finishing all three pays a bonus
 // chest (+100 shards), and one mission can be rerolled per day.
 const SAVE_KEY = 'lumen-drift-save';
-const SAVE_VERSION = 4;
+const SAVE_VERSION = 5;
 
 // Daily-reward calendar: shards per cycle day (day 7 is visibly best).
 const DAILY_REWARDS = [10, 15, 20, 30, 40, 50, 100];
@@ -2310,6 +3396,24 @@ function freshSave(today) {
     highestCleared: 0,
     // Owned ships: { owned: { spark: { level: 1 } }, equipped: 'spark' }.
     ships: { owned: { spark: { level: 1 } }, equipped: 'spark' },
+    // Pilot level / XP (see pilot.js): XP from every run, win or lose.
+    pilot: { xp: 0, level: 1 },
+    // Owned weapons (Wave A roster; Blaster only so far) and the
+    // equipped one. Weapon levels are bought with coins in the shop.
+    weapons: { owned: { blaster: { level: 1 } }, equipped: 'blaster' },
+    // Owned chips and the two slotted ones (a third slot unlocks at
+    // pilot level 10 — see PILOT_GATES in pilot.js).
+    chips: { owned: {}, slots: [null, null] },
+    // Achievements: unlocked[id] once earned, claimed[id] once the
+    // coin reward was paid out (see pilot.js).
+    achievements: { unlocked: {}, claimed: {} },
+    // Lifetime counters for achievements + the profile menu. Kept
+    // separate from `lifetime` (which predates them) so a v4 blob
+    // migrates with clean zeros instead of a guessed backfill.
+    stats: {
+      enemiesDestroyed: 0, bulletsDestroyed: 0, bossesKilled: 0,
+      stagesCleared: 0, totalScore: 0, runsPlayed: 0,
+    },
     // Permanent per-part ship upgrades (see hangar.js).
     hangar: { hull: 0, engine: 0, shield: 0, magnet: 0, collector: 0 },
     // True once the player has beaten the Aurora Gate: endless mode is
@@ -2328,6 +3432,42 @@ function freshSave(today) {
     // Player settings (persisted).
     settings: { muted: false, reduceShake: false },
   };
+}
+
+function isSaveShapeV5(save) {
+  return save && typeof save === 'object'
+    && save.version === 5
+    && Array.isArray(save.top5) && Array.isArray(save.history)
+    && save.lifetime && typeof save.lifetime === 'object'
+    && typeof save.shardBalance === 'number'
+    && save.hangar && typeof save.hangar === 'object'
+    && typeof save.endlessUnlocked === 'boolean'
+    && save.streak && typeof save.streak === 'object'
+    && save.missions && Array.isArray(save.missions.list)
+    && typeof save.coins === 'number'
+    && typeof save.highestCleared === 'number'
+    && save.ships && typeof save.ships === 'object'
+    && save.ships.owned && typeof save.ships.owned === 'object'
+    && typeof save.ships.equipped === 'string'
+    && save.pilot && typeof save.pilot === 'object'
+    && typeof save.pilot.xp === 'number'
+    && typeof save.pilot.level === 'number'
+    && save.weapons && typeof save.weapons === 'object'
+    && save.weapons.owned && typeof save.weapons.owned === 'object'
+    && typeof save.weapons.equipped === 'string'
+    && save.chips && typeof save.chips === 'object'
+    && save.chips.owned && typeof save.chips.owned === 'object'
+    && Array.isArray(save.chips.slots)
+    && save.achievements && typeof save.achievements === 'object'
+    && save.achievements.unlocked && typeof save.achievements.unlocked === 'object'
+    && save.achievements.claimed && typeof save.achievements.claimed === 'object'
+    && save.stats && typeof save.stats === 'object'
+    && typeof save.stats.enemiesDestroyed === 'number'
+    && typeof save.stats.bulletsDestroyed === 'number'
+    && typeof save.stats.bossesKilled === 'number'
+    && typeof save.stats.stagesCleared === 'number'
+    && typeof save.stats.totalScore === 'number'
+    && typeof save.stats.runsPlayed === 'number';
 }
 
 function isSaveShapeV4(save) {
@@ -2451,13 +3591,35 @@ function migrateSaveV2toV3(save) {
  * Migrate a v3 save to v4. Nothing earned is lost: coins, highest
  * stage and ships start at their defaults (0 / 0 / SPARK Lv 1);
  * endlessUnlocked carries over as-is — a player who earned it under
- * the old gate keeps it. Everything else untouched.
+ * the old gate keeps it. Everything else untouched. Sets version 4
+ * (not SAVE_VERSION) so loadSave can chain it into v5.
  */
 function migrateSaveV3toV4(save) {
-  const migrated = { ...save, version: SAVE_VERSION };
+  const migrated = { ...save, version: 4 };
   migrated.coins = 0;
   migrated.highestCleared = 0;
   migrated.ships = { owned: { spark: { level: 1 } }, equipped: 'spark' };
+  return migrated;
+}
+
+/**
+ * Migrate a v4 save to v5. Nothing earned is lost: the pilot starts
+ * at Lv 1 with 0 XP, the Blaster is owned at Lv 1, no chips are
+ * owned or slotted, no achievements are unlocked or claimed, and the
+ * lifetime counters start at zero (they are only counted from v5
+ * onward — backfilling them from the old fields would be a guess).
+ * Everything else untouched.
+ */
+function migrateSaveV4toV5(save) {
+  const migrated = { ...save, version: SAVE_VERSION };
+  migrated.pilot = { xp: 0, level: 1 };
+  migrated.weapons = { owned: { blaster: { level: 1 } }, equipped: 'blaster' };
+  migrated.chips = { owned: {}, slots: [null, null] };
+  migrated.achievements = { unlocked: {}, claimed: {} };
+  migrated.stats = {
+    enemiesDestroyed: 0, bulletsDestroyed: 0, bossesKilled: 0,
+    stagesCleared: 0, totalScore: 0, runsPlayed: 0,
+  };
   return migrated;
 }
 
@@ -2483,6 +3645,31 @@ function fillDefaults(save) {
   if (typeof save.ships.equipped !== 'string' || !save.ships.owned[save.ships.equipped]) {
     save.ships.equipped = 'spark';
   }
+  // v5 fields, filled defensively when missing (a v4-shaped blob that
+  // reaches here, or a hand-edited v5 blob, keeps its old progress).
+  if (!save.pilot || typeof save.pilot !== 'object') save.pilot = fresh.pilot;
+  if (typeof save.pilot.xp !== 'number') save.pilot.xp = 0;
+  if (typeof save.pilot.level !== 'number') save.pilot.level = 1;
+  if (!save.weapons || typeof save.weapons !== 'object') save.weapons = fresh.weapons;
+  if (!save.weapons.owned || typeof save.weapons.owned !== 'object') save.weapons.owned = {};
+  if (!save.weapons.owned.blaster) save.weapons.owned.blaster = { level: 1 };
+  if (typeof save.weapons.equipped !== 'string' || !save.weapons.owned[save.weapons.equipped]) {
+    save.weapons.equipped = 'blaster';
+  }
+  if (!save.chips || typeof save.chips !== 'object') save.chips = fresh.chips;
+  if (!save.chips.owned || typeof save.chips.owned !== 'object') save.chips.owned = {};
+  if (!Array.isArray(save.chips.slots)) save.chips.slots = [null, null];
+  if (!save.achievements || typeof save.achievements !== 'object') save.achievements = fresh.achievements;
+  if (!save.achievements.unlocked || typeof save.achievements.unlocked !== 'object') {
+    save.achievements.unlocked = {};
+  }
+  if (!save.achievements.claimed || typeof save.achievements.claimed !== 'object') {
+    save.achievements.claimed = {};
+  }
+  if (!save.stats || typeof save.stats !== 'object') save.stats = fresh.stats;
+  for (const key of Object.keys(fresh.stats)) {
+    if (typeof save.stats[key] !== 'number') save.stats[key] = 0;
+  }
   return save;
 }
 
@@ -2497,10 +3684,11 @@ function loadSave(storage, today, legacy = { best: 0, shards: 0 }) {
     const raw = storage.getItem(SAVE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (isSaveShapeV4(parsed)) save = fillDefaults(parsed);
-      else if (isSaveShapeV3(parsed)) save = migrateSaveV3toV4(fillDefaults(parsed));
-      else if (isSaveShapeV2(parsed)) save = migrateSaveV3toV4(migrateSaveV2toV3(parsed));
-      else if (isSaveShapeV1(parsed)) save = migrateSaveV3toV4(migrateSaveV2toV3(migrateSave(parsed)));
+      if (isSaveShapeV5(parsed)) save = fillDefaults(parsed);
+      else if (isSaveShapeV4(parsed)) save = migrateSaveV4toV5(fillDefaults(parsed));
+      else if (isSaveShapeV3(parsed)) save = migrateSaveV4toV5(migrateSaveV3toV4(fillDefaults(parsed)));
+      else if (isSaveShapeV2(parsed)) save = migrateSaveV4toV5(migrateSaveV3toV4(migrateSaveV2toV3(parsed)));
+      else if (isSaveShapeV1(parsed)) save = migrateSaveV4toV5(migrateSaveV3toV4(migrateSaveV2toV3(migrateSave(parsed))));
     }
   } catch {
     save = null;
@@ -2627,6 +3815,14 @@ function claimDailyReward(save, today) {
  * so the run is counted exactly once, with its final score.
  */
 function recordRun(save, run, opts = {}) {
+  // Lifetime counters for achievements / the profile menu (v5). A
+  // hand-edited or pre-v5 save gets them filled with zeros first.
+  if (!save.stats || typeof save.stats !== 'object') {
+    save.stats = {
+      enemiesDestroyed: 0, bulletsDestroyed: 0, bossesKilled: 0,
+      stagesCleared: 0, totalScore: 0, runsPlayed: 0,
+    };
+  }
   if (opts.replace) {
     const { entry, historyEntry, shards: oldShards } = opts.replace;
     const ti = save.top5.indexOf(entry);
@@ -2636,8 +3832,24 @@ function recordRun(save, run, opts = {}) {
     save.lifetime.shards -= oldShards || 0;
     save.shardBalance = (save.shardBalance ?? 0) - (oldShards || 0);
     save.lifetime.runs -= 1;
+    // Take the banked run's stats back out, so the final run is
+    // counted exactly once. Entries banked before v5 lack these
+    // fields — then there is nothing to take back (they never added
+    // any), so the guards below skip the subtraction.
+    if (typeof historyEntry.kills === 'number') save.stats.enemiesDestroyed -= historyEntry.kills;
+    if (typeof historyEntry.bulletsDestroyed === 'number') save.stats.bulletsDestroyed -= historyEntry.bulletsDestroyed;
+    if (historyEntry.bossKilled) save.stats.bossesKilled -= 1;
+    if (historyEntry.cleared) save.stats.stagesCleared -= 1;
+    if (typeof historyEntry.score === 'number') save.stats.totalScore -= historyEntry.score;
+    save.stats.runsPlayed -= 1;
   }
   save.lifetime.runs += 1;
+  save.stats.enemiesDestroyed += run.kills ?? 0;
+  save.stats.bulletsDestroyed += run.bulletsDestroyed ?? 0;
+  save.stats.bossesKilled += run.bossKilled ? 1 : 0;
+  save.stats.stagesCleared += run.cleared ? 1 : 0;
+  save.stats.totalScore += run.score ?? 0;
+  save.stats.runsPlayed += 1;
   save.lifetime.shards += run.shards;
   save.shardBalance = (save.shardBalance ?? 0) + run.shards;
   save.lifetime.playSeconds += run.playSeconds || 0;
@@ -2654,6 +3866,10 @@ function recordRun(save, run, opts = {}) {
     score: run.score, level: run.level, bestCombo: run.bestCombo,
     shards: run.shards, dashes: run.dashes, upgrades: run.upgrades || [],
     date: run.date, endless: !!run.endless, stage: run.stage ?? 0,
+    // Kept so an endless continuation (opts.replace) can take the
+    // banked run's lifetime stats back out before re-banking it.
+    kills: run.kills ?? 0, bulletsDestroyed: run.bulletsDestroyed ?? 0,
+    bossKilled: !!run.bossKilled, cleared: !!run.cleared,
   };
   save.history.unshift(historyEntry);
   save.history = save.history.slice(0, 20);
@@ -2892,162 +4108,580 @@ function bandOf(stage) {
   return themeFor(stage).band;
 }
 
-// ---- src/ships.js ----
-// Lumen Drift — the ship shop: six ships, their levels, and the coin
-// economy. Pure logic: every function takes the save and returns plain
-// data or a { ok } / { ok: false, reason } result, like hangar.js.
-// Coins are save.coins (spendable); shards (shardBalance) are untouched.
+// ---- src/chips.js ----
+// Lumen Drift — chips (stage 2, Wave A). Ability-changing slottables,
+// not stat sticks. Pure logic: every function takes the save (or a list
+// of chip ids) and returns plain data — no DOM, no storage, no import
+// of world.js or weapons.js (Wave C owns the integration; it calls
+// these with its state/save).
 //
-// Core balance rule (Petta, 2026-11-18): higher stages demand a higher
-// ship level + a better ship. A ship's level is bought with coins in
-// the shop (cap Lv 10); each level boosts stats, so the loop is:
-// clear stages -> earn coins -> level up / buy a better ship -> clear
-// higher stages.
-const SHIP_LEVEL_MAX = 10;
+// Save shape: save.chips = { owned: { 'piercing-rounds': true, ... },
+// slots: [null, null] } (slot entries are chip ids or null).
+// Pilot level lives in save.pilot.level (Wave B owns pilot.js); read
+// it defensively as save.pilot?.level ?? 1 everywhere below.
+//
+// Rarity gates: common unlocks at pilot Lv 1, rare at Lv 3, epic at
+// Lv 5, legendary at Lv 8 — each chip's unlockPilotLevel matches its
+// rarity gate (asserted in tests/chips.test.mjs).
+//
+// Where each effect is applied (Wave C / world integration):
+//   pierce          weapons.js: extra pierce on blaster + laser bolts
+//                   (state.chipEffects.pierce).
+//   dashMine        world dash: leave a mine (damage 2, lasts 8 s) at
+//                   the dash start point when state.chipEffects.dashMine.
+//   shardBonus      shard pickup: +N points per shard.
+//   dashCooldownMult world dash: dash cooldown * this (0.8 = -20%).
+//   chainSpark      weapons.js: on an enemy kill, a roll under this
+//                   chance chains 1 damage to the nearest other enemy
+//                   within CHAIN_RADIUS (see weapons.js).
+//   bulletWard      weapons.js: destroying an enemy bullet sets
+//                   state.shield = true and state.shieldTimer = 2.
+//   heartSiphon     shard pickup: every N shards collected restores 1
+//                   heart (up to maxHearts). 0 = off.
+//   overdrive       weapons.js: +25% weapon damage while hearts ==
+//                   maxHearts (only when maxHearts is known).
+//
+// Boss first-clear drops (deterministic — NO RNG gating; a boss stage's
+// first clear always pays its chip, or 100 coins when already owned):
+//   S10  -> bullet-ward       S70  -> chain-spark
+//   S30  -> heart-siphon      S90  -> piercing-rounds
+//   S50  -> overdrive
+//   (all other stages, including midboss stages, drop nothing.)
+const CHIP_SLOT_COUNT = 2;
 
-const SHIPS = [
+const CHIPS = [
   {
-    id: 'spark', name: 'SPARK', rarity: 'common', unlockStage: 0, price: 0,
-    hearts: 3, speedMult: 1.00, blasterDamage: 1, blasterRate: 2.0,
-    shape: 'skiff', desc: 'The starter skiff. Reliable, nothing fancy.',
+    id: 'piercing-rounds', name: 'PIERCING ROUNDS', rarity: 'common', price: 100, unlockPilotLevel: 1,
+    desc: 'Bolts pierce +1 enemy.',
+    effect: 'pierce+1',
   },
   {
-    id: 'comet', name: 'COMET', rarity: 'common', unlockStage: 3, price: 150,
-    hearts: 3, speedMult: 1.05, blasterDamage: 1, blasterRate: 2.2,
-    shape: 'dart', desc: 'A quick dart. Fires a little faster.',
+    id: 'dash-mine', name: 'DASH MINE', rarity: 'common', price: 100, unlockPilotLevel: 1,
+    desc: 'Dash leaves a damaging mine (damage 2, lasts 8 s).',
+    effect: 'dash-mine',
   },
   {
-    id: 'nebula', name: 'NEBULA', rarity: 'rare', unlockStage: 10, price: 500,
-    hearts: 4, speedMult: 1.10, blasterDamage: 2, blasterRate: 2.2,
-    shape: 'wing', desc: 'A winged cruiser with a heavier blaster.',
+    id: 'golden-touch', name: 'GOLDEN TOUCH', rarity: 'common', price: 100, unlockPilotLevel: 1,
+    desc: 'Shards are worth +1 pt each.',
+    effect: 'shard+1',
   },
   {
-    id: 'pulsar', name: 'PULSAR', rarity: 'epic', unlockStage: 25, price: 1500,
-    hearts: 4, speedMult: 1.15, blasterDamage: 2, blasterRate: 2.6,
-    shape: 'dart', desc: 'An epic dart that spits blaster fire.',
+    id: 'swift-recovery', name: 'SWIFT RECOVERY', rarity: 'rare', price: 250, unlockPilotLevel: 3,
+    desc: 'Dash cooldown −20%.',
+    effect: 'dash-cd-20%',
   },
   {
-    id: 'aurora', name: 'AURORA', rarity: 'legendary', unlockStage: 50, price: 4000,
-    hearts: 5, speedMult: 1.20, blasterDamage: 3, blasterRate: 2.6,
-    shape: 'wing', desc: 'A legendary wing — the stage-50 gate-breaker.',
+    id: 'chain-spark', name: 'CHAIN SPARK', rarity: 'rare', price: 250, unlockPilotLevel: 3,
+    desc: 'On an enemy kill, 25% chance lightning chains to a nearby enemy for 1 damage.',
+    effect: 'chain-spark-25%',
   },
   {
-    id: 'novaprime', name: 'NOVA PRIME', rarity: 'mythic', unlockStage: 75, price: 8000,
-    hearts: 6, speedMult: 1.25, blasterDamage: 4, blasterRate: 3.0,
-    shape: 'skiff', desc: 'The mythic skiff. The final storm fears it.',
+    id: 'bullet-ward', name: 'BULLET WARD', rarity: 'rare', price: 250, unlockPilotLevel: 3,
+    desc: 'Destroying an enemy bullet grants a 2 s shield.',
+    effect: 'bullet-ward',
+  },
+  {
+    id: 'heart-siphon', name: 'HEART SIPHON', rarity: 'epic', price: 600, unlockPilotLevel: 5,
+    desc: 'Every 25 shards collected restores 1 heart (up to max).',
+    effect: 'heart-siphon-25',
+  },
+  {
+    id: 'overdrive', name: 'OVERDRIVE', rarity: 'legendary', price: 1200, unlockPilotLevel: 8,
+    desc: 'At full hearts, +25% weapon damage.',
+    effect: 'overdrive',
   },
 ];
 
-function shipById(id) {
-  return SHIPS.find((s) => s.id === id) || null;
+function chipById(id) {
+  return CHIPS.find((c) => c.id === id) || null;
 }
 
-/** Coins to go from `level` to `level+1` (100/level: Lv1->2 is 100 … Lv9->10 is 900; 4500 to max). */
-function shipLevelCost(level) {
-  return 100 * level;
+function pilotLevel(save) {
+  return (save && save.pilot && save.pilot.level) || 1;
 }
 
-/**
- * Derived stats for a ship definition at a level:
- * hearts +1 at Lv 5 and Lv 10, +2% speed per level, +1 blaster damage
- * per level (flat), blaster rate unchanged.
- */
-function shipStats(def, level) {
-  return {
-    hearts: def.hearts + (level >= 5 ? 1 : 0) + (level >= 10 ? 1 : 0),
-    speedMult: def.speedMult * (1 + 0.02 * (level - 1)),
-    blasterDamage: def.blasterDamage + (level - 1),
-    blasterRate: def.blasterRate,
-    level,
-  };
+function chipsOf(save) {
+  if (save && save.chips && save.chips.owned) return save.chips;
+  return { owned: {}, slots: [null, null] };
 }
 
-/** Current level of a ship (0 when not owned). */
-function shipLevel(save, id) {
-  return (save && save.ships && save.ships.owned && save.ships.owned[id]
-    && save.ships.owned[id].level) || 0;
+function ensureChips(save) {
+  if (!save.chips) save.chips = { owned: {}, slots: [null, null] };
+  if (!save.chips.owned) save.chips.owned = {};
+  if (!Array.isArray(save.chips.slots)) save.chips.slots = [null, null];
+  return save.chips;
 }
 
-/** The equipped ship's definition (defaults to SPARK when unset). */
-function equippedShip(save) {
-  const id = (save && save.ships && save.ships.equipped) || 'spark';
-  return shipById(id) || shipById('spark');
-}
-
-/** Derived stats of the equipped ship at its owned level. */
-function equippedShipStats(save) {
-  const def = equippedShip(save);
-  return shipStats(def, Math.max(1, shipLevel(save, def.id)));
+/** Chip slots: 2, or 3 once the pilot reaches Lv 10. */
+function chipSlotCount(save) {
+  return pilotLevel(save) >= 10 ? CHIP_SLOT_COUNT + 1 : CHIP_SLOT_COUNT;
 }
 
 /**
- * Can this ship be bought right now? Returns { ok } or
+ * Can this chip be bought right now? Returns { ok } or
  * { ok: false, reason } where reason is 'owned' | 'locked' | 'broke'
- * | 'unknown'. Locked = highestCleared < unlockStage (spark, unlock 0,
- * is always available; it starts owned).
+ * | 'unknown'. Locked = pilot level < unlockPilotLevel.
  */
-function canBuyShip(save, id) {
-  const def = shipById(id);
+function canBuyChip(save, id) {
+  const def = chipById(id);
   if (!def) return { ok: false, reason: 'unknown' };
-  if (shipLevel(save, id) > 0) return { ok: false, reason: 'owned' };
-  if ((save.highestCleared || 0) < def.unlockStage) return { ok: false, reason: 'locked' };
+  if (chipsOf(save).owned[id]) return { ok: false, reason: 'owned' };
+  if (pilotLevel(save) < def.unlockPilotLevel) return { ok: false, reason: 'locked' };
   if ((save.coins ?? 0) < def.price) return { ok: false, reason: 'broke' };
   return { ok: true, cost: def.price };
 }
 
 /**
- * Buy a ship. Deducts the price from save.coins, owns it at Lv 1 and
- * equips it. Returns { ok: true, cost, level: 1 } or the canBuy reason.
+ * Buy a chip. Deducts the price from save.coins and owns it (not
+ * slotted — slotting is a separate step). Returns { ok: true, cost }
+ * or the canBuy reason.
  */
-function buyShip(save, id) {
-  const check = canBuyShip(save, id);
+function buyChip(save, id) {
+  const check = canBuyChip(save, id);
   if (!check.ok) return check;
-  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
-  if (!save.ships.owned) save.ships.owned = {};
+  ensureChips(save);
   save.coins = (save.coins ?? 0) - check.cost;
-  save.ships.owned[id] = { level: 1 };
-  save.ships.equipped = id;
-  return { ok: true, cost: check.cost, level: 1 };
+  save.chips.owned[id] = true;
+  return { ok: true, cost: check.cost };
 }
 
 /**
- * Can this ship be levelled up right now? Returns { ok } or
- * { ok: false, reason } where reason is 'not-owned' | 'maxed' |
- * 'broke' | 'unknown'.
+ * Slot an owned chip into a slot (0-based). Returns { ok } or
+ * { ok: false, reason } where reason is 'not-owned' | 'occupied' |
+ * 'bad-slot'. A chip already slotted anywhere counts as 'occupied'
+ * (one chip, one slot — no double-applying). Unknown ids report
+ * 'not-owned'.
  */
-function canLevelShip(save, id) {
-  const def = shipById(id);
-  if (!def) return { ok: false, reason: 'unknown' };
-  const level = shipLevel(save, id);
-  if (level === 0) return { ok: false, reason: 'not-owned' };
-  if (level >= SHIP_LEVEL_MAX) return { ok: false, reason: 'maxed' };
-  const cost = shipLevelCost(level);
-  if ((save.coins ?? 0) < cost) return { ok: false, reason: 'broke' };
-  return { ok: true, cost };
-}
-
-/**
- * Level a ship up one level. Deducts shipLevelCost(level) from
- * save.coins. Returns { ok: true, cost, level } or the reason.
- */
-function levelUpShip(save, id) {
-  const check = canLevelShip(save, id);
-  if (!check.ok) return check;
-  save.ships.owned[id].level += 1;
-  save.coins = (save.coins ?? 0) - check.cost;
-  return { ok: true, cost: check.cost, level: save.ships.owned[id].level };
-}
-
-/**
- * Equip an owned ship. Returns { ok } or
- * { ok: false, reason: 'not-owned' } (or 'unknown' for a bad id).
- */
-function equipShip(save, id) {
-  if (!shipById(id)) return { ok: false, reason: 'unknown' };
-  if (shipLevel(save, id) === 0) return { ok: false, reason: 'not-owned' };
-  if (!save.ships) save.ships = { owned: {}, equipped: 'spark' };
-  save.ships.equipped = id;
+function slotChip(save, id, slot) {
+  const count = chipSlotCount(save);
+  if (!Number.isInteger(slot) || slot < 0 || slot >= count) return { ok: false, reason: 'bad-slot' };
+  if (!chipById(id) || !chipsOf(save).owned[id]) return { ok: false, reason: 'not-owned' };
+  const chips = ensureChips(save);
+  if (chips.slots.includes(id)) return { ok: false, reason: 'occupied' };
+  if (chips.slots[slot] != null) return { ok: false, reason: 'occupied' };
+  chips.slots[slot] = id;
   return { ok: true };
+}
+
+/**
+ * Remove whatever is in a slot. Returns { ok: true, id } or
+ * { ok: false, reason } where reason is 'bad-slot' | 'empty'.
+ */
+function unslotChip(save, slot) {
+  const count = chipSlotCount(save);
+  if (!Number.isInteger(slot) || slot < 0 || slot >= count) return { ok: false, reason: 'bad-slot' };
+  const chips = ensureChips(save);
+  const id = chips.slots[slot] ?? null;
+  if (id == null) return { ok: false, reason: 'empty' };
+  chips.slots[slot] = null;
+  return { ok: true, id };
+}
+
+/** The slotted chips' definitions, in slot order (empty slots skipped). */
+function equippedChips(save) {
+  const chips = chipsOf(save);
+  const out = [];
+  for (let i = 0; i < chipSlotCount(save); i += 1) {
+    const id = chips.slots[i];
+    if (id != null) {
+      const def = chipById(id);
+      if (def) out.push(def);
+    }
+  }
+  return out;
+}
+
+/**
+ * The combined live effects of a list of chip ids. Always returns
+ * exactly these keys (defaults: no chip equipped):
+ *   { pierce, dashMine, shardBonus, dashCooldownMult, chainSpark,
+ *     bulletWard, heartSiphon, overdrive }
+ * Unknown ids are ignored. Duplicate ids in the list do not stack
+ * (a chip can only be slotted once).
+ */
+function chipEffectsFor(chipIds) {
+  const effects = {
+    pierce: 0,
+    dashMine: false,
+    shardBonus: 0,
+    dashCooldownMult: 1,
+    chainSpark: 0,
+    bulletWard: false,
+    heartSiphon: 0,
+    overdrive: false,
+  };
+  const seen = new Set();
+  for (const id of chipIds || []) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    switch (id) {
+      case 'piercing-rounds':
+        effects.pierce += 1;
+        break;
+      case 'dash-mine':
+        effects.dashMine = true;
+        break;
+      case 'golden-touch':
+        effects.shardBonus += 1;
+        break;
+      case 'swift-recovery':
+        effects.dashCooldownMult *= 0.8;
+        break;
+      case 'chain-spark':
+        effects.chainSpark = Math.max(effects.chainSpark, 0.25);
+        break;
+      case 'bullet-ward':
+        effects.bulletWard = true;
+        break;
+      case 'heart-siphon':
+        effects.heartSiphon = 25;
+        break;
+      case 'overdrive':
+        effects.overdrive = true;
+        break;
+      default:
+        break;
+    }
+  }
+  return effects;
+}
+
+// --- Boss first-clear drops -------------------------------------------
+
+const BOSS_DROPS = {
+  10: 'bullet-ward',
+  30: 'heart-siphon',
+  50: 'overdrive',
+  70: 'chain-spark',
+  90: 'piercing-rounds',
+};
+
+/** The chip a first-clear of boss stage `stage` drops, or null. */
+function bossDropChip(stage) {
+  return BOSS_DROPS[stage] || null;
+}
+
+/**
+ * Grant a boss stage's first-clear drop to the save. Returns
+ * { granted: id } when the chip is newly owned, { coins: 100 } when
+ * the chip was already owned (100 coins instead), or null when the
+ * stage drops nothing. Idempotent per chip: a second grant of the
+ * same stage pays the 100 coins.
+ */
+function grantBossDrop(save, stage) {
+  const id = bossDropChip(stage);
+  if (!id) return null;
+  const chips = ensureChips(save);
+  if (chips.owned[id]) {
+    save.coins = (save.coins ?? 0) + 100;
+    return { coins: 100 };
+  }
+  chips.owned[id] = true;
+  return { granted: id };
+}
+
+// ---- src/pilot.js ----
+// Lumen Drift — the pilot: account level / XP, achievements, and the
+// profile aggregation (loadout + attributes + collection + totals).
+// Pure logic over the save blob; no DOM, no storage. Wave C renders
+// this (profile menu); Waves A/C build on the exact names below.
+//
+// XP model (tuned so an average player hits pilot Lv 5 in ~10-15 runs
+// and Lv 10 in ~40 runs — see the simulation test in
+// tests/pilot.test.mjs for the assumed average run):
+//   xpToNext(level) = 100 * level   (Lv1->2: 100, Lv2->3: 200, ...;
+//   cumulative XP to Lv 10 is 4500).
+//   awardRunXp: 15 base (showing up counts — every run pays, win or
+//   lose) + floor(score / 10) (performance) + 25 per stage cleared
+//   (50 on a first clear) + 1 per endless second + 25 flawless
+//   (noDamage). A first clear is detected from save.highestCleared,
+//   so call awardRunXp BEFORE recordStageClear mutates it — or pass
+//   run.firstClear explicitly.
+// Pilot level gates gear (PILOT_GATES): weapons, chip rarities and the
+// third chip slot unlock by pilot level, never by coins alone — the
+// level is the account's seniority, coins are the spend.
+//
+// Assumptions (chips.js / the full weapon roster are Wave A's and do
+// not exist yet): the only weapon is the Blaster, so weaponDamage /
+// weaponRate come from the equipped ship's blaster stats; chipEffects
+// is empty until the chip roster lands; the weapons collection total
+// is 1 (Blaster) and the chips collection total is 0 for the same
+// reason. Nothing here imports weapons.js or chips.js.
+
+/** XP to go from pilot level `level` to `level + 1` (100/level). */
+function xpToNext(level) {
+  return 100 * Math.max(1, level);
+}
+
+/** Total XP needed to reach `level` from level 1 (0 for level 1). */
+function xpForLevel(level) {
+  const n = Math.max(1, level) - 1;
+  return 50 * n * (n + 1);
+}
+
+/** Pilot level for a lifetime XP total (level 1 at 0 XP). */
+function pilotLevelForXp(totalXp) {
+  const xp = Math.max(0, totalXp || 0);
+  let level = 1;
+  while (xp >= xpForLevel(level + 1) && level < 999) level += 1;
+  return level;
+}
+
+/** Make sure save.pilot exists (a v4 blob, or a hand-edited one). */
+function ensurePilot(save) {
+  if (!save.pilot || typeof save.pilot !== 'object') save.pilot = { xp: 0, level: 1 };
+  if (typeof save.pilot.xp !== 'number') save.pilot.xp = 0;
+  if (typeof save.pilot.level !== 'number') save.pilot.level = 1;
+  return save.pilot;
+}
+
+/**
+ * Award XP for a finished run — win OR lose, no battle is wasted.
+ * run = { stage, score, cleared, endlessSeconds, kills,
+ * bulletsDestroyed, noDamage, firstClear? }. Returns
+ * { xpGained, level, leveledUp }. Mutates save.pilot.
+ *
+ * First-clear detection: run.firstClear when given, else
+ * run.cleared && run.stage > (save.highestCleared || 0) — so call
+ * this before recordStageClear updates highestCleared.
+ */
+function awardRunXp(save, run = {}) {
+  const pilot = ensurePilot(save);
+  const score = Math.max(0, run.score || 0);
+  const cleared = !!run.cleared;
+  const firstClear = cleared && (run.firstClear !== undefined
+    ? !!run.firstClear
+    : (run.stage || 0) > (save.highestCleared || 0));
+  let xp = 15 + Math.floor(score / 10);
+  if (cleared) xp += firstClear ? 50 : 25;
+  xp += Math.max(0, Math.floor(run.endlessSeconds || 0));
+  if (run.noDamage) xp += 25;
+  const oldLevel = pilot.level;
+  pilot.xp = (pilot.xp || 0) + xp;
+  pilot.level = pilotLevelForXp(pilot.xp);
+  return { xpGained: xp, level: pilot.level, leveledUp: pilot.level > oldLevel };
+}
+
+// --- Pilot-level gates ------------------------------------------------------
+
+/** What pilot level unlocks what gear (Wave A/C read this). */
+const PILOT_GATES = {
+  weapons: { mortar: 3, laser: 5, pulse: 8 },
+  chipRarity: { common: 1, rare: 3, epic: 5, legendary: 8 },
+  chipSlot3: 10,
+};
+
+// --- Achievements -----------------------------------------------------------
+
+/**
+ * Achievements: ~11, each { id, name, desc, reward (coins),
+ * check(save, stats) }. stats is save.stats (lifetime counters);
+ * checks that need other save fields read them from `save` directly.
+ * Rewards are coins (the stage economy), paid once on claim.
+ */
+const ACHIEVEMENTS = [
+  {
+    id: 'first-blood', name: 'FIRST BLOOD', desc: 'Destroy your first enemy.',
+    reward: 25,
+    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1,
+  },
+  {
+    id: 'boss-first', name: 'BOSS SLAYER', desc: 'Defeat your first boss.',
+    reward: 100,
+    check: (_save, stats) => (stats.bossesKilled || 0) >= 1,
+  },
+  {
+    id: 'clear-10', name: 'STAGE 10 CLEAR', desc: 'Clear stage 10 — the first boss falls.',
+    reward: 100,
+    check: (save) => (save.highestCleared || 0) >= 10,
+  },
+  {
+    id: 'clear-25', name: 'QUARTER WAY', desc: 'Clear stage 25.',
+    reward: 200,
+    check: (save) => (save.highestCleared || 0) >= 25,
+  },
+  {
+    id: 'clear-50', name: 'HALFWAY HERO', desc: 'Clear stage 50 — past the NEBULA CRUSHER.',
+    reward: 400,
+    check: (save) => (save.highestCleared || 0) >= 50,
+  },
+  {
+    id: 'clear-100', name: 'FINAL STORM', desc: 'Clear stage 100. The drift is yours.',
+    reward: 1000,
+    check: (save) => (save.highestCleared || 0) >= 100,
+  },
+  {
+    id: 'own-3-ships', name: 'FLEET OWNER', desc: 'Own 3 ships.',
+    reward: 150,
+    check: (save) => Object.keys(save.ships?.owned || {}).length >= 3,
+  },
+  {
+    id: 'pilot-5', name: 'SEASONED PILOT', desc: 'Reach pilot level 5.',
+    reward: 100,
+    check: (save) => (save.pilot?.level || 1) >= 5,
+  },
+  {
+    id: 'pilot-10', name: 'ACE PILOT', desc: 'Reach pilot level 10.',
+    reward: 250,
+    check: (save) => (save.pilot?.level || 1) >= 10,
+  },
+  {
+    id: 'slayer-1000', name: 'SLAYER', desc: 'Destroy 1,000 enemies (lifetime).',
+    reward: 300,
+    check: (_save, stats) => (stats.enemiesDestroyed || 0) >= 1000,
+  },
+  {
+    id: 'bullet-breaker-500', name: 'BULLET BREAKER', desc: 'Shoot down 500 enemy bullets (lifetime).',
+    reward: 200,
+    check: (_save, stats) => (stats.bulletsDestroyed || 0) >= 500,
+  },
+];
+
+function achievementById(id) {
+  return ACHIEVEMENTS.find((a) => a.id === id) || null;
+}
+
+/** Make sure save.achievements exists (a v4 blob, or hand-edited). */
+function ensureAchievements(save) {
+  if (!save.achievements || typeof save.achievements !== 'object') {
+    save.achievements = { unlocked: {}, claimed: {} };
+  }
+  if (!save.achievements.unlocked || typeof save.achievements.unlocked !== 'object') {
+    save.achievements.unlocked = {};
+  }
+  if (!save.achievements.claimed || typeof save.achievements.claimed !== 'object') {
+    save.achievements.claimed = {};
+  }
+  return save.achievements;
+}
+
+/**
+ * Check every achievement against the save; unlock the newly earned
+ * ones. Returns the array of newly unlocked ids — idempotent: an
+ * already-unlocked achievement is never returned again.
+ */
+function checkAchievements(save) {
+  const achievements = ensureAchievements(save);
+  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
+  const newly = [];
+  for (const def of ACHIEVEMENTS) {
+    if (achievements.unlocked[def.id]) continue;
+    if (def.check(save, stats)) {
+      achievements.unlocked[def.id] = true;
+      newly.push(def.id);
+    }
+  }
+  return newly;
+}
+
+/**
+ * Claim an unlocked achievement's coin reward — once only. Returns
+ * { ok: true, reward } or { ok: false, reason } where reason is
+ * 'unknown' (bad id), 'not-unlocked' or 'claimed'.
+ */
+function claimAchievement(save, id) {
+  const def = achievementById(id);
+  if (!def) return { ok: false, reason: 'unknown' };
+  const achievements = ensureAchievements(save);
+  if (!achievements.unlocked[id]) return { ok: false, reason: 'not-unlocked' };
+  if (achievements.claimed[id]) return { ok: false, reason: 'claimed' };
+  achievements.claimed[id] = true;
+  save.coins = (save.coins ?? 0) + def.reward;
+  return { ok: true, reward: def.reward };
+}
+
+/**
+ * The equipped ship's unique power, for the profile menu. Wave C adds
+ * a `power` field { id, name, desc } to each ship def in ships.js;
+ * until then (or for a def without one) this is null — read
+ * defensively, never crash on a power-less def.
+ */
+function shipPowerFor(def) {
+  const power = def && def.power;
+  if (!power || typeof power !== 'object') return null;
+  return {
+    id: power.id ?? null,
+    name: power.name ?? null,
+    desc: power.desc ?? null,
+  };
+}
+
+// --- Profile aggregation ----------------------------------------------------
+
+/**
+ * The profile menu's data, aggregated from the save — pure, no
+ * mutation. Attribute totals use the same model as the in-game
+ * derived numbers: ship level (shipStats) + hangar parts, the
+ * Blaster's rate/damage from the equipped ship, dash cooldown from
+ * config, magnet radius = base + hangar magnet, shard value = base +
+ * hangar collector. In-run upgrade picks are NOT included (they reset
+ * every run); chips contribute nothing yet — the chip roster is
+ * Wave A's, so chipEffects is [] until it lands.
+ */
+function profileStats(save) {
+  const pilot = ensurePilot(save);
+  const level = pilot.level;
+  const xp = pilot.xp;
+  const xpIntoLevel = xp - xpForLevel(level);
+  const next = xpToNext(level);
+  const ship = equippedShipStats(save);
+  const shipPower = shipPowerFor(equippedShip(save));
+  const hangar = save.hangar || {};
+  const weapons = (save.weapons && typeof save.weapons === 'object') ? save.weapons : {};
+  const ownedWeapons = (weapons.owned && typeof weapons.owned === 'object') ? weapons.owned : {};
+  const equippedWeapon = typeof weapons.equipped === 'string' ? weapons.equipped : 'blaster';
+  const weaponLevel = (ownedWeapons[equippedWeapon] && ownedWeapons[equippedWeapon].level) || 1;
+  const chips = (save.chips && typeof save.chips === 'object') ? save.chips : {};
+  const ownedChips = (chips.owned && typeof chips.owned === 'object') ? chips.owned : {};
+  const slots = Array.isArray(chips.slots) ? chips.slots : [null, null];
+  const stats = (save.stats && typeof save.stats === 'object') ? save.stats : {};
+  const lifetimeShards = (save.lifetime && save.lifetime.shards) || 0;
+  return {
+    pilot: {
+      level,
+      xp,
+      xpToNext: next,
+      // 0..1 progress through the current level.
+      xpProgress: next > 0 ? xpIntoLevel / next : 0,
+    },
+    loadout: {
+      ship: { id: (save.ships?.equipped) || 'spark', level: ship.level },
+      // The equipped ship's unique power (null until Wave C adds the
+      // `power` field to the ship defs in ships.js).
+      shipPower,
+      weapon: { id: equippedWeapon, level: weaponLevel },
+      chips: slots.filter((c) => c !== null && c !== undefined),
+    },
+    attributes: {
+      // The ship's unique power, listed with the other attributes so
+      // the profile menu shows what makes this ship special.
+      shipPower,
+      hearts: ship.hearts + (hangarLevel(save, 'hull')),
+      speedMult: Math.round(ship.speedMult * (1 + 0.08 * (hangar.engine || 0)) * 1000) / 1000,
+      weaponDamage: ship.blasterDamage,
+      weaponRate: ship.blasterRate,
+      dashCooldown: SHIP.dashCooldown,
+      magnetRadius: MAGNET_BASE_RADIUS + 30 * (hangar.magnet || 0),
+      shardValue: SHARD_POINTS + 2 * (hangar.collector || 0),
+      chipEffects: [],
+    },
+    collection: {
+      ships: {
+        owned: Object.keys(save.ships?.owned || {}).length,
+        total: SHIPS.length,
+      },
+      weapons: { owned: Object.keys(ownedWeapons).length, total: 1 },
+      chips: { owned: Object.keys(ownedChips).length, total: 0 },
+      skins: { owned: unlockedSkins(lifetimeShards).length, total: SKINS.length },
+    },
+    totals: {
+      stagesCleared: stats.stagesCleared || 0,
+      enemiesDestroyed: stats.enemiesDestroyed || 0,
+      bossesKilled: stats.bossesKilled || 0,
+      runsPlayed: stats.runsPlayed || 0,
+      totalScore: stats.totalScore || 0,
+    },
+  };
 }
 
 // ---- src/render.js ----
@@ -3070,6 +4704,7 @@ const SCREEN_OVER = 'over';
 const SCREEN_CLEAR = 'clear';
 const SCREEN_STAGES = 'stages';
 const SCREEN_SHOP = 'shop';
+const SCREEN_PROFILE = 'profile';
 const SCREEN_UPGRADE = 'upgrade';
 const SCREEN_STATS = 'stats';
 const SCREEN_HANGAR = 'hangar';
@@ -3080,20 +4715,23 @@ const SCREEN_SETTINGS = 'settings';
 const SCREEN_REWARD = 'reward';
 
 // --- Home (title) layout: PLAY only. Top corners hold the gear and the
-// currency; the meta game (hangar / missions / scores) lives in a bottom
-// tab bar that appears after the first run (progressive disclosure).
+// currency; the meta game (hangar / shop / profile / missions /
+// scores) lives in a bottom tab bar that appears after the first run
+// (progressive disclosure).
 const GEAR_RECT = { x: 24, y: 24, w: 48, h: 48 };
-// Top-right cluster, left to right: streak flame, coins purse, shard
-// balance. (The flame only draws while a streak is alive; the coins
-// chip always shows — coins are the stage economy now.)
-const FLAME_RECT = { x: 856, y: 24, w: 76, h: 48 };
-const COINS_RECT = { x: 946, y: 24, w: 130, h: 48 };
-const BALANCE_RECT = { x: 1090, y: 24, w: 166, h: 48 };
+// Top-right cluster, left to right: streak flame, pilot level, coins
+// purse, shard balance. (The flame only draws while a streak is
+// alive; the pilot chip and the coins chip always show.)
+const FLAME_RECT = { x: 800, y: 24, w: 64, h: 48 };
+const PILOT_RECT = { x: 872, y: 24, w: 92, h: 48 };
+const COINS_RECT = { x: 972, y: 24, w: 124, h: 48 };
+const BALANCE_RECT = { x: 1104, y: 24, w: 152, h: 48 };
 const PLAY_RECT = { x: 470, y: 410, w: 340, h: 76 };
-const HANGAR_TAB_RECT = { x: 260, y: 636, w: 190, h: 56 };
-const SHOP_TAB_RECT = { x: 470, y: 636, w: 190, h: 56 };
-const MISSIONS_TAB_RECT = { x: 680, y: 636, w: 190, h: 56 };
-const SCORES_TAB_RECT = { x: 890, y: 636, w: 190, h: 56 };
+const HANGAR_TAB_RECT = { x: 208, y: 636, w: 160, h: 56 };
+const SHOP_TAB_RECT = { x: 384, y: 636, w: 160, h: 56 };
+const PROFILE_TAB_RECT = { x: 560, y: 636, w: 160, h: 56 };
+const MISSIONS_TAB_RECT = { x: 736, y: 636, w: 160, h: 56 };
+const SCORES_TAB_RECT = { x: 912, y: 636, w: 160, h: 56 };
 
 // --- Panels: one centred card over a dimmed home screen.
 const PANEL_CARD = { x: 260, y: 96, w: 760, h: 528 };
@@ -3106,22 +4744,32 @@ const SETTINGS_FULLSCREEN_RECT = { x: 880, y: 284, w: 100, h: 44 };
 const SETTINGS_SHAKE_RECT = { x: 880, y: 360, w: 100, h: 44 };
 
 // The deliberate restart button on the game-over screen.
-const PLAY_AGAIN_RECT = { x: 510, y: 470, w: 260, h: 56 };
+const PLAY_AGAIN_RECT = { x: 510, y: 520, w: 260, h: 56 };
 // Hangar exit on the game-over screen (the endless trap fix: after an
 // endless death the player can go straight to the hangar to spend).
-const OVER_HANGAR_RECT = { x: 510, y: 546, w: 260, h: 48 };
-// Stage-clear buttons, stacked under the coins line.
-const CLEAR_NEXT_RECT = { x: 510, y: 360, w: 260, h: 56 };
-const CLEAR_REPLAY_RECT = { x: 510, y: 428, w: 260, h: 48 };
-const CLEAR_STAGES_RECT = { x: 510, y: 488, w: 260, h: 48 };
-const CLEAR_HANGAR_RECT = { x: 510, y: 548, w: 260, h: 48 };
+const OVER_HANGAR_RECT = { x: 510, y: 596, w: 260, h: 48 };
+// Stage-clear buttons, stacked under the summary lines (which now
+// include newly unlocked achievements, up to two lines).
+const CLEAR_NEXT_RECT = { x: 510, y: 384, w: 260, h: 56 };
+const CLEAR_REPLAY_RECT = { x: 510, y: 452, w: 260, h: 48 };
+const CLEAR_STAGES_RECT = { x: 510, y: 512, w: 260, h: 48 };
+const CLEAR_HANGAR_RECT = { x: 510, y: 572, w: 260, h: 48 };
 // Endless continuation on the clear screen (drawn only when unlocked).
-const CLEAR_ENDLESS_RECT = { x: 510, y: 608, w: 260, h: 48 };
+const CLEAR_ENDLESS_RECT = { x: 510, y: 632, w: 260, h: 48 };
 // Back button on the hangar screen.
 const HANGAR_BACK_RECT = { x: 540, y: 606, w: 200, h: 44 };
 // Back buttons on the stage-select and shop screens (same spot).
 const STAGES_BACK_RECT = { x: 540, y: 580, w: 200, h: 44 };
 const SHOP_BACK_RECT = { x: 540, y: 636, w: 200, h: 44 };
+// Back button on the profile screen (same spot as the shop's).
+const PROFILE_BACK_RECT = { x: 540, y: 636, w: 200, h: 44 };
+// Shop section tabs: SHIPS / WEAPONS / CHIPS (one section visible at
+// a time — the three economies do not fit on one screen).
+const SHOP_SECTION_RECTS = {
+  ships: { x: 384, y: 126, w: 160, h: 42 },
+  weapons: { x: 560, y: 126, w: 160, h: 42 },
+  chips: { x: 736, y: 126, w: 160, h: 42 },
+};
 // Skin arrows in the hangar (the selector moved here from the title, so
 // its name can never overlap an arrow again).
 const HANGAR_SKIN_LEFT = { x: 200, y: 126, w: 40, h: 52 };
@@ -3217,7 +4865,8 @@ function layoutStageTiles(page) {
 }
 
 // --- Ship shop: 6 cards in a 2x3 grid; each card's action button sits
-// at its foot (BUY / LEVEL UP / EQUIP / EQUIPPED).
+// at its foot (BUY / LEVEL UP / EQUIP / EQUIPPED). The grid starts
+// below the section tabs (y 126..168).
 const RARITY_COLORS = {
   common: '#e2e8f0',
   rare: '#38bdf8',
@@ -3231,7 +4880,7 @@ function layoutShopCards() {
   const gap = 20;
   const totalW = 3 * cardW + 2 * gap;
   const x0 = (FIELD.width - totalW) / 2;
-  const y0 = 170;
+  const y0 = 188;
   return SHIPS.map((ship, i) => {
     const col = i % 3;
     const row = Math.floor(i / 3);
@@ -3242,6 +4891,188 @@ function layoutShopCards() {
       action: { x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 },
     };
   });
+}
+
+// --- Weapon shop: one card per weapon in the same 2x3 grid as the
+// ship shop (4 weapons: one full row + one card). `weapons` is the
+// roster (WEAPONS); passing a list keeps the layout testable.
+function layoutShopWeapons(weapons = WEAPONS) {
+  const cardW = 380;
+  const cardH = 210;
+  const gap = 20;
+  const totalW = 3 * cardW + 2 * gap;
+  const x0 = (FIELD.width - totalW) / 2;
+  const y0 = 188;
+  return (weapons || []).map((weapon, i) => {
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    const x = x0 + col * (cardW + gap);
+    const y = y0 + row * (cardH + gap);
+    return {
+      x, y, w: cardW, h: cardH, weapon,
+      action: { x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 },
+    };
+  });
+}
+
+// --- Chip shop: compact cards (name, rarity, effect, action) in a
+// 3-column grid; 8 chips fit in 3 rows above BACK (y 636).
+function layoutShopChips(chips = CHIPS) {
+  const cardW = 380;
+  const cardH = 130;
+  const gap = 14;
+  const totalW = 3 * cardW + 2 * gap;
+  const x0 = (FIELD.width - totalW) / 2;
+  const y0 = 188;
+  return (chips || []).map((chip, i) => {
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    const x = x0 + col * (cardW + gap);
+    const y = y0 + row * (cardH + gap);
+    return {
+      x, y, w: cardW, h: cardH, chip,
+      action: { x: x + 16, y: y + cardH - 44, w: cardW - 32, h: 36 },
+    };
+  });
+}
+
+// --- Profile: two columns. Left: pilot XP, loadout, attributes.
+// Right: collection, achievements (up to 5 rows shown + claim buttons).
+function layoutProfileSections(profile = {}) {
+  const achievements = Array.isArray(profile.achievements) ? profile.achievements : [];
+  const shown = achievements.slice(0, 5);
+  const rows = shown.map((achievement, i) => {
+    const y = 376 + i * 46;
+    return {
+      x: 672, y, w: 536, h: 40, achievement,
+      claim: { x: 672 + 536 - 110, y: y + 4, w: 102, h: 32 },
+    };
+  });
+  return {
+    xp: { x: 60, y: 100, w: 560, h: 80 },
+    loadout: { x: 60, y: 192, w: 560, h: 140 },
+    attributes: { x: 60, y: 344, w: 560, h: 276 },
+    collection: {
+      x: 660, y: 100, w: 560, h: 232,
+      rows: {
+        ships: { x: 672, y: 130, w: 536, h: 42 },
+        weapons: { x: 672, y: 174, w: 536, h: 42 },
+        chips: { x: 672, y: 218, w: 536, h: 58 },
+        skins: { x: 672, y: 278, w: 536, h: 42 },
+      },
+    },
+    achievements: {
+      x: 660, y: 332, w: 560, h: 288,
+      rows,
+      shown: shown.length,
+      total: achievements.length,
+    },
+  };
+}
+
+/**
+ * The profile menu's view data: pilot.js's profileStats (pilot,
+ * loadout, attributes, collection, totals) enriched with the
+ * display-ready bits the renderer needs — collection items (owned
+ * vs locked, with the unlock condition per item), weapon/chip names
+ * and rarities, and the chip effects as attribute lines.
+ *
+ * `opts` (all optional): { weapons (defs, default WEAPONS),
+ * chips (defs, default CHIPS), chipEffects (the live effects object
+ * from chipEffectsFor, default all-off), weaponStats (fn, default
+ * the weapons.js one), achievements (view list [{id,name,desc,
+ * reward,state}], default []) }. With no save at all (a bare
+ * screenshot draw) it returns the fresh-save profile.
+ */
+function profileFromSave(save, opts = {}) {
+  const s = save ?? freshSave(localDate());
+  const base = profileStats(s);
+  const weapons = opts.weapons ?? WEAPONS;
+  const chips = opts.chips ?? CHIPS;
+  const effects = opts.chipEffects ?? null;
+  const weaponStatsFn = opts.weaponStats ?? null;
+
+  const weaponDef = (weapons || []).find((w) => w.id === base.loadout.weapon.id)
+    || { id: 'blaster', name: 'BLASTER', range: BLASTER.range, unlockPilotLevel: 1, price: 0, baseDamage: 1, damagePerLevel: 0, rate: 2 };
+  // The Blaster's damage/rate come from the equipped ship (see
+  // weapons.js weaponStats); other weapons use their own def + level.
+  let weaponDamage = base.attributes.weaponDamage;
+  let weaponRate = base.attributes.weaponRate;
+  if (weaponDef.id !== 'blaster' && weaponStatsFn) {
+    const ws = weaponStatsFn(weaponDef, base.loadout.weapon.level);
+    weaponDamage = ws.damage;
+    weaponRate = ws.rate;
+  }
+  const slotted = (base.loadout.chips || []).map((id) => {
+    const def = (chips || []).find((c) => c.id === id) || chipById(id);
+    return def ? { id: def.id, name: def.name, rarity: def.rarity } : { id, name: String(id).toUpperCase(), rarity: 'common' };
+  });
+
+  const effectLines = [];
+  if (effects) {
+    if ((effects.pierce ?? 0) > 0) effectLines.push({ label: 'PIERCING ROUNDS', value: `+${effects.pierce} pierce` });
+    if (effects.dashMine) effectLines.push({ label: 'DASH MINE', value: 'dash leaves a mine' });
+    if ((effects.shardBonus ?? 0) > 0) effectLines.push({ label: 'GOLDEN TOUCH', value: `+${effects.shardBonus} pts / shard` });
+    if ((effects.dashCooldownMult ?? 1) !== 1) effectLines.push({ label: 'SWIFT RECOVERY', value: `dash ×${effects.dashCooldownMult}` });
+    if ((effects.chainSpark ?? 0) > 0) effectLines.push({ label: 'CHAIN SPARK', value: `${Math.round(effects.chainSpark * 100)}% chain on kill` });
+    if (effects.bulletWard) effectLines.push({ label: 'BULLET WARD', value: '2 s shield per orb' });
+    if ((effects.heartSiphon ?? 0) > 0) effectLines.push({ label: 'HEART SIPHON', value: `1 heart / ${effects.heartSiphon} shards` });
+    if (effects.overdrive) effectLines.push({ label: 'OVERDRIVE', value: '+25% dmg at full hearts' });
+  }
+
+  const shipItems = SHIPS.map((def) => ({
+    name: def.name,
+    owned: !!s.ships?.owned?.[def.id],
+    unlock: def.unlockStage > 0 ? `Clear stage ${def.unlockStage}` : 'Starter',
+    short: def.unlockStage > 0 ? `S${def.unlockStage}` : '',
+  }));
+  const weaponItems = (weapons || []).map((def) => ({
+    name: def.name,
+    owned: !!(s.weapons?.owned && s.weapons.owned[def.id]),
+    unlock: def.unlockPilotLevel > 1 ? `Pilot Lv ${def.unlockPilotLevel}` : 'Pilot Lv 1',
+    short: def.unlockPilotLevel > 1 ? `Lv ${def.unlockPilotLevel}` : '',
+  }));
+  const chipItems = (chips || []).map((def) => ({
+    name: def.name,
+    owned: !!(s.chips?.owned && s.chips.owned[def.id]),
+    unlock: `Pilot Lv ${def.unlockPilotLevel}`,
+    short: `Lv ${def.unlockPilotLevel}`,
+  }));
+  const skinItems = SKINS.map((def) => ({
+    name: def.name,
+    owned: (s.lifetime?.shards ?? 0) >= def.unlock,
+    unlock: def.unlock > 0 ? `${def.unlock} ◆` : 'Starter',
+    short: def.unlock > 0 ? `${def.unlock}◆` : '',
+  }));
+
+  return {
+    pilot: base.pilot,
+    loadout: {
+      ship: { ...base.loadout.ship, name: (SHIPS.find((d) => d.id === base.loadout.ship.id)?.name) ?? 'SPARK' },
+      shipPower: base.loadout.shipPower,
+      weapon: { ...base.loadout.weapon, name: weaponDef.name },
+      chips: slotted,
+    },
+    attributes: {
+      shipPower: base.attributes.shipPower,
+      hearts: base.attributes.hearts,
+      speedMult: base.attributes.speedMult,
+      weaponDamage,
+      weaponRate,
+      dashCooldown: base.attributes.dashCooldown * (effects?.dashCooldownMult ?? 1),
+      magnetRadius: base.attributes.magnetRadius,
+      shardValue: base.attributes.shardValue + (effects?.shardBonus ?? 0),
+      chipEffects: effectLines,
+    },
+    collection: {
+      ships: { ...base.collection.ships, items: shipItems },
+      weapons: { owned: weaponItems.filter((i) => i.owned).length, total: weaponItems.length, items: weaponItems },
+      chips: { owned: chipItems.filter((i) => i.owned).length, total: chipItems.length, items: chipItems },
+      skins: { ...base.collection.skins, items: skinItems },
+    },
+    totals: base.totals,
+    achievements: Array.isArray(opts.achievements) ? opts.achievements : [],
+  };
 }
 
 const CYAN = '#22d3ee';
@@ -3521,20 +5352,87 @@ function drawEnemy(ctx, e) {
 }
 
 function drawBullet(ctx, b) {
-  // A player blaster bolt: a short cyan streak along its flight path.
+  // A player projectile, by kind: a bolt is a short cyan streak along
+  // its flight path; a laser bolt is a longer, brighter beam; a mortar
+  // shell is a fat orange round (it bursts on impact or at max range).
+  if (b.kind === 'shell') {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    glow(ctx, '#fb923c', 16);
+    ctx.fillStyle = '#fb923c';
+    ctx.beginPath();
+    ctx.arc(0, 0, 9, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffedd5';
+    ctx.beginPath();
+    ctx.arc(0, 0, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
   const angle = Math.atan2(b.vy ?? 0, b.vx ?? 1);
   ctx.save();
   ctx.translate(b.x, b.y);
   ctx.rotate(angle);
-  glow(ctx, CYAN, 10);
-  ctx.fillStyle = '#a5f3fc';
+  const laser = b.kind === 'laser';
+  glow(ctx, laser ? '#e0f2fe' : CYAN, laser ? 16 : 10);
+  ctx.fillStyle = laser ? '#e0f2fe' : '#a5f3fc';
   ctx.beginPath();
-  ctx.ellipse(0, 0, 11, 3.5, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 0, laser ? 20 : 11, laser ? 2.5 : 3.5, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#ecfeff';
   ctx.beginPath();
-  ctx.ellipse(3, 0, 5, 2, 0, 0, Math.PI * 2);
+  ctx.ellipse(3, 0, laser ? 10 : 5, laser ? 1.5 : 2, 0, 0, Math.PI * 2);
   ctx.fill();
+  ctx.restore();
+}
+
+function drawTrap(ctx, t) {
+  // A dash mine (chip): an orange spiked round, fading as its 8 s run out.
+  ctx.save();
+  ctx.globalAlpha = Math.max(0.25, Math.min(1, (t.ttl ?? 8) / 2));
+  ctx.translate(t.x, t.y);
+  glow(ctx, '#fb923c', 12);
+  ctx.fillStyle = '#7c2d12';
+  ctx.strokeStyle = '#fb923c';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 6; i += 1) {
+    const angle = (i / 6) * Math.PI * 2;
+    const outer = (t.r ?? 36) * 0.55;
+    const inner = (t.r ?? 36) * 0.3;
+    const tipX = Math.cos(angle) * outer;
+    const tipY = Math.sin(angle) * outer;
+    const baseAngle = angle + Math.PI / 6;
+    if (i === 0) ctx.moveTo(tipX, tipY);
+    else ctx.lineTo(tipX, tipY);
+    ctx.lineTo(Math.cos(baseAngle) * inner, Math.sin(baseAngle) * inner);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#fdba74';
+  ctx.beginPath();
+  ctx.arc(0, 0, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPulseFx(ctx, seg) {
+  // One chain-lightning jump: a bright violet line that fades fast.
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, (seg.ttl ?? 0.15) / 0.15));
+  ctx.strokeStyle = '#c084fc';
+  ctx.lineWidth = 3;
+  glow(ctx, '#a78bfa', 14);
+  ctx.beginPath();
+  ctx.moveTo(seg.x1, seg.y1);
+  // A jagged middle so the bolt reads as lightning, not a ruler line.
+  const mx = (seg.x1 + seg.x2) / 2 + (Math.random() * 24 - 12);
+  const my = (seg.y1 + seg.y2) / 2 + (Math.random() * 24 - 12);
+  ctx.lineTo(mx, my);
+  ctx.lineTo(seg.x2, seg.y2);
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -3786,7 +5684,7 @@ function drawJoystick(ctx, pointer) {
   ctx.restore();
 }
 
-function drawHud(ctx, state, best, width, theme = THEMES[0]) {
+function drawHud(ctx, state, best, width, theme = THEMES[0], extra = {}) {
   const pad = 18;
   ctx.textBaseline = 'alphabetic';
   // Score, big and gold — counted up smoothly (displayScore), not jumped.
@@ -3835,11 +5733,19 @@ function drawHud(ctx, state, best, width, theme = THEMES[0]) {
     ctx.restore();
   }
   // Stage, top right — tinted with the current band's theme accent.
-  // LEVEL lives on the upgrade screen only now.
+  // LEVEL lives on the upgrade screen only now. The equipped weapon
+  // rides next to it, so the loadout is always visible in play.
   ctx.textAlign = 'right';
   ctx.fillStyle = theme.accent;
   ctx.font = 'bold 19px sans-serif';
-  ctx.fillText(state.endless ? 'ENDLESS' : `STAGE ${state.stage ?? 1}`, width - pad, 66);
+  const weaponLabel = extra.weaponLabel
+    ?? (state.weaponId
+      ? `${String(state.weaponId).toUpperCase()} Lv ${state.weaponLevel ?? 1}`
+      : 'BLASTER Lv 1');
+  ctx.fillText(
+    state.endless ? `ENDLESS  •  ${weaponLabel}` : `STAGE ${state.stage ?? 1}  •  ${weaponLabel}`,
+    width - pad, 66,
+  );
   const dashReady = state.ship.dashCooldown <= 0;
   const dashBase = effectiveDashCooldown(state);
   const dashFrac = dashReady ? 1 : 1 - state.ship.dashCooldown / dashBase;
@@ -3987,6 +5893,18 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   ctx.textBaseline = 'middle';
   ctx.fillText(`🪙 ${save ? (save.coins ?? 0) : 0}`, COINS_RECT.x + COINS_RECT.w / 2, COINS_RECT.y + COINS_RECT.h / 2 + 1);
   ctx.restore();
+  // Pilot level chip (top right, next to the coins — the account level
+  // gates weapons, chips and the third chip slot).
+  ctx.save();
+  ctx.strokeStyle = 'rgba(192, 132, 252, 0.65)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(PILOT_RECT.x, PILOT_RECT.y, PILOT_RECT.w, PILOT_RECT.h);
+  ctx.fillStyle = '#c084fc';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`Lv ${save?.pilot?.level ?? 1}`, PILOT_RECT.x + PILOT_RECT.w / 2, PILOT_RECT.y + PILOT_RECT.h / 2 + 1);
+  ctx.restore();
   bigTitle(ctx, 'LUMEN DRIFT', 240, width, CYAN, 72);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fbbf24';
@@ -4053,6 +5971,7 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     const tabs = [
       [HANGAR_TAB_RECT, 'HANGAR', CYAN],
       [SHOP_TAB_RECT, 'SHOP', GOLD],
+      [PROFILE_TAB_RECT, 'PROFILE', '#c084fc'],
       [MISSIONS_TAB_RECT, 'MISSIONS', GOLD],
       [SCORES_TAB_RECT, 'SCORES', '#e2e8f0'],
     ];
@@ -4415,14 +6334,25 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null, ext
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 21px sans-serif';
   ctx.fillText(`BALANCE  ${balance} shards — tap a part to buy it (keys 1–5 work too)`, 500, 172);
-  // Equipped ship + level (from main's extra, else the save's ships).
+  // Equipped ship + level (from main's extra, else the save's ships),
+  // plus the equipped weapon and the slotted chips — the whole loadout
+  // on one line, so the hangar shows what the ship fights with.
   const shipInfo = extra.ship ?? null;
   const shipDef = equippedShip(save);
   const shipLevelNow = shipInfo?.level ?? Math.max(1, shipLevel(save, shipDef.id));
   const shipName = shipInfo?.name ?? shipDef.name;
+  const loadout = extra.loadout ?? null;
+  const weaponName = loadout?.weapon?.name ?? 'BLASTER';
+  const weaponLevelNow = loadout?.weapon?.level
+    ?? (save?.weapons?.owned?.[save?.weapons?.equipped ?? 'blaster']?.level ?? 1);
+  const chipNames = loadout?.chips
+    ?? (save?.chips?.slots ?? []).filter(Boolean).map((id) => chipById(id)?.name ?? String(id).toUpperCase());
   ctx.fillStyle = CYAN;
   ctx.font = 'bold 19px sans-serif';
-  ctx.fillText(`SHIP ${shipName}  Lv ${shipLevelNow}`, 500, 204);
+  ctx.fillText(
+    `SHIP ${shipName}  Lv ${shipLevelNow}  •  ${weaponName} Lv ${weaponLevelNow}  •  CHIPS: ${chipNames.length ? chipNames.join(', ') : '—'}`,
+    500, 204,
+  );
   // One row per part: name, effect, level pips, buy button.
   for (const row of layoutHangarParts()) {
     const level = save ? hangarLevel(save, row.part.id) : 0;
@@ -4541,9 +6471,18 @@ function drawUpgrade(ctx, state, offers, width, height, age = 0) {
     ctx.translate(0, (1 - ease) * 40);
     ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
     ctx.fillRect(card.x, card.y, card.w, card.h);
-    ctx.strokeStyle = CYAN;
-    ctx.lineWidth = 2;
+    // A MERGE card is unmistakable: a gold border, a MERGE tag, and
+    // the two components it evolves from.
+    ctx.strokeStyle = up.isMerge ? GOLD : CYAN;
+    ctx.lineWidth = up.isMerge ? 3 : 2;
     ctx.strokeRect(card.x, card.y, card.w, card.h);
+    if (up.isMerge) {
+      ctx.fillStyle = GOLD;
+      ctx.font = 'bold 15px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText('◆ MERGE ◆', card.x + card.w - 16, card.y + 32);
+      ctx.textAlign = 'center';
+    }
     // Key badge: press 1, 2 or 3 — or tap the card.
     ctx.save();
     ctx.translate(card.x + 28, card.y + 30);
@@ -4561,9 +6500,15 @@ function drawUpgrade(ctx, state, offers, width, height, age = 0) {
     ctx.restore();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = CYAN;
+    ctx.fillStyle = up.isMerge ? GOLD : CYAN;
     ctx.font = 'bold 26px sans-serif';
     ctx.fillText(up.name, card.x + card.w / 2, card.y + 84);
+    if (up.isMerge) {
+      const compNames = (up.components || []).map((id) => upgradeById(id)?.name ?? id);
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 15px sans-serif';
+      ctx.fillText(`${compNames.join('  +  ')}  →`, card.x + card.w / 2, card.y + 108);
+    }
     ctx.fillStyle = '#e2e8f0';
     ctx.font = '17px sans-serif';
     const lines = wrapText(ctx, up.desc, card.w - 36);
@@ -4571,8 +6516,12 @@ function drawUpgrade(ctx, state, offers, width, height, age = 0) {
       ctx.fillText(line, card.x + card.w / 2, card.y + 122 + li * 24);
     });
     // Current level: pips for capped upgrades, a count for AEGIS.
+    // A merge is a one-time evolution, not a stack.
     ctx.font = 'bold 16px sans-serif';
-    if (Number.isFinite(up.max)) {
+    if (up.isMerge) {
+      ctx.fillStyle = GOLD;
+      ctx.fillText('ONE-TIME EVOLUTION', card.x + card.w / 2, card.y + 200);
+    } else if (Number.isFinite(up.max)) {
       const pipGap = 26;
       const totalW = (up.max - 1) * pipGap;
       const startX = card.x + card.w / 2 - totalW / 2;
@@ -4618,18 +6567,18 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 26px sans-serif';
   ctx.fillText(`SCORE  ${state.score}    •    LEVEL ${state.level}    •    BEST COMBO  x${Math.max(1, state.bestCombo)}`, width / 2, 268);
-  let y = 306;
+  let y = 296;
   if (summary && summary.endless) {
     ctx.fillStyle = GREEN;
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText('∞  ENDLESS RUN — you drifted past the Aurora Gate!', width / 2, y);
-    y += 36;
+    y += 28;
   }
   if (state.score >= best && state.score > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText('★ NEW BEST SCORE ★', width / 2, y);
-    y += 36;
+    y += 28;
   }
   if (summary && summary.rank > 0) {
     ctx.fillStyle = GOLD;
@@ -4640,7 +6589,7 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
         : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
       width / 2, y,
     );
-    y += 36;
+    y += 28;
   }
   // Near-miss line (Zeigarnik): how close the stage target was. Only
   // when the player died within 100 points of clearing the stage.
@@ -4651,7 +6600,7 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
     ctx.fillStyle = '#a5f3fc';
     ctx.font = 'bold 22px sans-serif';
     ctx.fillText(`You died at ${state.score} — just ${stageTarget - state.score} more to clear stage ${stage}!`, width / 2, y);
-    y += 36;
+    y += 28;
   }
   // Missions, one compact line instead of one line per mission.
   if (summary && summary.completed.length) {
@@ -4659,7 +6608,24 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 20px sans-serif';
     ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
-    y += 36;
+    y += 28;
+  }
+  // Newly unlocked achievements (the coins are claimed from the
+  // profile screen — never auto-paid). At most two lines; the second
+  // folds any further unlocks into a "+N more".
+  const unlocked = summary?.achievements ?? [];
+  if (unlocked.length) {
+    ctx.fillStyle = '#c084fc';
+    ctx.font = 'bold 20px sans-serif';
+    const first = unlocked[0];
+    ctx.fillText(`🏆 ACHIEVEMENT: ${first.name} +${first.reward} 🪙`, width / 2, y);
+    y += 28;
+    if (unlocked.length > 1) {
+      const second = unlocked[1];
+      const more = unlocked.length > 2 ? `  (+${unlocked.length - 2} more)` : '';
+      ctx.fillText(`🏆 ACHIEVEMENT: ${second.name} +${second.reward} 🪙${more}`, width / 2, y);
+      y += 28;
+    }
   }
   // The visible next goal: in a campaign run it is the stage itself —
   // a boss stage names the boss. In endless (or with no stage yet) it
@@ -4684,7 +6650,7 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
   drawButton(ctx, OVER_HANGAR_RECT, 'HANGAR  [H]');
   ctx.fillStyle = '#94a3b8';
   ctx.font = '17px sans-serif';
-  ctx.fillText('R retry  •  H hangar  •  Esc menu', width / 2, 622);
+  ctx.fillText('R retry  •  H hangar  •  Esc menu', width / 2, 672);
 }
 
 function drawClear(ctx, state, best, width, height, summary = null, extra = {}) {
@@ -4693,16 +6659,16 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
   const stage = summary?.stage ?? state.stage ?? 1;
   const coins = summary?.coins ?? 0;
   const firstClear = summary?.firstClear ?? false;
-  bigTitle(ctx, `STAGE ${stage} CLEAR!`, 150, width, GREEN, 56);
+  bigTitle(ctx, `STAGE ${stage} CLEAR!`, 140, width, GREEN, 56);
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fef9c3';
   ctx.font = 'bold 26px sans-serif';
-  ctx.fillText(`You cleared stage ${stage} — the storm bows to you.`, width / 2, 210);
+  ctx.fillText(`You cleared stage ${stage} — the storm bows to you.`, width / 2, 196);
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 24px sans-serif';
   ctx.fillText(
     `+${coins} COINS${firstClear ? '  •  FIRST CLEAR!' : '  •  replay reward'}`,
-    width / 2, 252,
+    width / 2, 236,
   );
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 22px sans-serif';
@@ -4710,9 +6676,9 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
     stage >= 100
       ? 'ALL 100 STAGES CLEAR — YOU ARE THE STORM!'
       : `STAGE ${stage + 1} UNLOCKED!`,
-    width / 2, 290,
+    width / 2, 272,
   );
-  let y = 312;
+  let y = 296;
   if (summary && summary.rank > 0) {
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 20px sans-serif';
@@ -4722,14 +6688,36 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
         : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
       width / 2, y,
     );
-    y += 28;
+    y += 26;
   }
   if (summary && summary.completed.length) {
     const total = summary.completed.reduce((n, m) => n + m.reward, 0);
     ctx.fillStyle = '#34d399';
     ctx.font = 'bold 20px sans-serif';
     ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
-    y += 28;
+    y += 26;
+  }
+  // Newly unlocked achievements (coins claimed from the profile —
+  // never auto-paid) and the boss chip drop, if any.
+  const unlocked = summary?.achievements ?? [];
+  if (unlocked.length) {
+    ctx.fillStyle = '#c084fc';
+    ctx.font = 'bold 20px sans-serif';
+    const first = unlocked[0];
+    ctx.fillText(`🏆 ACHIEVEMENT: ${first.name} +${first.reward} 🪙`, width / 2, y);
+    y += 26;
+    if (unlocked.length > 1) {
+      const second = unlocked[1];
+      const more = unlocked.length > 2 ? `  (+${unlocked.length - 2} more)` : '';
+      ctx.fillText(`🏆 ACHIEVEMENT: ${second.name} +${second.reward} 🪙${more}`, width / 2, y);
+      y += 26;
+    }
+  }
+  if (summary && summary.bossDrop) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(`🎁 BOSS DROP: ${summary.bossDrop}`, width / 2, y);
+    y += 26;
   }
   // NEXT is the gold primary (only while a next stage exists); REPLAY,
   // STAGES and HANGAR are the outlined exits. CONTINUE — ENDLESS shows
@@ -4880,101 +6868,507 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
   drawButton(ctx, layout.back, '◀  BACK  [H]');
 }
 
-function drawShop(ctx, save, width, height) {
+function drawShop(ctx, save, width, height, extra = {}) {
+  const section = extra.section ?? 'ships';
+  const weapons = extra.weapons ?? WEAPONS;
+  const chips = extra.chips ?? CHIPS;
   panel(ctx, width, height);
-  bigTitle(ctx, 'SHIP SHOP', 64, width, GOLD, 46);
+  const title = section === 'weapons' ? 'WEAPON SHOP' : section === 'chips' ? 'CHIP SHOP' : 'SHIP SHOP';
+  bigTitle(ctx, title, 64, width, GOLD, 46);
   const coins = save ? (save.coins ?? 0) : 0;
   const equippedId = equippedShip(save).id;
   ctx.textAlign = 'center';
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 21px sans-serif';
-  ctx.fillText(`🪙 ${coins} coins — clear stages to earn more`, width / 2, 108);
-  ctx.fillStyle = '#a5f3fc';
-  ctx.font = '17px sans-serif';
-  ctx.fillText('Ships level up with coins too — higher stages demand a stronger ship.', width / 2, 136);
-  for (const card of layoutShopCards()) {
-    const def = card.ship;
-    const level = shipLevel(save, def.id);
-    const owned = level > 0;
-    const isEquipped = def.id === equippedId && owned;
-    const stats = shipStats(def, Math.max(1, level));
-    const color = RARITY_COLORS[def.rarity] ?? '#e2e8f0';
+  let coinsLine = `🪙 ${coins} coins — clear stages to earn more`;
+  if (section === 'chips' && save) {
+    const slots = save.chips?.slots ?? [null, null];
+    const filled = slots.filter(Boolean).length;
+    coinsLine += `   •   CHIP SLOTS ${filled}/${chipSlotCount(save)}`;
+  }
+  ctx.fillText(coinsLine, width / 2, 100);
+  // Section tabs: one section visible at a time.
+  const tabLabels = { ships: 'SHIPS', weapons: 'WEAPONS', chips: 'CHIPS' };
+  for (const [key, rect] of Object.entries(SHOP_SECTION_RECTS)) {
+    const active = key === section;
     ctx.save();
-    ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
-    ctx.fillRect(card.x, card.y, card.w, card.h);
-    ctx.strokeStyle = isEquipped ? GOLD : color;
-    ctx.lineWidth = isEquipped ? 3 : 2;
-    ctx.strokeRect(card.x, card.y, card.w, card.h);
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = color;
-    ctx.font = 'bold 24px sans-serif';
-    ctx.fillText(def.name, card.x + 18, card.y + 36);
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = 'bold 14px sans-serif';
-    ctx.fillText(def.rarity.toUpperCase(), card.x + 18, card.y + 58);
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '17px sans-serif';
-    ctx.fillText(`♥ ${stats.hearts} hearts   •   speed ×${stats.speedMult.toFixed(2)}`, card.x + 18, card.y + 88);
-    ctx.fillText(`Blaster ${stats.blasterDamage} dmg   •   ${stats.blasterRate.toFixed(1)}/s`, card.x + 18, card.y + 112);
-    // Level pips.
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = 'bold 16px sans-serif';
-    ctx.fillText(owned ? `Lv ${level}/10` : 'Not owned', card.x + 18, card.y + 138);
-    if (owned) {
-      const pipGap = 22;
-      const startX = card.x + 130;
-      for (let p = 0; p < 10; p += 1) {
-        ctx.beginPath();
-        ctx.arc(startX + p * pipGap, card.y + 132, 6, 0, Math.PI * 2);
-        ctx.fillStyle = p < level ? GOLD : 'rgba(148, 163, 184, 0.35)';
-        ctx.fill();
-      }
-    }
-    // Lock line, or the action button.
-    const b = card.action;
-    if (!owned && (save?.highestCleared ?? 0) < def.unlockStage) {
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = 'bold 17px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(`🔒 Clear stage ${def.unlockStage}`, b.x + b.w / 2, b.y + b.h / 2 + 1);
-    } else {
-      // No save (a bare screenshot draw): nothing can be bought.
-      const buy = save ? canBuyShip(save, def.id) : { ok: false, reason: 'broke' };
-      const lvl = save ? canLevelShip(save, def.id) : { ok: false, reason: 'not-owned' };
-      let label;
-      let active = false;
-      let gold = false;
-      if (!owned) {
-        label = buy.ok ? `BUY  🪙 ${def.price}` : `NEED  🪙 ${def.price}`;
-        active = buy.ok;
-        gold = buy.ok;
-      } else if (isEquipped && !lvl.ok && lvl.reason === 'maxed') {
-        label = 'EQUIPPED ★';
-      } else if (isEquipped) {
-        label = lvl.ok ? `LEVEL UP  🪙 ${lvl.cost}` : `NEED  🪙 ${shipLevelCost(level)}`;
-        active = lvl.ok;
-        gold = lvl.ok;
-      } else {
-        label = 'EQUIP';
-        active = true;
-      }
-      ctx.fillStyle = gold ? GOLD : (active ? 'rgba(34, 211, 238, 0.20)' : 'rgba(148, 163, 184, 0.18)');
-      ctx.fillRect(b.x, b.y, b.w, b.h);
-      ctx.strokeStyle = gold ? GOLD : (active ? CYAN : 'rgba(148, 163, 184, 0.35)');
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(b.x, b.y, b.w, b.h);
-      ctx.fillStyle = gold ? INK : (active ? CYAN : '#94a3b8');
-      ctx.font = 'bold 18px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
-    }
+    ctx.fillStyle = active ? GOLD : 'rgba(20, 27, 61, 0.96)';
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeStyle = active ? GOLD : 'rgba(148, 163, 184, 0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = active ? INK : '#94a3b8';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(tabLabels[key], rect.x + rect.w / 2, rect.y + rect.h / 2 + 1);
     ctx.restore();
+  }
+  if (section === 'weapons') {
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '17px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('Weapons unlock with pilot level — switching weapons is free.', width / 2, 110);
+    const equippedWeaponId = equippedWeapon(save);
+    for (const card of layoutShopWeapons(weapons)) {
+      const def = card.weapon;
+      const level = Math.max(1, weaponLevel(save, def.id));
+      const owned = !!(save?.weapons?.owned && save.weapons.owned[def.id]);
+      const isEquipped = def.id === equippedWeaponId && owned;
+      const ws = weaponStats(def, level, shipStats(equippedShip(save), Math.max(1, shipLevel(save, equippedShip(save).id))));
+      ctx.save();
+      ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+      ctx.fillRect(card.x, card.y, card.w, card.h);
+      ctx.strokeStyle = isEquipped ? GOLD : CYAN;
+      ctx.lineWidth = isEquipped ? 3 : 2;
+      ctx.strokeRect(card.x, card.y, card.w, card.h);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = CYAN;
+      ctx.font = 'bold 24px sans-serif';
+      ctx.fillText(def.name, card.x + 18, card.y + 36);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '15px sans-serif';
+      const descLines = wrapText(ctx, def.desc, card.w - 36).slice(0, 2);
+      descLines.forEach((line, li) => {
+        ctx.fillText(line, card.x + 18, card.y + 60 + li * 20);
+      });
+      ctx.font = '17px sans-serif';
+      ctx.fillText(`DMG ${ws.damage}   •   ${ws.rate.toFixed(1)}/s   •   RNG ${ws.range}`, card.x + 18, card.y + 110);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText(owned ? `Lv ${level}/10` : 'Not owned', card.x + 18, card.y + 140);
+      if (owned) {
+        const pipGap = 22;
+        const startX = card.x + 130;
+        for (let p = 0; p < 10; p += 1) {
+          ctx.beginPath();
+          ctx.arc(startX + p * pipGap, card.y + 134, 6, 0, Math.PI * 2);
+          ctx.fillStyle = p < level ? GOLD : 'rgba(148, 163, 184, 0.35)';
+          ctx.fill();
+        }
+      }
+      // Lock line, or the action button.
+      const b = card.action;
+      const pilotLevel = save?.pilot?.level ?? 1;
+      if (!owned && pilotLevel < def.unlockPilotLevel) {
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = 'bold 17px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`🔒 Pilot Lv ${def.unlockPilotLevel}`, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      } else {
+        const buy = save ? canBuyWeapon(save, def.id) : { ok: false, reason: 'broke' };
+        const lvl = save ? canLevelWeapon(save, def.id) : { ok: false, reason: 'not-owned' };
+        let label;
+        let active = false;
+        let gold = false;
+        if (!owned) {
+          label = buy.ok ? `BUY  🪙 ${def.price}` : `NEED  🪙 ${def.price}`;
+          active = buy.ok;
+          gold = buy.ok;
+        } else if (isEquipped && !lvl.ok && lvl.reason === 'maxed') {
+          label = 'EQUIPPED ★';
+        } else if (isEquipped) {
+          label = lvl.ok ? `LEVEL UP  🪙 ${lvl.cost}` : `NEED  🪙 ${weaponLevelCost(level)}`;
+          active = lvl.ok;
+          gold = lvl.ok;
+        } else {
+          label = 'EQUIP';
+          active = true;
+        }
+        ctx.fillStyle = gold ? GOLD : (active ? 'rgba(34, 211, 238, 0.20)' : 'rgba(148, 163, 184, 0.18)');
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.strokeStyle = gold ? GOLD : (active ? CYAN : 'rgba(148, 163, 184, 0.35)');
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = gold ? INK : (active ? CYAN : '#94a3b8');
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      }
+      ctx.restore();
+    }
+  } else if (section === 'chips') {
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '17px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('Chips slot into your loadout — tap SLOT to equip, tap a slotted chip to remove it.', width / 2, 110);
+    const slots = save?.chips?.slots ?? [null, null];
+    const freeSlot = slots.some((s) => s == null);
+    for (const card of layoutShopChips(chips)) {
+      const def = card.chip;
+      const owned = !!(save?.chips?.owned && save.chips.owned[def.id]);
+      const slotted = slots.includes(def.id);
+      const color = RARITY_COLORS[def.rarity] ?? '#e2e8f0';
+      ctx.save();
+      ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+      ctx.fillRect(card.x, card.y, card.w, card.h);
+      ctx.strokeStyle = slotted ? GOLD : color;
+      ctx.lineWidth = slotted ? 3 : 2;
+      ctx.strokeRect(card.x, card.y, card.w, card.h);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = color;
+      ctx.font = 'bold 20px sans-serif';
+      ctx.fillText(def.name, card.x + 16, card.y + 28);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillText(def.rarity.toUpperCase(), card.x + card.w - 16 - ctx.measureText(def.rarity.toUpperCase()).width, card.y + 28);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '14px sans-serif';
+      const descLines = wrapText(ctx, def.desc, card.w - 32).slice(0, 2);
+      descLines.forEach((line, li) => {
+        ctx.fillText(line, card.x + 16, card.y + 52 + li * 18);
+      });
+      // Lock line, or the action button.
+      const b = card.action;
+      const pilotLevel = save?.pilot?.level ?? 1;
+      if (!owned && pilotLevel < def.unlockPilotLevel) {
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = 'bold 16px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`🔒 Pilot Lv ${def.unlockPilotLevel}`, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      } else {
+        const buy = save ? canBuyChip(save, def.id) : { ok: false, reason: 'broke' };
+        let label;
+        let active = false;
+        let gold = false;
+        if (!owned) {
+          label = buy.ok ? `BUY  🪙 ${def.price}` : `NEED  🪙 ${def.price}`;
+          active = buy.ok;
+          gold = buy.ok;
+        } else if (slotted) {
+          label = 'SLOTTED ◆';
+          active = true;
+        } else if (!freeSlot) {
+          label = 'NO FREE SLOT';
+          active = false;
+        } else {
+          label = 'SLOT';
+          active = true;
+        }
+        ctx.fillStyle = gold ? GOLD : (active ? 'rgba(34, 211, 238, 0.20)' : 'rgba(148, 163, 184, 0.18)');
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.strokeStyle = gold ? GOLD : (active ? CYAN : 'rgba(148, 163, 184, 0.35)');
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = gold ? INK : (active ? CYAN : '#94a3b8');
+        ctx.font = 'bold 16px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      }
+      ctx.restore();
+    }
+  } else {
+    ctx.fillStyle = '#a5f3fc';
+    ctx.font = '17px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('Ships level up with coins too — higher stages demand a stronger ship.', width / 2, 110);
+    for (const card of layoutShopCards()) {
+      const def = card.ship;
+      const level = shipLevel(save, def.id);
+      const owned = level > 0;
+      const isEquipped = def.id === equippedId && owned;
+      const stats = shipStats(def, Math.max(1, level));
+      const color = RARITY_COLORS[def.rarity] ?? '#e2e8f0';
+      ctx.save();
+      ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+      ctx.fillRect(card.x, card.y, card.w, card.h);
+      ctx.strokeStyle = isEquipped ? GOLD : color;
+      ctx.lineWidth = isEquipped ? 3 : 2;
+      ctx.strokeRect(card.x, card.y, card.w, card.h);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = color;
+      ctx.font = 'bold 24px sans-serif';
+      ctx.fillText(def.name, card.x + 18, card.y + 36);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillText(def.rarity.toUpperCase(), card.x + 18, card.y + 58);
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '17px sans-serif';
+      ctx.fillText(`♥ ${stats.hearts} hearts   •   speed ×${stats.speedMult.toFixed(2)}`, card.x + 18, card.y + 88);
+      ctx.fillText(`Blaster ${stats.blasterDamage} dmg   •   ${stats.blasterRate.toFixed(1)}/s`, card.x + 18, card.y + 112);
+      // The ship's unique power (Stage 2): one line under the stats.
+      if (def.power) {
+        ctx.fillStyle = GOLD;
+        ctx.font = '13px sans-serif';
+        const powerLine = `⚡ ${def.power.name}: ${def.power.desc}`;
+        const wrapped = wrapText(ctx, powerLine, card.w - 36).slice(0, 1);
+        ctx.fillText(wrapped[0] ?? powerLine, card.x + 18, card.y + 130);
+      }
+      // Level pips.
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = 'bold 16px sans-serif';
+      ctx.fillText(owned ? `Lv ${level}/10` : 'Not owned', card.x + 18, card.y + 152);
+      if (owned) {
+        const pipGap = 22;
+        const startX = card.x + 130;
+        for (let p = 0; p < 10; p += 1) {
+          ctx.beginPath();
+          ctx.arc(startX + p * pipGap, card.y + 146, 6, 0, Math.PI * 2);
+          ctx.fillStyle = p < level ? GOLD : 'rgba(148, 163, 184, 0.35)';
+          ctx.fill();
+        }
+      }
+      // Lock line, or the action button.
+      const b = card.action;
+      if (!owned && (save?.highestCleared ?? 0) < def.unlockStage) {
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = 'bold 17px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`🔒 Clear stage ${def.unlockStage}`, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      } else {
+        // No save (a bare screenshot draw): nothing can be bought.
+        const buy = save ? canBuyShip(save, def.id) : { ok: false, reason: 'broke' };
+        const lvl = save ? canLevelShip(save, def.id) : { ok: false, reason: 'not-owned' };
+        let label;
+        let active = false;
+        let gold = false;
+        if (!owned) {
+          label = buy.ok ? `BUY  🪙 ${def.price}` : `NEED  🪙 ${def.price}`;
+          active = buy.ok;
+          gold = buy.ok;
+        } else if (isEquipped && !lvl.ok && lvl.reason === 'maxed') {
+          label = 'EQUIPPED ★';
+        } else if (isEquipped) {
+          label = lvl.ok ? `LEVEL UP  🪙 ${lvl.cost}` : `NEED  🪙 ${shipLevelCost(level)}`;
+          active = lvl.ok;
+          gold = lvl.ok;
+        } else {
+          label = 'EQUIP';
+          active = true;
+        }
+        ctx.fillStyle = gold ? GOLD : (active ? 'rgba(34, 211, 238, 0.20)' : 'rgba(148, 163, 184, 0.18)');
+        ctx.fillRect(b.x, b.y, b.w, b.h);
+        ctx.strokeStyle = gold ? GOLD : (active ? CYAN : 'rgba(148, 163, 184, 0.35)');
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = gold ? INK : (active ? CYAN : '#94a3b8');
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+      }
+      ctx.restore();
+    }
   }
   ctx.textBaseline = 'alphabetic';
   drawButton(ctx, SHOP_BACK_RECT, '◀  BACK  [H]');
+}
+
+// --- Profile: pilot level + XP bar, equipped loadout, Attribute
+// Overview, Collection, Achievements (claimable from here).
+function drawProfile(ctx, save, width, height, extra = {}) {
+  const profile = extra.profile ?? profileFromSave(save, extra.profileOpts ?? {});
+  const layout = layoutProfileSections(profile);
+  panel(ctx, width, height);
+  bigTitle(ctx, 'PROFILE', 64, width, '#c084fc', 46);
+
+  // Pilot XP panel.
+  const xp = layout.xp;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+  ctx.fillRect(xp.x, xp.y, xp.w, xp.h);
+  ctx.strokeStyle = '#c084fc';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(xp.x, xp.y, xp.w, xp.h);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#c084fc';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillText(`PILOT  Lv ${profile.pilot.level}`, xp.x + 18, xp.y + 34);
+  const barX = xp.x + 18;
+  const barY = xp.y + 46;
+  const barW = xp.w - 36;
+  const barH = 12;
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.fillRect(barX, barY, barW, barH);
+  ctx.fillStyle = '#c084fc';
+  ctx.fillRect(barX, barY, barW * Math.max(0, Math.min(1, profile.pilot.xpProgress ?? 0)), barH);
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '16px sans-serif';
+  const xpIntoLevel = Math.round((profile.pilot.xpProgress ?? 0) * (profile.pilot.xpToNext ?? 0));
+  ctx.fillText(`XP ${xpIntoLevel} / ${profile.pilot.xpToNext} to Lv ${profile.pilot.level + 1}`, xp.x + 18, xp.y + 72);
+  ctx.restore();
+
+  // Loadout panel: ship (+ power), weapon, chips, totals.
+  const lo = layout.loadout;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+  ctx.fillRect(lo.x, lo.y, lo.w, lo.h);
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(lo.x, lo.y, lo.w, lo.h);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('LOADOUT', lo.x + 18, lo.y + 24);
+  ctx.font = '18px sans-serif';
+  ctx.fillStyle = CYAN;
+  ctx.fillText(`SHIP ${profile.loadout.ship.name}  Lv ${profile.loadout.ship.level}`, lo.x + 18, lo.y + 50);
+  if (profile.loadout.shipPower) {
+    ctx.fillStyle = GOLD;
+    ctx.font = '14px sans-serif';
+    ctx.fillText(`⚡ ${profile.loadout.shipPower.name}: ${profile.loadout.shipPower.desc}`, lo.x + 18, lo.y + 72);
+  }
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = '18px sans-serif';
+  ctx.fillText(`WEAPON ${profile.loadout.weapon.name}  Lv ${profile.loadout.weapon.level}`, lo.x + 18, lo.y + 96);
+  const chipNames = (profile.loadout.chips || []).map((c) => c.name);
+  ctx.fillStyle = '#c084fc';
+  ctx.fillText(`CHIPS: ${chipNames.length ? chipNames.join(', ') : '—'}`, lo.x + 18, lo.y + 120);
+  // Lifetime totals, one compact line at the foot of the loadout.
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '13px sans-serif';
+  ctx.fillText(
+    `RUNS ${profile.totals.runsPlayed}  •  STAGES ${profile.totals.stagesCleared}  •  KILLS ${profile.totals.enemiesDestroyed}  •  BOSSES ${profile.totals.bossesKilled}`,
+    lo.x + 18, lo.y + 136,
+  );
+  ctx.restore();
+
+  // Attribute Overview panel: base stats, then the active chip effects.
+  const at = layout.attributes;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+  ctx.fillRect(at.x, at.y, at.w, at.h);
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(at.x, at.y, at.w, at.h);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('ATTRIBUTES', at.x + 18, at.y + 24);
+  const attrLines = [
+    ['HEARTS', `${profile.attributes.hearts}`],
+    ['SPEED', `×${profile.attributes.speedMult.toFixed(2)}`],
+    ['WEAPON DAMAGE', `${profile.attributes.weaponDamage}`],
+    ['FIRE RATE', `${profile.attributes.weaponRate.toFixed(1)}/s`],
+    ['DASH COOLDOWN', `${profile.attributes.dashCooldown.toFixed(2)}s`],
+    ['MAGNET RADIUS', `${profile.attributes.magnetRadius}`],
+    ['SHARD VALUE', `${profile.attributes.shardValue} pts`],
+  ];
+  for (const effect of profile.attributes.chipEffects ?? []) {
+    attrLines.push([effect.label, effect.value]);
+  }
+  ctx.font = '17px sans-serif';
+  attrLines.forEach(([label, value], i) => {
+    const y = at.y + 52 + i * 24;
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText(label, at.x + 18, y);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.textAlign = 'right';
+    ctx.fillText(value, at.x + at.w - 18, y);
+    ctx.textAlign = 'left';
+  });
+  ctx.restore();
+
+  // Collection panel: four category rows (ships / weapons / chips /
+  // skins) with owned-vs-locked items and their unlock condition.
+  const col = layout.collection;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+  ctx.fillRect(col.x, col.y, col.w, col.h);
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(col.x, col.y, col.w, col.h);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.fillText('COLLECTION', col.x + 18, col.y + 24);
+  const categories = [
+    ['SHIPS', profile.collection.ships, col.rows.ships],
+    ['WEAPONS', profile.collection.weapons, col.rows.weapons],
+    ['CHIPS', profile.collection.chips, col.rows.chips],
+    ['SKINS', profile.collection.skins, col.rows.skins],
+  ];
+  for (const [label, cat, row] of categories) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText(`${label}  ${cat.owned}/${cat.total}`, row.x, row.y + 16);
+    // Items flow across the row (two lines for chips), each owned item
+    // in white with a ✓, each locked one dimmed with its unlock gate.
+    ctx.font = '13px sans-serif';
+    let itemX = row.x;
+    let itemY = row.y + 36;
+    const maxX = row.x + row.w;
+    for (const item of cat.items ?? []) {
+      const text = item.owned ? `${item.name} ✓  ` : `${item.name} 🔒 ${item.short}  `;
+      const w = ctx.measureText(text).width;
+      if (itemX + w > maxX && itemX > row.x) {
+        itemX = row.x;
+        itemY += 18;
+      }
+      if (itemY > row.y + row.h - 2) break;
+      ctx.fillStyle = item.owned ? '#e2e8f0' : '#64748b';
+      ctx.fillText(text, itemX, itemY);
+      itemX += w;
+    }
+  }
+  ctx.restore();
+
+  // Achievements panel: up to 5 rows, each with a CLAIM button when
+  // the achievement is unlocked and unclaimed.
+  const ac = layout.achievements;
+  ctx.save();
+  ctx.fillStyle = 'rgba(20, 27, 61, 0.96)';
+  ctx.fillRect(ac.x, ac.y, ac.w, ac.h);
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(ac.x, ac.y, ac.w, ac.h);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#e2e8f0';
+  ctx.font = 'bold 18px sans-serif';
+  const claimed = (profile.achievements ?? []).filter((a) => a.state === 'claimed').length;
+  ctx.fillText(`ACHIEVEMENTS  ${claimed}/${profile.achievements.length}`, ac.x + 18, ac.y + 24);
+  for (const row of ac.rows) {
+    const a = row.achievement;
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.fillText(a.name, row.x, row.y + 16);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '13px sans-serif';
+    ctx.fillText(a.desc, row.x, row.y + 33);
+    const b = row.claim;
+    const claimable = a.state === 'claimable';
+    const isClaimed = a.state === 'claimed';
+    ctx.fillStyle = claimable ? GOLD : (isClaimed ? 'rgba(52, 211, 153, 0.25)' : 'rgba(148, 163, 184, 0.18)');
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = claimable ? GOLD : 'rgba(148, 163, 184, 0.35)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = claimable ? INK : (isClaimed ? '#34d399' : '#94a3b8');
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(
+      claimable ? `CLAIM +${a.reward}` : (isClaimed ? 'CLAIMED ✓' : `🔒 +${a.reward}`),
+      b.x + b.w / 2, b.y + b.h / 2 + 1,
+    );
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+  if (ac.total > ac.shown) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '14px sans-serif';
+    ctx.fillText(`+ ${ac.total - ac.shown} more achievements…`, ac.x + 18, ac.y + ac.h - 10);
+  }
+  ctx.restore();
+
+  ctx.textBaseline = 'alphabetic';
+  drawButton(ctx, PROFILE_BACK_RECT, '◀  BACK  [H]');
 }
 
 function createRenderer(canvas) {
@@ -5074,6 +7468,8 @@ function createRenderer(canvas) {
       for (const e of state.enemies ?? []) drawEnemy(ctx, e);
       for (const b of state.bullets ?? []) drawBullet(ctx, b);
       for (const b of state.enemyBullets ?? []) drawEnemyBullet(ctx, b);
+      for (const t of state.traps ?? []) drawTrap(ctx, t);
+      for (const seg of state.pulseFx ?? []) drawPulseFx(ctx, seg);
       if (state.boss) drawBoss(ctx, state.boss);
       if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawShip(ctx, state, skin, extra.shipShape ?? 'skiff');
     }
@@ -5138,11 +7534,12 @@ function createRenderer(canvas) {
     ctx.globalAlpha = 1;
     ctx.restore();
 
-    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width, theme);
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width, theme, { weaponLabel: extra.weaponLabel });
     if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
-    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape });
+    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape, loadout: extra.loadout });
     if (screen === SCREEN_STAGES) drawStages(ctx, save, FIELD.width, FIELD.height, extra.stagesPage ?? 0, { ship: extra.ship });
-    if (screen === SCREEN_SHOP) drawShop(ctx, save, FIELD.width, FIELD.height);
+    if (screen === SCREEN_SHOP) drawShop(ctx, save, FIELD.width, FIELD.height, { section: extra.section, weapons: extra.weapons, chips: extra.chips });
+    if (screen === SCREEN_PROFILE) drawProfile(ctx, save, FIELD.width, FIELD.height, { profile: extra.profile, profileOpts: extra.profileOpts });
     if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
     if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
     if (screen === SCREEN_CLEAR) drawClear(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
@@ -5184,7 +7581,7 @@ function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
 }
 
 // ---- src/shots.js ----
-// Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win.
+// Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win|profile.
 // Each scene plays the real rules forward from a fresh world for a fixed
 // number of steps, steered by a simple autopilot (chase the nearest shard,
 // keep clear of mines and storm shards), so the frame is what a real game
@@ -5194,6 +7591,8 @@ function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
 // - play: a busy mid-game — score ~340, combo x3, 2 hearts left.
 // - end: the autopilot flies carelessly and the storm takes the skiff.
 // - win: stage 1 clears at its target (500 points).
+// - profile: the profile screen over a demo save (Lv 3 pilot, two ships,
+//   a mortar, two chips, two achievements unlocked, one claimed).
 
 const START_SECONDS = 6;
 const PLAY_TARGET = 340;
@@ -5285,6 +7684,25 @@ function stageShot(name, world) {
     for (let i = 0; i < 20; i += 1) world.step(STEP, { x: 0, y: 0 }, null, false);
     return { screen: SCREEN_OVER, best: state.score };
   }
+  if (name === 'profile') {
+    // A demo save with real progress: Lv 3 pilot, two ships, a mortar,
+    // two chips (one slotted), two achievements unlocked, one claimed.
+    const save = freshSave(localDate());
+    save.coins = 1250;
+    save.highestCleared = 12;
+    save.pilot = { xp: 320, level: 3 };
+    save.ships = { owned: { spark: { level: 3 }, comet: { level: 1 } }, equipped: 'comet' };
+    save.weapons = { owned: { blaster: { level: 2 }, mortar: { level: 1 } }, equipped: 'mortar' };
+    save.chips = { owned: { 'piercing-rounds': true, 'golden-touch': true }, slots: ['piercing-rounds', null] };
+    save.achievements = { unlocked: { 'first-blood': true, 'boss-first': true }, claimed: { 'first-blood': true } };
+    save.stats = { enemiesDestroyed: 342, bulletsDestroyed: 128, bossesKilled: 2, stagesCleared: 12, totalScore: 18400, runsPlayed: 31 };
+    save.lifetime.shards = 500;
+    const achievements = ACHIEVEMENTS.map((def) => ({
+      id: def.id, name: def.name, desc: def.desc, reward: def.reward,
+      state: save.achievements.claimed[def.id] ? 'claimed' : (save.achievements.unlocked[def.id] ? 'claimable' : 'locked'),
+    }));
+    return { screen: SCREEN_PROFILE, best: 0, extra: { save, profile: profileFromSave(save, { achievements }) } };
+  }
   // start (and any unknown name): a live field behind the title.
   for (let i = 0; i < START_SECONDS / STEP; i += 1) {
     world.step(STEP, { x: 0, y: 0 }, null, false);
@@ -5296,12 +7714,12 @@ function stageShot(name, world) {
 // Lumen Drift — boot and the one loop. Input is read every frame, the world
 // advances in fixed 1/60 s steps (several in a slow frame, none in a fast
 // one), and the renderer paints what is there. The game moves between
-// fourteen screens: title, stage select, ship shop, hangar, play, upgrade
-// (level-up choice), paused, game over and stage clear (which can continue
-// into endless mode), plus the panels over Home — top scores, daily
-// missions, settings and daily reward.
+// fifteen screens: title, stage select, ship shop, profile, hangar, play,
+// upgrade (level-up choice), paused, game over and stage clear (which can
+// continue into endless mode), plus the panels over Home — top scores,
+// daily missions, settings and daily reward.
 //
-// ?seed=N fixes the storm's pattern. ?shot=start|play|end|win (with
+// ?seed=N fixes the storm's pattern. ?shot=start|play|end|win|profile (with
 // &seed=N) stages that scene instead of running the loop, paints it twice
 // and sets window.__shotReady for a screenshot. ?debug=win starts a live
 // game one shard away from the stage-1 target, for testing the clear path.
@@ -5340,7 +7758,7 @@ function runShot(name) {
   const scene = stageShot(name, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world.state, scene.screen, scene.best, scene.extra ?? {});
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -5413,6 +7831,8 @@ function runGame() {
   let upgradeAge = 0;
   // Which 10-stage band the stage select is showing (0 = stages 1–10).
   let stagesPage = 0;
+  // Which shop section is showing: ships, weapons or chips.
+  let shopSection = 'ships';
 
   // Debug hook for testing the clear path: one shard away from the
   // stage-1 target. (Stage is 1 by default.)
@@ -5428,10 +7848,55 @@ function runGame() {
   }
 
   // Pick up the equipped ship's stats (a shop purchase between runs
-  // changes them).
+  // changes them), plus the equipped weapon, its levels, the slotted
+  // chips and the ship itself — the world's loadout.
   function applyEquippedShip() {
     const stats = equippedShipStats(save);
     world.setShip(stats);
+    const chipIds = equippedChips(save).map((chip) => chip.id);
+    const weaponLevels = {};
+    for (const [id, owned] of Object.entries(save.weapons?.owned ?? {})) {
+      weaponLevels[id] = owned?.level ?? 1;
+    }
+    world.setLoadout({
+      weaponId: save.weapons?.equipped ?? 'blaster',
+      weaponLevel: save.weapons?.owned?.[save.weapons?.equipped ?? 'blaster']?.level ?? 1,
+      weaponLevels,
+      chipEffects: chipEffectsFor(chipIds),
+      shipId: equippedShip(save).id,
+    });
+  }
+
+  // The loadout as the renderer shows it: weapon name + level, slotted
+  // chip names (hangar line, HUD label, profile screen).
+  function loadoutView() {
+    const weaponId = save.weapons?.equipped ?? 'blaster';
+    const def = weaponById(weaponId);
+    return {
+      weapon: { id: weaponId, name: def?.name ?? 'BLASTER', level: save.weapons?.owned?.[weaponId]?.level ?? 1 },
+      chips: equippedChips(save).map((chip) => chip.name),
+    };
+  }
+
+  // The profile menu's view data: pilot.js's stats enriched with the
+  // real weapon/chip rosters and the achievement states (claimable /
+  // claimed / locked — the claim buttons pay coins once, from here).
+  function buildProfile() {
+    const achievements = ACHIEVEMENTS.map((def) => {
+      const unlocked = !!(save.achievements?.unlocked && save.achievements.unlocked[def.id]);
+      const claimed = !!(save.achievements?.claimed && save.achievements.claimed[def.id]);
+      return {
+        id: def.id, name: def.name, desc: def.desc, reward: def.reward,
+        state: claimed ? 'claimed' : (unlocked ? 'claimable' : 'locked'),
+      };
+    });
+    return profileFromSave(save, {
+      weapons: WEAPONS,
+      chips: CHIPS,
+      chipEffects: chipEffectsFor(equippedChips(save).map((chip) => chip.id)),
+      weaponStats,
+      achievements,
+    });
   }
 
   function startGame() {
@@ -5474,7 +7939,12 @@ function runGame() {
     input.clearTap();
     // Bank the run into the local save: top-5, history, lifetime stats,
     // and today's missions (which pay their shard rewards immediately).
+    // Pilot XP and achievements (Stage 2) run off the world's per-run
+    // counters — kills, bullets destroyed, boss kills, no-damage.
     const stage = world.state.endless ? 0 : (world.state.stage ?? 1);
+    const cleared = won && !world.state.endless;
+    const firstClear = cleared && stage > (save.highestCleared ?? 0);
+    const worldStats = world.getRunStats ? world.getRunStats() : { kills: 0, bulletsDestroyed: 0, bossKilled: false, noDamage: true };
     const run = {
       score: world.state.score,
       level: world.state.level,
@@ -5487,24 +7957,52 @@ function runGame() {
       date: today,
       endless: world.state.endless,
       stage,
+      cleared,
+      firstClear,
+      endlessSeconds: world.state.endless ? Math.round(runStats.playSeconds) : 0,
+      kills: worldStats.kills,
+      bulletsDestroyed: worldStats.bulletsDestroyed,
+      bossKilled: worldStats.bossKilled,
+      noDamage: worldStats.noDamage,
     };
     let result;
     let clear = null;
-    if (won && !world.state.endless) {
+    let xpResult = null;
+    let bossDrop = null;
+    if (cleared) {
       // A stage clear pays coins (first clear, or the smaller replay
       // reward) and may unlock the next stage — and endless at stage 10.
       // The clear is banked now — if the player continues into endless,
       // the death at the end of that same run REPLACES this bank (see
       // below), so the run is counted exactly once, with its final score.
+      // Pilot XP is awarded BEFORE recordStageClear moves
+      // highestCleared (awardRunXp reads it for first-clear detection).
+      xpResult = awardRunXp(save, run);
       clear = recordStageClear(save, stage);
       result = recordRun(save, run);
       lastBanked = { entry: result.entry, historyEntry: result.historyEntry, shards: run.shards };
+      // Boss stages drop a chip on first clear (already owned: +100
+      // coins instead). Midboss stages drop nothing.
+      if (firstClear && isBossStage(stage)) {
+        const drop = grantBossDrop(save, stage);
+        if (drop?.granted) bossDrop = chipById(drop.granted)?.name ?? drop.granted;
+        else if (drop?.coins) bossDrop = `+${drop.coins} coins (chip already owned)`;
+      }
     } else if (endlessRun && lastBanked) {
+      // The endless death replaces the clear's bank — and the clear
+      // already awarded this run's XP, so no second award here.
       result = recordRun(save, run, { replace: lastBanked });
       lastBanked = null;
     } else {
+      xpResult = awardRunXp(save, run);
       result = recordRun(save, run);
     }
+    // Achievements unlock (but never pay) here — the coins are claimed
+    // from the profile screen, once each.
+    const newlyUnlocked = checkAchievements(save).map((id) => {
+      const def = ACHIEVEMENTS.find((a) => a.id === id);
+      return def ? { id: def.id, name: def.name, reward: def.reward } : { id, name: id, reward: 0 };
+    });
     // The first-run cue is over once the run ends; the dash cue is
     // retired the same way, so it teaches exactly once.
     if (dashCueSeen) save.ftue.dashCueShown = true;
@@ -5521,12 +8019,21 @@ function runGame() {
       coins: clear ? clear.coins : 0,
       firstClear: clear ? clear.firstClear : false,
       unlockedEndless: clear ? clear.unlockedEndless : false,
+      achievements: newlyUnlocked,
+      bossDrop,
+      xpGained: xpResult ? xpResult.xpGained : 0,
+      pilotLevel: save.pilot?.level ?? 1,
+      leveledUp: xpResult ? xpResult.leveledUp : false,
     };
     if (won) audio.win();
     else audio.over();
+    const achievementNote = newlyUnlocked.length
+      ? ` ${newlyUnlocked.length} achievement${newlyUnlocked.length > 1 ? 's' : ''} unlocked — claim ${newlyUnlocked.length > 1 ? 'them' : 'it'} in PROFILE!`
+      : '';
+    const xpNote = xpResult ? ` +${xpResult.xpGained} XP.` : '';
     announce(won
-      ? `Stage ${stage} clear! +${clear ? clear.coins : 0} coins${clear && clear.firstClear ? ' — first clear!' : ''}. Press N for the next stage, R to replay.`
-      : `Game over. Score ${world.state.score}. Press R or tap PLAY AGAIN.`);
+      ? `Stage ${stage} clear! +${clear ? clear.coins : 0} coins${clear && clear.firstClear ? ' — first clear!' : ''}.${xpNote}${achievementNote} Press N for the next stage, R to replay.`
+      : `Game over. Score ${world.state.score}.${xpNote}${achievementNote} Press R or tap PLAY AGAIN.`);
   }
 
   // Keep drifting past the Aurora Gate: the run goes endless — no reset,
@@ -5591,7 +8098,41 @@ function runGame() {
     input.clearTap();
     input.armGate();
     audio.click();
-    announce('Ship shop. Buy ships and level them up with coins. Press H to go back.');
+    announce('Shop. Ships, weapons and chips — buy with coins. Press H to go back.');
+  }
+
+  // Open the profile screen from the title tab bar (or the P key).
+  function enterProfile() {
+    screen = SCREEN_PROFILE;
+    input.clearPressed();
+    input.clearTap();
+    input.armGate();
+    audio.click();
+    announce('Profile. Pilot level, loadout, attributes, collection and achievements. Press P or H to go back.');
+  }
+
+  // Claim one unlocked achievement's coins (from the profile screen
+  // only — never auto-paid). Failures are announced, never silent.
+  function tryClaimAchievement(index) {
+    const profile = buildProfile();
+    const rows = layoutProfileSections(profile).achievements.rows;
+    const row = rows[index];
+    if (!row) return;
+    const def = row.achievement;
+    if (def.state !== 'claimable') {
+      announce(def.state === 'claimed'
+        ? `${def.name} is already claimed.`
+        : `${def.name} is still locked.`);
+      return;
+    }
+    const claimed = claimAchievement(save, def.id);
+    if (claimed.ok) {
+      saveSave(window.localStorage, save);
+      audio.click();
+      announce(`Claimed ${def.name}: +${claimed.reward} coins!`);
+    } else {
+      announce(`Could not claim ${def.name}.`);
+    }
   }
 
   // One tap on a ship card's action button: buy it, level it up, or
@@ -5638,6 +8179,101 @@ function runGame() {
       announce(`${def.name} is already maxed at Lv 10.`);
     } else if (levelled.reason === 'broke') {
       announce(`Not enough coins to level ${def.name}.`);
+    }
+  }
+
+  // One tap on a weapon card's action button: buy it, level it up, or
+  // equip it — whichever the button offered. Weapon switching is free.
+  function tryShopWeaponAction(index) {
+    const cards = layoutShopWeapons(WEAPONS);
+    const card = cards[index];
+    if (!card) return;
+    const def = card.weapon;
+    const owned = !!(save.weapons?.owned && save.weapons.owned[def.id]);
+    const isEquipped = (save.weapons?.equipped ?? 'blaster') === def.id && owned;
+    if (!owned) {
+      const bought = buyWeapon(save, def.id);
+      if (bought.ok) {
+        applyEquippedShip();
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Bought ${def.name} for ${bought.cost} coins — equipped!`);
+      } else if (bought.reason === 'locked') {
+        announce(`${def.name} unlocks at Pilot Lv ${def.unlockPilotLevel}.`);
+      } else if (bought.reason === 'broke') {
+        announce(`Not enough coins for ${def.name} — ${def.price} needed.`);
+      }
+      return;
+    }
+    if (!isEquipped) {
+      const equipped = equipWeapon(save, def.id);
+      if (equipped.ok) {
+        applyEquippedShip();
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Equipped ${def.name}.`);
+      }
+      return;
+    }
+    const levelled = levelUpWeapon(save, def.id);
+    if (levelled.ok) {
+      applyEquippedShip();
+      saveSave(window.localStorage, save);
+      audio.click();
+      announce(`${def.name} is now Lv ${levelled.level} — ${levelled.cost} coins.`);
+    } else if (levelled.reason === 'maxed') {
+      announce(`${def.name} is already maxed at Lv 10.`);
+    } else if (levelled.reason === 'broke') {
+      announce(`Not enough coins to level ${def.name}.`);
+    }
+  }
+
+  // One tap on a chip card's action button: buy it, slot it into the
+  // first free slot, or unslot it when it is already equipped.
+  function tryShopChipAction(index) {
+    const cards = layoutShopChips(CHIPS);
+    const card = cards[index];
+    if (!card) return;
+    const def = card.chip;
+    const owned = !!(save.chips?.owned && save.chips.owned[def.id]);
+    const slots = save.chips?.slots ?? [null, null];
+    const slotIndex = slots.indexOf(def.id);
+    if (!owned) {
+      const bought = buyChip(save, def.id);
+      if (bought.ok) {
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Bought ${def.name} for ${bought.cost} coins — tap SLOT to equip it.`);
+      } else if (bought.reason === 'locked') {
+        announce(`${def.name} unlocks at Pilot Lv ${def.unlockPilotLevel}.`);
+      } else if (bought.reason === 'broke') {
+        announce(`Not enough coins for ${def.name} — ${def.price} needed.`);
+      }
+      return;
+    }
+    if (slotIndex >= 0) {
+      const removed = unslotChip(save, slotIndex);
+      if (removed.ok) {
+        applyEquippedShip();
+        saveSave(window.localStorage, save);
+        audio.click();
+        announce(`Removed ${def.name} from the loadout.`);
+      }
+      return;
+    }
+    const free = slots.findIndex((s) => s == null);
+    if (free < 0) {
+      announce('No free chip slot — remove a chip first (pilot Lv 10 adds a third slot).');
+      return;
+    }
+    const slotted = slotChip(save, def.id, free);
+    if (slotted.ok) {
+      applyEquippedShip();
+      saveSave(window.localStorage, save);
+      audio.click();
+      announce(`${def.name} slotted.`);
+    } else {
+      announce(`Could not slot ${def.name}.`);
     }
   }
 
@@ -5692,7 +8328,11 @@ function runGame() {
 
   function applyPick(index) {
     const up = offers[index];
-    if (!up || !applyUpgrade(world.state, up.id)) return;
+    if (!up) return;
+    // A MERGE card evolves its two components into one merged effect;
+    // anything else is a normal upgrade pick.
+    const applied = up.isMerge ? applyMerge(world.state, up.id) : applyUpgrade(world.state, up.id);
+    if (!applied) return;
     world.state.pendingLevelUps = Math.max(0, world.state.pendingLevelUps - 1);
     audio.levelup();
     if (world.state.pendingLevelUps > 0) {
@@ -5751,6 +8391,8 @@ function runGame() {
         enterHangar();
       } else if (inRect(tap, SHOP_TAB_RECT) && save.lifetime.runs > 0) {
         enterShop();
+      } else if (inRect(tap, PROFILE_TAB_RECT) && save.lifetime.runs > 0) {
+        enterProfile();
       } else if (inRect(tap, MISSIONS_TAB_RECT) && save.lifetime.runs > 0) {
         openPanel(SCREEN_MISSIONS, 'Daily missions');
       } else if (inRect(tap, SCORES_TAB_RECT) && save.lifetime.runs > 0) {
@@ -5759,6 +8401,8 @@ function runGame() {
         openPanel(SCREEN_STATS, 'Top scores');
       } else if (input.consume('KeyH')) {
         enterHangar();
+      } else if (input.consume('KeyP')) {
+        enterProfile();
       } else if (input.consume(ACTION_CONFIRM) || input.consume(ACTION_RESTART)) {
         enterStages();
       }
@@ -5849,9 +8493,10 @@ function runGame() {
         }
       }
     } else if (screen === SCREEN_SHOP) {
-      // Ship shop: tap a card's action button to buy / level / equip.
-      // BACK (or H / Esc) returns to the title. Same input-gate
-      // discipline as the hangar: no stale tap may spend coins.
+      // Shop: three sections (SHIPS / WEAPONS / CHIPS) — tap a section
+      // tab to switch, tap a card's action button to buy / level /
+      // equip / slot. BACK (or H / Esc) returns to the title. Same
+      // input-gate discipline as the hangar: no stale tap may spend coins.
       if (!input.gateOpen()) {
         input.takeTap();
         input.clearPressed();
@@ -5862,11 +8507,69 @@ function runGame() {
           input.clearPressed();
           input.clearTap();
           announce('Lumen Drift. Press Enter or click to launch.');
+        } else if (inRect(tap, SHOP_SECTION_RECTS.ships)) {
+          shopSection = 'ships';
+          input.clearPressed();
+          audio.click();
+        } else if (inRect(tap, SHOP_SECTION_RECTS.weapons)) {
+          shopSection = 'weapons';
+          input.clearPressed();
+          audio.click();
+        } else if (inRect(tap, SHOP_SECTION_RECTS.chips)) {
+          shopSection = 'chips';
+          input.clearPressed();
+          audio.click();
+        } else if (shopSection === 'weapons') {
+          const cards = layoutShopWeapons(WEAPONS);
+          const acted = cards.findIndex((card) => inRect(tap, card.action));
+          if (acted >= 0) tryShopWeaponAction(acted);
+          else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+            screen = SCREEN_TITLE;
+            input.clearPressed();
+            input.clearTap();
+            announce('Lumen Drift. Press Enter or click to launch.');
+          }
+        } else if (shopSection === 'chips') {
+          const cards = layoutShopChips(CHIPS);
+          const acted = cards.findIndex((card) => inRect(tap, card.action));
+          if (acted >= 0) tryShopChipAction(acted);
+          else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+            screen = SCREEN_TITLE;
+            input.clearPressed();
+            input.clearTap();
+            announce('Lumen Drift. Press Enter or click to launch.');
+          }
         } else {
           const cards = layoutShopCards();
           const acted = cards.findIndex((card) => inRect(tap, card.action));
           if (acted >= 0) tryShopAction(acted);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
+            screen = SCREEN_TITLE;
+            input.clearPressed();
+            input.clearTap();
+            announce('Lumen Drift. Press Enter or click to launch.');
+          }
+        }
+      }
+    } else if (screen === SCREEN_PROFILE) {
+      // Profile: tap a CLAIM button to take an unlocked achievement's
+      // coins (once each). BACK (or P / H / Esc) returns to the title.
+      // Same input-gate discipline as the shop: no stale tap may claim.
+      if (!input.gateOpen()) {
+        input.takeTap();
+        input.clearPressed();
+      } else {
+        const tap = input.takeTap();
+        if (inRect(tap, PROFILE_BACK_RECT)) {
+          screen = SCREEN_TITLE;
+          input.clearPressed();
+          input.clearTap();
+          announce('Lumen Drift. Press Enter or click to launch.');
+        } else {
+          const rows = layoutProfileSections(buildProfile()).achievements.rows;
+          const claimed = rows.findIndex((row) => inRect(tap, row.claim));
+          if (claimed >= 0) tryClaimAchievement(claimed);
+          else if (input.consume(ACTION_PAUSE) || input.consume('KeyH') || input.consume('KeyP')) {
             screen = SCREEN_TITLE;
             input.clearPressed();
             input.clearTap();
@@ -6115,6 +8818,7 @@ function runGame() {
     const themeStage = screen === SCREEN_STAGES
       ? stagesPage * 10 + 1
       : (world.state.endless ? 100 : (world.state.stage || (save.highestCleared ?? 0) + 1));
+    const lv = loadoutView();
     renderer.draw(world.state, screen, best, {
       skin: skinById(skinId),
       offers: screen === SCREEN_UPGRADE ? offers : [],
@@ -6130,6 +8834,10 @@ function runGame() {
       shipShape: equippedShip(save).shape,
       ship: { name: equippedShip(save).name, level: Math.max(1, save.ships?.owned?.[equippedShip(save).id]?.level ?? 1) },
       stagesPage,
+      section: shopSection,
+      profile: screen === SCREEN_PROFILE ? buildProfile() : undefined,
+      loadout: lv,
+      weaponLabel: `${lv.weapon.name} Lv ${lv.weapon.level}`,
       theme: themeFor(themeStage),
     });
   }
