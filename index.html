@@ -639,13 +639,29 @@ function enemyHp(kind, n) {
   return base + eliteTier(n);
 }
 
-/** Spawn pressure for a stage (mine/storm caps, spawn intervals). */
+/** Spawn pressure for a stage (mine/storm caps, spawn intervals).
+ * Mines are sparse early and grow slowly (Fix Round 3): stage 1
+ * allows only 3 mines at a 2.5 s spawn interval — the old 8-cap /
+ * 1.5 s let stage 1 fill up and the stage-10 boss fight sit under
+ * ~20 pink mines. The base cap grows ~0.6/stage to a 19 ceiling
+ * (S1 3, S5 5, S10 8, S25 17, S49 19); the interval eases 2.5 s →
+ * 1.5 s by stage 50. Boss and midboss stages cap mines at 10
+ * instead: the boss is the fight, and a minefield that lands 5 hits
+ * while the player focuses on the boss is noise, not challenge —
+ * capping the arena at 10 is what keeps AURORA Lv 5 clearing S50
+ * (6/6 in the sim with cap 8, 5/6 with cap 10, vs 1/3 uncapped).
+ * So S50 (boss) reads 10 while its non-boss neighbours read 19.
+ * Endless mine pressure does NOT come from here: the world keeps
+ * its own level-based endless ramp (SPAWN_CAPS) for mines/storms
+ * and uses stageSpawn(100) only for enemy pressure.
+ */
 function stageSpawn(n) {
+  const mineCap = Math.min(3 + Math.floor((n - 1) * 0.6), 19);
   return {
-    mineCap: Math.min(8 + (n - 1), 22),
+    mineCap: (isBossStage(n) || isMidbossStage(n)) ? Math.min(mineCap, 10) : mineCap,
     stormCap: Math.min(2 + Math.floor((n - 1) / 3), 6),
     enemyEvery: Math.max(2.2 - 0.012 * (n - 1), 1.0),
-    mineEvery: 1.5,
+    mineEvery: Math.max(2.5 - 0.02 * (n - 1), 1.5),
     stormEvery: 2.4,
   };
 }
@@ -1434,6 +1450,26 @@ const BLASTER = {
 // is deliberately short (~1 s of orb flight): a wide radius let the
 // Blaster spend whole radial bursts on orbs and doubled boss kill
 // times in the sim.
+//
+// Void mines (state.mines, the pink spiky hazards) are shootable too
+// (Fix Round 3): 1 HP, a small burst, NO score — mines respawn, so
+// scoring them would be a farm. Priority order, chosen so mines never
+// starve enemy kills or orb defense (verified in sims — see below):
+//   1. close enemy bullet (inside BULLET_DEFENSE_RADIUS) — self-defense;
+//   2. nearest enemy / boss in range — the job that clears stages;
+//   3. nearest enemy bullet in range (idle cleanup) — an orb is
+//      seconds from hitting the ship; a mine only drifts;
+//   4. nearest void mine in range — hazard cleanup when there is
+//      nothing else at all to shoot.
+// The first version of this fix put mines at step 3, above far orbs,
+// and the e2e sims regressed: Pulse cleared S5 only 1/3 (was ≥2/3)
+// and AURORA Lv 5 cleared S50 only 2/3 with a 180 s timeout (was
+// 3/3) — shots spent on mines let radial orbs through and stole
+// boss windows. Mines below far orbs keeps boss DPS and orb defense
+// untouched while mines still get shot whenever the field is clear
+// of enemies and orbs (the common early-stage case). The player's
+// own dash-mines (DASH MINE chip traps, state.traps) are a SEPARATE
+// list and are NEVER targeted: targeting reads state.mines only.
 const BULLET_DEFENSE_RADIUS = 140;
 
 // Chain-lightning jump radius, shared by Pulse Beam and the Chain
@@ -1631,10 +1667,15 @@ function distTo(ship, t) {
  *   1. an enemy bullet (magenta orb) inside BULLET_DEFENSE_RADIUS —
  *      self-defense: the orb about to hit the ship is shot first;
  *   2. the nearest enemy or boss inside `range`;
- *   3. the nearest enemy bullet inside `range` (idle cleanup).
+ *   3. the nearest enemy bullet inside `range` (idle cleanup);
+ *   4. the nearest void mine (state.mines) inside `range` — hazard
+ *      cleanup only when there is no enemy or orb to shoot.
  * `range` defaults to BLASTER.range. Returns { x, y, kind, ref } or
  * null. Bullet targets carry kind 'enemyBullet' and ref the orb
- * object (1 HP — see updateBullets).
+ * object (1 HP — see updateBullets); mine targets carry kind 'mine'
+ * and ref the mine object (1 HP, no score — see destroyMine).
+ * Traps (state.traps, the player's own dash-mines) are never
+ * considered: this function reads state.mines only.
  */
 function nearestTarget(state, range = BLASTER.range) {
   const ship = state.ship;
@@ -1674,7 +1715,17 @@ function nearestTarget(state, range = BLASTER.range) {
       farBullet = { x: b.x, y: b.y, kind: 'enemyBullet', ref: b };
     }
   }
-  return farBullet;
+  if (farBullet) return farBullet;
+  let bestMine = null;
+  let mineDist = range;
+  for (const mine of state.mines || []) {
+    const d = distTo(ship, mine);
+    if (d <= mineDist) {
+      mineDist = d;
+      bestMine = { x: mine.x, y: mine.y, kind: 'mine', ref: mine };
+    }
+  }
+  return bestMine;
 }
 
 // --- Firing ------------------------------------------------------------
@@ -1738,6 +1789,14 @@ function fireBlaster(state) {
     damage,
     radius: BLASTER.bulletRadius,
     kind: 'bolt',
+    // targetKind: which kind of target this bolt was aimed at.
+    // updateBullets only pops a void mine for a bolt aimed at a mine:
+    // a mine drifting across a boss-bound bolt must not intercept it
+    // (sim evidence: interception let the Laser clear S10 on SPARK
+    // Lv 1 and cost the Mortar its S5 boss DPS). Orbs keep the old
+    // behaviour — a bolt aimed at an enemy still pops an orb in its
+    // path, because orbs are the incoming threat.
+    targetKind: target.kind,
     pierce: 1 + (state.chipEffects?.pierce ?? 0),
     hitRefs: [],
   });
@@ -1765,6 +1824,7 @@ function fireMortar(state, level) {
       damage,
       radius: def.bulletRadius,
       kind: 'shell',
+      targetKind: target.kind,
       blastRadius: stats.blastRadius,
       dist: 0,
       maxDist: stats.range,
@@ -1789,6 +1849,7 @@ function fireLaser(state, level) {
     damage,
     radius: def.bulletRadius,
     kind: 'laser',
+    targetKind: target.kind,
     pierce: 1 + stats.pierce + (state.chipEffects?.pierce ?? 0),
     hitRefs: [],
   });
@@ -1824,7 +1885,9 @@ function firePulse(state, level) {
   return true;
 }
 
-/** Nearest enemy/boss/orb within CHAIN_RADIUS of `from`, excluding already-hit refs. */
+/** Nearest enemy/boss/orb within CHAIN_RADIUS of `from`, excluding already-hit refs.
+ * Void mines are a last-resort chain target (only when no enemy, boss
+ * or orb is in range): lightning prefers something that scores. */
 function nearestChainTarget(state, from, hitRefs) {
   let best = null;
   let bestDist = CHAIN_RADIUS;
@@ -1839,14 +1902,18 @@ function nearestChainTarget(state, from, hitRefs) {
   for (const enemy of state.enemies || []) consider(enemy.x, enemy.y, enemy.kind || 'drifter', enemy);
   if (state.boss) consider(state.boss.x, state.boss.y, state.boss.kind || 'boss', state.boss);
   for (const orb of state.enemyBullets || []) consider(orb.x, orb.y, 'enemyBullet', orb);
+  if (best) return best;
+  for (const mine of state.mines || []) consider(mine.x, mine.y, 'mine', mine);
   return best;
 }
 
-/** Apply one pulse hit: enemies take damage (kills score, chain spark may fire), the boss loses hp, orbs pop. */
+/** Apply one pulse hit: enemies take damage (kills score, chain spark may fire), the boss loses hp, orbs pop, mines pop (no score). */
 function applyPulseHit(state, target, damage) {
   const effects = state.chipEffects ?? null;
   if (target.kind === 'enemyBullet') {
     destroyOrb(state, target.ref, null, effects);
+  } else if (target.kind === 'mine') {
+    destroyMine(state, target.ref, null);
   } else if (target.ref === state.boss) {
     state.boss.hp -= damage;
   } else {
@@ -1879,6 +1946,19 @@ function rollRandom(state) {
   if (typeof r === 'function') return r();
   if (r && typeof r.next === 'function') return r.next();
   return Math.random();
+}
+
+/** Destroy one void mine (1 HP): remove it with a burst and NOTHING
+ * else — no score, no floater, no gate progress, no Bullet Ward
+ * shield, no chain. Mines respawn, so scoring them would be a farm;
+ * a mine kill must never advance a stage. */
+function destroyMine(state, mine, burst) {
+  const mines = state.mines || [];
+  const idx = mines.indexOf(mine);
+  if (idx < 0) return false;
+  mines.splice(idx, 1);
+  if (burst) burst(mine.x, mine.y);
+  return true;
 }
 
 /** Destroy one enemy bullet (orb). With the Bullet Ward chip, grants a shield (see header). */
@@ -1934,7 +2014,7 @@ function damageEnemy(state, enemy, damage, burst, allowChainSpark, effects) {
   return true;
 }
 
-/** A shell bursts: everything within blastRadius takes its damage (enemies, boss, orbs). */
+/** A shell bursts: everything within blastRadius takes its damage (enemies, boss, orbs, mines). */
 function explodeShell(state, shell, burst, effects) {
   const radius = shell.blastRadius ?? 60;
   if (burst) burst(shell.x, shell.y);
@@ -1946,6 +2026,11 @@ function explodeShell(state, shell, burst, effects) {
   if (state.boss && Math.hypot(state.boss.x - shell.x, state.boss.y - shell.y) <= radius + hitRadius(state.boss)) {
     state.boss.hp -= shell.damage;
     if (burst) burst(state.boss.x, state.boss.y);
+  }
+  for (const mine of [...(state.mines || [])]) {
+    if (Math.hypot(mine.x - shell.x, mine.y - shell.y) <= radius + (mine.radius ?? 15)) {
+      destroyMine(state, mine, burst);
+    }
   }
   for (const orb of [...(state.enemyBullets || [])]) {
     if (Math.hypot(orb.x - shell.x, orb.y - shell.y) <= radius + (orb.radius ?? 6)) {
@@ -1974,7 +2059,10 @@ function consumePierce(bullet, ref) {
  * to state.score, a '+N' floater is pushed, and state.gateProgress is
  * refreshed when state.stageTarget is a finite number. A hit on the
  * boss reduces state.boss.hp (boss death is the world's job — it
- * watches state.boss.hp <= 0). A hit on an enemy bullet (magenta orb)
+ * watches state.boss.hp <= 0). A hit on a void mine destroys it
+ * (1 HP) with a spark and no score — shooting mines is hazard
+ * cleanup, not a farm, and never advances gate progress. A hit on an
+ * enemy bullet (magenta orb)
  * destroys the orb with a spark and no score — shooting orbs is
  * defensive, not a farm. `burst` is an optional (x, y) callback.
  *
@@ -2044,9 +2132,11 @@ function updateBullets(state, dt, burst) {
         }
       }
     }
-    // Last: an enemy bullet (magenta orb) is 1 HP — the bolt pops it
+    // Then an enemy bullet (magenta orb) is 1 HP — the bolt pops it
     // with a spark and no score. Enemies and the boss are checked
     // first, so one bolt never wastes itself on an orb in their way.
+    // Orbs are checked before mines, matching nearestTarget: a bolt
+    // aimed at an orb must pop the orb, not a mine in its path.
     if (!spent) {
       const orbs = state.enemyBullets || [];
       for (const orb of [...orbs]) {
@@ -2061,6 +2151,32 @@ function updateBullets(state, dt, burst) {
           }
           destroyOrb(state, orb, burst, effects);
           spent = consumePierce(b, orb);
+        }
+      }
+    }
+    // Last: a void mine is 1 HP — but only for a bolt that was aimed
+    // at it (bullet.targetKind === 'mine', set by the fire functions
+    // from nearestTarget). A boss- or enemy-bound bolt passes straight
+    // through a mine in its path: mines must never intercept boss DPS
+    // (see targetKind in fireBlaster). A mine-aimed bolt pops the mine
+    // with a spark and no score, exactly like an orb. Mines are checked
+    // after enemies, the boss and orbs, so a mine-aimed bolt that meets
+    // a scoring target or an incoming orb on the way still spends
+    // itself on the higher-priority hit first.
+    if (!spent && b.targetKind === 'mine') {
+      const mines = state.mines || [];
+      for (const mine of [...mines]) {
+        if (spent) break;
+        if (!mines.includes(mine)) continue;
+        if (b.hitRefs && b.hitRefs.includes(mine)) continue;
+        if (Math.hypot(mine.x - b.x, mine.y - b.y) <= (b.radius ?? BLASTER.bulletRadius) + (mine.radius ?? 15)) {
+          if (b.kind === 'shell') {
+            explodeShell(state, b, burst, effects);
+            spent = true;
+            break;
+          }
+          destroyMine(state, mine, burst);
+          spent = consumePierce(b, mine);
         }
       }
     }
@@ -2868,6 +2984,25 @@ function createWorld(random, hangarLevels = {}, shipStats = null, loadout = {}) 
           damageEnemy(e, 1);
         }
       }
+      // The same 1 damage applies to a void mine (1 HP), so a Nova
+      // Dash destroys a mine it passes through — no score, like any
+      // mine kill. This is the consistent choice: a mine explodes on
+      // ship contact, but during a dash the ship is invulnerable
+      // (dash i-frames, set above), so contact during the dash cannot
+      // hurt it either way — the dash does not trigger the mine's
+      // hit, it applies the Nova power's damage to it. The dash is a
+      // mine-clear tool for NOVA PRIME only: any other ship dashes
+      // through a mine unharmed while its i-frames last, and the mine
+      // survives. Once per mine per dash, via the same novaHit set.
+      for (const m of [...state.mines]) {
+        if (state.novaHit.has(m)) continue;
+        if (Math.hypot(m.x - ship.x, m.y - ship.y) < SHIP.radius * 0.8 + m.radius * 0.85) {
+          state.novaHit.add(m);
+          burst(m.x, m.y, '#f472b6', 10, 200);
+          const idx = state.mines.indexOf(m);
+          if (idx >= 0) state.mines.splice(idx, 1);
+        }
+      }
     }
 
     // Engine trail: a fading ribbon behind the skiff.
@@ -3025,8 +3160,8 @@ function createWorld(random, hangarLevels = {}, shipStats = null, loadout = {}) 
 
     // --- Weapons ----------------------------------------------------------
     // Auto-fires the equipped weapon at the nearest enemy or boss in
-    // range — or at an enemy bullet when that is all there is to
-    // shoot. fireWeapon dispatches by state.weaponId (Blaster,
+    // range — or at an enemy bullet, or a void mine, when that is all
+    // there is to shoot. fireWeapon dispatches by state.weaponId (Blaster,
     // Mortar, Laser, Pulse Beam) and applies the Overdrive chip and
     // the Piercing Rounds chip itself. Rapid Fire (PULSAR) shortens
     // the cooldown just set, whatever the weapon. Bullets resolve
@@ -3038,7 +3173,7 @@ function createWorld(random, hangarLevels = {}, shipStats = null, loadout = {}) 
     state.weaponCooldown = state.blasterCooldown;
     const enemiesBefore = state.enemies.length;
     const orbsBefore = state.enemyBullets.length;
-    if (state.enemies.length > 0 || state.boss || state.enemyBullets.length > 0) {
+    if (state.enemies.length > 0 || state.boss || state.enemyBullets.length > 0 || state.mines.length > 0) {
       const fired = fireWeapon(state);
       if (fired && state.powerId === 'rapid-fire') {
         state.weaponCooldown = (state.weaponCooldown ?? 0) / 1.2;
@@ -3374,7 +3509,9 @@ function toScreen(worldX, worldY, cssWidth, cssHeight) {
 // Enter/click confirms.
 // The pointer also steers: holding the mouse down — or dragging a finger —
 // pulls the skiff toward it, in world coordinates (view.js), so the ship
-// goes where the finger actually points on any screen shape.
+// goes where the finger actually points on any screen shape. Taps are
+// kept twice: in field coordinates (takeTap, for play) and in raw
+// CSS pixels (takeTapCss, for the fullscreen menus).
 //
 // On touch, a drag only steers: it never dashes (every touch used to dash,
 // which made the game unplayable on phones). Dashing on touch is the
@@ -3440,6 +3577,14 @@ function createInput(canvas) {
   // never set it: they are not children of the canvas and bindButton
   // stops their presses, so a DASH/pause tap can never pick a card.
   let tap = null;
+  // The same press in raw CSS pixels, relative to the canvas box —
+  // the coordinate menu screens are hit-tested in. Menus are drawn
+  // fullscreen (stretched past the letterboxed field), so a menu tap
+  // near the screen edge can land outside the field entirely: the
+  // field-coordinate tap above is dropped for those presses (see
+  // onPointerDown), but the CSS-pixel tap survives. Play never reads
+  // this; steering still uses the field pointer.
+  let tapCss = null;
   // Upgrade-screen input gate (Stage 1 fix for the stale-tap bug): after
   // armGate(), input is ignored until the lockout has elapsed AND the
   // steering finger has been lifted. A tap stored during play can never
@@ -3474,6 +3619,14 @@ function createInput(canvas) {
 
   function onPointerDown(event) {
     pointerPosition(event);
+    // Record the raw CSS-pixel press first: menu hit-testing uses it,
+    // and a menu tap can sit on a letterbox bar (outside the field),
+    // where the field tap below is dropped. A second finger never
+    // overwrites the first finger's tap.
+    if (!pointer.down) {
+      const rect = canvas.getBoundingClientRect();
+      tapCss = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
     // Touches that start on the letterbox bars (outside the field) are
     // ignored: they used to drag the ship to the edge and stick it there.
     if (pointer.x < 0 || pointer.x > FIELD.width || pointer.y < 0 || pointer.y > FIELD.height) return;
@@ -3528,6 +3681,7 @@ function createInput(canvas) {
       // Drag-lock: this pointer is a drag now, never a tap.
       pointer.dragLocked = true;
       tap = null;
+      tapCss = null;
     }
     if (dist <= DEAD_ZONE) {
       pointer.relX = 0;
@@ -3583,6 +3737,7 @@ function createInput(canvas) {
     // from play must never be read as a menu tap on the next screen.
     clearTap() {
       tap = null;
+      tapCss = null;
     },
     // Close the input gate for 400 ms and require the steering finger to
     // be lifted first (when it is down now). Call when an overlay that
@@ -3592,6 +3747,7 @@ function createInput(canvas) {
       gateUntil = now + 400;
       liftNeeded = pointer.down;
       tap = null;
+      tapCss = null;
     },
     // True when a gated screen may accept taps / pick keys again: the
     // lockout has elapsed and no steering finger is still held down.
@@ -3603,6 +3759,15 @@ function createInput(canvas) {
     takeTap() {
       const taken = tap;
       tap = null;
+      return taken;
+    },
+    // The last canvas tap in raw CSS pixels (relative to the canvas
+    // box), or null when none is waiting. Menu screens hit-test with
+    // this — their rects live in CSS-pixel space. Reading consumes it,
+    // exactly like takeTap; clearTap and armGate drop it too.
+    takeTapCss() {
+      const taken = tapCss;
+      tapCss = null;
       return taken;
     },
     // Wire an on-screen button (e.g. the touch DASH / pause buttons) to
@@ -4725,9 +4890,15 @@ function grantBossDrop(save, stage) {
 //
 // COORDINATES: the world is 1280x720. draw() fills the whole screen with
 // the sky, then draws the field letterboxed with ONE uniform scale
-// (viewTransform) — every entity, the ship, the HUD and the overlays live
+// (viewTransform) — every entity, the ship, the HUD and the joystick live
 // in field coordinates under that transform, so the drawn position of
-// everything is its simulated position, on any screen shape.
+// everything is its simulated position, on any screen shape. MENUS are
+// different: they are drawn in FULLSCREEN CSS-pixel space, through a
+// second scale (menuScale: width/1280 x height/720) applied by beginMenu,
+// so a menu fills the whole screen on any shape instead of sitting inset
+// in the letterbox. Every menu rect is a function of (width, height) —
+// scaleRect — and at 1280x720 it reproduces the design coordinates
+// exactly, so the 16:9 layout is unchanged.
 
 const SCREEN_TITLE = 'title';
 const SCREEN_PLAY = 'play';
@@ -4746,115 +4917,195 @@ const SCREEN_MISSIONS = 'missions';
 const SCREEN_SETTINGS = 'settings';
 const SCREEN_REWARD = 'reward';
 
-// --- Home (title) layout: PLAY only. Top corners hold the gear and the
-// currency; the meta game (hangar / shop / profile / missions /
-// scores) lives in a bottom tab bar that appears after the first run
-// (progressive disclosure).
-const GEAR_RECT = { x: 24, y: 24, w: 48, h: 48 };
-// Top-right cluster, left to right: streak flame, pilot level, coins
-// purse, shard balance. (The flame only draws while a streak is
-// alive; the pilot chip and the coins chip always show.)
-const FLAME_RECT = { x: 800, y: 24, w: 64, h: 48 };
-const PILOT_RECT = { x: 872, y: 24, w: 92, h: 48 };
-const COINS_RECT = { x: 972, y: 24, w: 124, h: 48 };
-const BALANCE_RECT = { x: 1104, y: 24, w: 152, h: 48 };
-const PLAY_RECT = { x: 470, y: 410, w: 340, h: 76 };
-const HANGAR_TAB_RECT = { x: 208, y: 636, w: 160, h: 56 };
-const SHOP_TAB_RECT = { x: 384, y: 636, w: 160, h: 56 };
-const PROFILE_TAB_RECT = { x: 560, y: 636, w: 160, h: 56 };
-const MISSIONS_TAB_RECT = { x: 736, y: 636, w: 160, h: 56 };
-const SCORES_TAB_RECT = { x: 912, y: 636, w: 160, h: 56 };
+// --- Menu layout: every rect below is a FUNCTION of the screen size
+// it is drawn / tapped in, (width, height) in CSS pixels. The design
+// lives in a 1280x720 space (FIELD); a rect at another size is the
+// design rect stretched by sx = width/1280, sy = height/720, so at
+// 1280x720 every rect reproduces its old coordinates exactly, and on
+// any other screen the menus fill the whole CSS box instead of sitting
+// inside the letterboxed field. The renderer draws menus through that
+// same stretch (beginMenu) and main.js hit-tests taps with these same
+// functions, so what is drawn is what is tappable, at every size.
+/** The menu stretch for a CSS-pixel box: design 1280x720 -> fullscreen. */
+function menuScale(width, height) {
+  return { sx: width / FIELD.width, sy: height / FIELD.height };
+}
+/** A design-space rect stretched into (width, height) CSS pixels. */
+function scaleRect(rect, width = FIELD.width, height = FIELD.height) {
+  const { sx, sy } = menuScale(width, height);
+  return { x: rect.x * sx, y: rect.y * sy, w: rect.w * sx, h: rect.h * sy };
+}
+// Enter menu space: scale the 1280x720 design onto the full CSS box.
+// Every menu draw function calls this first (and endMenu at the end),
+// then works in design coordinates, so the body of each screen is
+// unchanged. The gate ring and the starfield are NOT drawn here — they
+// stay in field space (drawn under the letterbox transform in draw()).
+function beginMenu(ctx, width, height) {
+  const { sx, sy } = menuScale(width, height);
+  ctx.save();
+  ctx.scale(sx, sy);
+}
+function endMenu(ctx) { ctx.restore(); }
 
-// --- Panels: one centred card over a dimmed home screen.
-const PANEL_CARD = { x: 260, y: 96, w: 760, h: 528 };
-const PANEL_CLOSE_RECT = { x: 964, y: 108, w: 44, h: 44 };
+// Design-space rects (1280x720). The exported *_RECT names are
+// functions of (width, height) that stretch these; call with no
+// arguments for the design coordinates.
+const BASE_RECTS = {
+  gear: { x: 24, y: 24, w: 48, h: 48 },
+  // Top-right cluster, left to right: streak flame, pilot level, coins
+  // purse, shard balance. (The flame only draws while a streak is
+  // alive; the pilot chip and the coins chip always show.)
+  flame: { x: 800, y: 24, w: 64, h: 48 },
+  pilot: { x: 872, y: 24, w: 92, h: 48 },
+  coins: { x: 972, y: 24, w: 124, h: 48 },
+  balance: { x: 1104, y: 24, w: 152, h: 48 },
+  play: { x: 470, y: 410, w: 340, h: 76 },
+  hangarTab: { x: 208, y: 636, w: 160, h: 56 },
+  shopTab: { x: 384, y: 636, w: 160, h: 56 },
+  profileTab: { x: 560, y: 636, w: 160, h: 56 },
+  missionsTab: { x: 736, y: 636, w: 160, h: 56 },
+  scoresTab: { x: 912, y: 636, w: 160, h: 56 },
+  panelCard: { x: 260, y: 96, w: 760, h: 528 },
+  panelClose: { x: 964, y: 108, w: 44, h: 44 },
+  claim: { x: 510, y: 430, w: 260, h: 60 },
+  settingsSound: { x: 880, y: 208, w: 100, h: 44 },
+  settingsFullscreen: { x: 880, y: 284, w: 100, h: 44 },
+  settingsShake: { x: 880, y: 360, w: 100, h: 44 },
+  playAgain: { x: 510, y: 520, w: 260, h: 56 },
+  overHangar: { x: 510, y: 596, w: 260, h: 48 },
+  clearNext: { x: 510, y: 384, w: 260, h: 56 },
+  clearReplay: { x: 510, y: 452, w: 260, h: 48 },
+  clearStages: { x: 510, y: 512, w: 260, h: 48 },
+  clearHangar: { x: 510, y: 572, w: 260, h: 48 },
+  clearEndless: { x: 510, y: 632, w: 260, h: 48 },
+  hangarBack: { x: 540, y: 606, w: 200, h: 44 },
+  stagesBack: { x: 540, y: 580, w: 200, h: 44 },
+  shopBack: { x: 540, y: 636, w: 200, h: 44 },
+  profileBack: { x: 540, y: 636, w: 200, h: 44 },
+  shopShips: { x: 384, y: 132, w: 160, h: 42 },
+  shopWeapons: { x: 560, y: 132, w: 160, h: 42 },
+  shopChips: { x: 736, y: 132, w: 160, h: 42 },
+  hangarSkinLeft: { x: 200, y: 126, w: 40, h: 52 },
+  hangarSkinRight: { x: 420, y: 126, w: 40, h: 52 },
+  pauseResume: { x: 510, y: 360, w: 260, h: 52 },
+  pauseRestart: { x: 510, y: 428, w: 260, h: 52 },
+  pauseHangar: { x: 510, y: 496, w: 260, h: 52 },
+  pauseMenu: { x: 510, y: 564, w: 260, h: 52 },
+};
+function rectFn(name) {
+  return (width = FIELD.width, height = FIELD.height) => scaleRect(BASE_RECTS[name], width, height);
+}
+// Home (title) layout: PLAY only. Top corners hold the gear and the
+// currency; the meta game lives in a bottom tab bar that appears after
+// the first run (progressive disclosure).
+const GEAR_RECT = rectFn('gear');
+const FLAME_RECT = rectFn('flame');
+const PILOT_RECT = rectFn('pilot');
+const COINS_RECT = rectFn('coins');
+const BALANCE_RECT = rectFn('balance');
+const PLAY_RECT = rectFn('play');
+const HANGAR_TAB_RECT = rectFn('hangarTab');
+const SHOP_TAB_RECT = rectFn('shopTab');
+const PROFILE_TAB_RECT = rectFn('profileTab');
+const MISSIONS_TAB_RECT = rectFn('missionsTab');
+const SCORES_TAB_RECT = rectFn('scoresTab');
+// Panels: one centred card over a dimmed home screen.
+const PANEL_CARD = rectFn('panelCard');
+const PANEL_CLOSE_RECT = rectFn('panelClose');
 // Daily-reward CLAIM button.
-const CLAIM_RECT = { x: 510, y: 430, w: 260, h: 60 };
+const CLAIM_RECT = rectFn('claim');
 // Settings toggles (right side of their rows).
-const SETTINGS_SOUND_RECT = { x: 880, y: 208, w: 100, h: 44 };
-const SETTINGS_FULLSCREEN_RECT = { x: 880, y: 284, w: 100, h: 44 };
-const SETTINGS_SHAKE_RECT = { x: 880, y: 360, w: 100, h: 44 };
-
+const SETTINGS_SOUND_RECT = rectFn('settingsSound');
+const SETTINGS_FULLSCREEN_RECT = rectFn('settingsFullscreen');
+const SETTINGS_SHAKE_RECT = rectFn('settingsShake');
 // The deliberate restart button on the game-over screen.
-const PLAY_AGAIN_RECT = { x: 510, y: 520, w: 260, h: 56 };
+const PLAY_AGAIN_RECT = rectFn('playAgain');
 // Hangar exit on the game-over screen (the endless trap fix: after an
 // endless death the player can go straight to the hangar to spend).
-const OVER_HANGAR_RECT = { x: 510, y: 596, w: 260, h: 48 };
+const OVER_HANGAR_RECT = rectFn('overHangar');
 // Stage-clear buttons, stacked under the summary lines (which now
 // include newly unlocked achievements, up to two lines).
-const CLEAR_NEXT_RECT = { x: 510, y: 384, w: 260, h: 56 };
-const CLEAR_REPLAY_RECT = { x: 510, y: 452, w: 260, h: 48 };
-const CLEAR_STAGES_RECT = { x: 510, y: 512, w: 260, h: 48 };
-const CLEAR_HANGAR_RECT = { x: 510, y: 572, w: 260, h: 48 };
+const CLEAR_NEXT_RECT = rectFn('clearNext');
+const CLEAR_REPLAY_RECT = rectFn('clearReplay');
+const CLEAR_STAGES_RECT = rectFn('clearStages');
+const CLEAR_HANGAR_RECT = rectFn('clearHangar');
 // Endless continuation on the clear screen (drawn only when unlocked).
-const CLEAR_ENDLESS_RECT = { x: 510, y: 632, w: 260, h: 48 };
+const CLEAR_ENDLESS_RECT = rectFn('clearEndless');
 // Back button on the hangar screen.
-const HANGAR_BACK_RECT = { x: 540, y: 606, w: 200, h: 44 };
+const HANGAR_BACK_RECT = rectFn('hangarBack');
 // Back buttons on the stage-select and shop screens (same spot).
-const STAGES_BACK_RECT = { x: 540, y: 580, w: 200, h: 44 };
-const SHOP_BACK_RECT = { x: 540, y: 636, w: 200, h: 44 };
+const STAGES_BACK_RECT = rectFn('stagesBack');
+const SHOP_BACK_RECT = rectFn('shopBack');
 // Back button on the profile screen (same spot as the shop's).
-const PROFILE_BACK_RECT = { x: 540, y: 636, w: 200, h: 44 };
+const PROFILE_BACK_RECT = rectFn('profileBack');
 // Shop section tabs: SHIPS / WEAPONS / CHIPS (one section visible at
-// a time — the three economies do not fit on one screen).
-const SHOP_SECTION_RECTS = {
-  ships: { x: 384, y: 126, w: 160, h: 42 },
-  weapons: { x: 560, y: 126, w: 160, h: 42 },
-  chips: { x: 736, y: 126, w: 160, h: 42 },
-};
+// a time — the three economies do not fit on one screen). They sit at
+// y 132 so the section subtitle (baseline 122) clears them.
+function SHOP_SECTION_RECTS(width = FIELD.width, height = FIELD.height) {
+  return {
+    ships: scaleRect(BASE_RECTS.shopShips, width, height),
+    weapons: scaleRect(BASE_RECTS.shopWeapons, width, height),
+    chips: scaleRect(BASE_RECTS.shopChips, width, height),
+  };
+}
 // Skin arrows in the hangar (the selector moved here from the title, so
 // its name can never overlap an arrow again).
-const HANGAR_SKIN_LEFT = { x: 200, y: 126, w: 40, h: 52 };
-const HANGAR_SKIN_RIGHT = { x: 420, y: 126, w: 40, h: 52 };
+const HANGAR_SKIN_LEFT = rectFn('hangarSkinLeft');
+const HANGAR_SKIN_RIGHT = rectFn('hangarSkinRight');
 // Pause-menu buttons.
-const PAUSE_RESUME_RECT = { x: 510, y: 360, w: 260, h: 52 };
-const PAUSE_RESTART_RECT = { x: 510, y: 428, w: 260, h: 52 };
-const PAUSE_HANGAR_RECT = { x: 510, y: 496, w: 260, h: 52 };
-const PAUSE_MENU_RECT = { x: 510, y: 564, w: 260, h: 52 };
+const PAUSE_RESUME_RECT = rectFn('pauseResume');
+const PAUSE_RESTART_RECT = rectFn('pauseRestart');
+const PAUSE_HANGAR_RECT = rectFn('pauseHangar');
+const PAUSE_MENU_RECT = rectFn('pauseMenu');
 
-/** Row rectangles for the hangar parts, in field coordinates. */
-function layoutHangarParts() {
+/** Row rectangles for the hangar parts, in (width, height) CSS pixels. */
+function layoutHangarParts(width = FIELD.width, height = FIELD.height) {
   const x = 140;
   const w = 1000;
   const h = 66;
   const gap = 6;
   const y0 = 226;
+  const s = (r) => scaleRect(r, width, height);
   return HANGAR_PARTS.map((part, i) => {
     const y = y0 + i * (h + gap);
     return {
-      x, y, w, h, part,
-      buy: { x: x + w - 170, y: y + 9, w: 150, h: 48 },
+      ...s({ x, y, w, h }), part,
+      buy: s({ x: x + w - 170, y: y + 9, w: 150, h: 48 }),
     };
   });
 }
 
 /** Mission rows in the missions panel: row + reroll-button rectangles. */
-function layoutMissionRows() {
+function layoutMissionRows(width = FIELD.width, height = FIELD.height) {
   const x = 300;
   const w = 680;
   const h = 92;
   const gap = 14;
   const y0 = 208;
+  const s = (r) => scaleRect(r, width, height);
   return [0, 1, 2].map((i) => {
     const y = y0 + i * (h + gap);
     return {
-      x, y, w, h,
-      reroll: { x: x + w - 64, y: y + 22, w: 48, h: 48 },
+      ...s({ x, y, w, h }),
+      reroll: s({ x: x + w - 64, y: y + 22, w: 48, h: 48 }),
     };
   });
 }
-function layoutUpgradeCards(offers) {
+function layoutUpgradeCards(offers, width = FIELD.width, height = FIELD.height) {
   const cardW = 340;
   const cardH = 230;
   const gap = 30;
   const total = offers.length * cardW + Math.max(0, offers.length - 1) * gap;
   const startX = (FIELD.width - total) / 2;
   const y = 250;
+  const s = (r) => scaleRect(r, width, height);
   return offers.map((upgrade, i) => ({
-    x: startX + i * (cardW + gap),
-    y,
-    w: cardW,
-    h: cardH,
+    ...s({
+      x: startX + i * (cardW + gap),
+      y,
+      w: cardW,
+      h: cardH,
+    }),
     upgrade,
   }));
 }
@@ -4863,7 +5114,7 @@ function layoutUpgradeCards(offers) {
 // sides, a big PLAY STAGE button under the grid, BACK under that.
 const STAGES_PER_PAGE = 10;
 const STAGE_PAGE_COUNT = 10;
-function layoutStageTiles(page) {
+function layoutStageTiles(page, width = FIELD.width, height = FIELD.height) {
   const p = Math.max(0, Math.min(STAGE_PAGE_COUNT - 1, page | 0));
   const tileW = 180;
   const tileH = 110;
@@ -4883,22 +5134,23 @@ function layoutStageTiles(page) {
       stage: p * STAGES_PER_PAGE + i + 1,
     });
   }
+  const s = (r) => scaleRect(r, width, height);
   return {
     page: p,
     pageCount: STAGE_PAGE_COUNT,
-    tiles,
-    prevArrow: { x: 60, y: 245, w: 60, h: 60 },
-    nextArrow: { x: 1160, y: 245, w: 60, h: 60 },
+    tiles: tiles.map((t) => ({ ...s(t), stage: t.stage })),
+    prevArrow: s({ x: 60, y: 245, w: 60, h: 60 }),
+    nextArrow: s({ x: 1160, y: 245, w: 60, h: 60 }),
     prevEnabled: p > 0,
     nextEnabled: p < STAGE_PAGE_COUNT - 1,
-    play: { x: 470, y: 480, w: 340, h: 64 },
-    back: STAGES_BACK_RECT,
+    play: s({ x: 470, y: 480, w: 340, h: 64 }),
+    back: STAGES_BACK_RECT(width, height),
   };
 }
 
 // --- Ship shop: 6 cards in a 2x3 grid; each card's action button sits
 // at its foot (BUY / LEVEL UP / EQUIP / EQUIPPED). The grid starts
-// below the section tabs (y 126..168).
+// below the section tabs (y 132..174).
 const RARITY_COLORS = {
   common: '#e2e8f0',
   rare: '#38bdf8',
@@ -4906,21 +5158,22 @@ const RARITY_COLORS = {
   legendary: '#fbbf24',
   mythic: '#f472b6',
 };
-function layoutShopCards() {
+function layoutShopCards(width = FIELD.width, height = FIELD.height) {
   const cardW = 380;
   const cardH = 210;
   const gap = 20;
   const totalW = 3 * cardW + 2 * gap;
   const x0 = (FIELD.width - totalW) / 2;
   const y0 = 188;
+  const s = (r) => scaleRect(r, width, height);
   return SHIPS.map((ship, i) => {
     const col = i % 3;
     const row = Math.floor(i / 3);
     const x = x0 + col * (cardW + gap);
     const y = y0 + row * (cardH + gap);
     return {
-      x, y, w: cardW, h: cardH, ship,
-      action: { x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 },
+      ...s({ x, y, w: cardW, h: cardH }), ship,
+      action: s({ x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 }),
     };
   });
 }
@@ -4928,73 +5181,76 @@ function layoutShopCards() {
 // --- Weapon shop: one card per weapon in the same 2x3 grid as the
 // ship shop (4 weapons: one full row + one card). `weapons` is the
 // roster (WEAPONS); passing a list keeps the layout testable.
-function layoutShopWeapons(weapons = WEAPONS) {
+function layoutShopWeapons(weapons = WEAPONS, width = FIELD.width, height = FIELD.height) {
   const cardW = 380;
   const cardH = 210;
   const gap = 20;
   const totalW = 3 * cardW + 2 * gap;
   const x0 = (FIELD.width - totalW) / 2;
   const y0 = 188;
+  const s = (r) => scaleRect(r, width, height);
   return (weapons || []).map((weapon, i) => {
     const col = i % 3;
     const row = Math.floor(i / 3);
     const x = x0 + col * (cardW + gap);
     const y = y0 + row * (cardH + gap);
     return {
-      x, y, w: cardW, h: cardH, weapon,
-      action: { x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 },
+      ...s({ x, y, w: cardW, h: cardH }), weapon,
+      action: s({ x: x + 20, y: y + cardH - 56, w: cardW - 40, h: 44 }),
     };
   });
 }
 
 // --- Chip shop: compact cards (name, rarity, effect, action) in a
 // 3-column grid; 8 chips fit in 3 rows above BACK (y 636).
-function layoutShopChips(chips = CHIPS) {
+function layoutShopChips(chips = CHIPS, width = FIELD.width, height = FIELD.height) {
   const cardW = 380;
   const cardH = 130;
   const gap = 14;
   const totalW = 3 * cardW + 2 * gap;
   const x0 = (FIELD.width - totalW) / 2;
   const y0 = 188;
+  const s = (r) => scaleRect(r, width, height);
   return (chips || []).map((chip, i) => {
     const col = i % 3;
     const row = Math.floor(i / 3);
     const x = x0 + col * (cardW + gap);
     const y = y0 + row * (cardH + gap);
     return {
-      x, y, w: cardW, h: cardH, chip,
-      action: { x: x + 16, y: y + cardH - 44, w: cardW - 32, h: 36 },
+      ...s({ x, y, w: cardW, h: cardH }), chip,
+      action: s({ x: x + 16, y: y + cardH - 44, w: cardW - 32, h: 36 }),
     };
   });
 }
 
 // --- Profile: two columns. Left: pilot XP, loadout, attributes.
 // Right: collection, achievements (up to 5 rows shown + claim buttons).
-function layoutProfileSections(profile = {}) {
+function layoutProfileSections(profile = {}, width = FIELD.width, height = FIELD.height) {
   const achievements = Array.isArray(profile.achievements) ? profile.achievements : [];
   const shown = achievements.slice(0, 5);
+  const s = (r) => scaleRect(r, width, height);
   const rows = shown.map((achievement, i) => {
     const y = 376 + i * 46;
     return {
-      x: 672, y, w: 536, h: 40, achievement,
-      claim: { x: 672 + 536 - 110, y: y + 4, w: 102, h: 32 },
+      ...s({ x: 672, y, w: 536, h: 40 }), achievement,
+      claim: s({ x: 672 + 536 - 110, y: y + 4, w: 102, h: 32 }),
     };
   });
   return {
-    xp: { x: 60, y: 100, w: 560, h: 80 },
-    loadout: { x: 60, y: 192, w: 560, h: 140 },
-    attributes: { x: 60, y: 344, w: 560, h: 276 },
+    xp: s({ x: 60, y: 100, w: 560, h: 80 }),
+    loadout: s({ x: 60, y: 192, w: 560, h: 140 }),
+    attributes: s({ x: 60, y: 344, w: 560, h: 276 }),
     collection: {
-      x: 660, y: 100, w: 560, h: 232,
+      ...s({ x: 660, y: 100, w: 560, h: 232 }),
       rows: {
-        ships: { x: 672, y: 130, w: 536, h: 42 },
-        weapons: { x: 672, y: 174, w: 536, h: 42 },
-        chips: { x: 672, y: 218, w: 536, h: 58 },
-        skins: { x: 672, y: 278, w: 536, h: 42 },
+        ships: s({ x: 672, y: 130, w: 536, h: 42 }),
+        weapons: s({ x: 672, y: 174, w: 536, h: 42 }),
+        chips: s({ x: 672, y: 218, w: 536, h: 58 }),
+        skins: s({ x: 672, y: 278, w: 536, h: 42 }),
       },
     },
     achievements: {
-      x: 660, y: 332, w: 560, h: 288,
+      ...s({ x: 660, y: 332, w: 560, h: 288 }),
       rows,
       shown: shown.length,
       total: achievements.length,
@@ -5718,6 +5974,12 @@ function drawJoystick(ctx, pointer) {
 
 function drawHud(ctx, state, best, width, theme = THEMES[0], extra = {}) {
   const pad = 18;
+  // Top-right cluster: its right edge is hudRight (from extra, computed
+  // in draw() from the CSS size), the field x that stays left of the DOM
+  // fullscreen/pause buttons. The whole cluster — hearts, stage/weapon
+  // label, dash bar and its label, shield line — ends there, on every
+  // screen size, so no HUD text ever sits under those buttons.
+  const right = extra.hudRight ?? width - pad;
   ctx.textBaseline = 'alphabetic';
   // Score, big and gold — counted up smoothly (displayScore), not jumped.
   ctx.textAlign = 'left';
@@ -5747,7 +6009,7 @@ function drawHud(ctx, state, best, width, theme = THEMES[0], extra = {}) {
   const maxHearts = state.maxHearts ?? HEARTS;
   ctx.textAlign = 'right';
   for (let i = 0; i < maxHearts; i += 1) {
-    const x = width - pad - i * 34;
+    const x = right - i * 34;
     const y = 32;
     ctx.save();
     ctx.translate(x, y);
@@ -5776,22 +6038,22 @@ function drawHud(ctx, state, best, width, theme = THEMES[0], extra = {}) {
       : 'BLASTER Lv 1');
   ctx.fillText(
     state.endless ? `ENDLESS  •  ${weaponLabel}` : `STAGE ${state.stage ?? 1}  •  ${weaponLabel}`,
-    width - pad, 66,
+    right, 66,
   );
   const dashReady = state.ship.dashCooldown <= 0;
   const dashBase = effectiveDashCooldown(state);
   const dashFrac = dashReady ? 1 : 1 - state.ship.dashCooldown / dashBase;
   ctx.fillStyle = 'rgba(148, 163, 184, 0.5)';
-  ctx.fillRect(width - pad - 110, 76, 110, 8);
+  ctx.fillRect(right - 110, 76, 110, 8);
   ctx.fillStyle = dashReady ? CYAN : '#64748b';
-  ctx.fillRect(width - pad - 110, 76, 110 * dashFrac, 8);
+  ctx.fillRect(right - 110, 76, 110 * dashFrac, 8);
   ctx.fillStyle = dashReady ? CYAN : '#94a3b8';
   ctx.font = '12px sans-serif';
-  ctx.fillText(dashReady ? 'DASH READY' : 'DASH…', width - pad, 100);
+  ctx.fillText(dashReady ? 'DASH READY' : 'DASH…', right, 100);
   if (state.shield) {
     ctx.fillStyle = GREEN;
     ctx.font = 'bold 14px sans-serif';
-    ctx.fillText('SHIELD UP', width - pad, 120);
+    ctx.fillText('SHIELD UP', right, 120);
   }
   // Progress bar, bottom centre — lifted off the edge. In endless mode
   // the bar tracks progress to the next level; on a boss stage it is the
@@ -5877,12 +6139,12 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   ctx.save();
   ctx.strokeStyle = 'rgba(226, 232, 240, 0.75)';
   ctx.lineWidth = 2;
-  ctx.strokeRect(GEAR_RECT.x, GEAR_RECT.y, GEAR_RECT.w, GEAR_RECT.h);
+  ctx.strokeRect(GEAR_RECT(width, height).x, GEAR_RECT(width, height).y, GEAR_RECT(width, height).w, GEAR_RECT(width, height).h);
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 24px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('⚙', GEAR_RECT.x + GEAR_RECT.w / 2, GEAR_RECT.y + GEAR_RECT.h / 2 + 1);
+  ctx.fillText('⚙', GEAR_RECT(width, height).x + GEAR_RECT(width, height).w / 2, GEAR_RECT(width, height).y + GEAR_RECT(width, height).h / 2 + 1);
   ctx.restore();
   // Streak flame (top right): opens the daily-reward calendar. It pulses
   // with a dot while today's reward waits unclaimed.
@@ -5895,47 +6157,47 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
     ctx.globalAlpha = pulse;
     ctx.strokeStyle = pending ? GOLD : 'rgba(251, 191, 36, 0.55)';
     ctx.lineWidth = pending ? 2.5 : 1.5;
-    ctx.strokeRect(FLAME_RECT.x, FLAME_RECT.y, FLAME_RECT.w, FLAME_RECT.h);
+    ctx.strokeRect(FLAME_RECT(width, height).x, FLAME_RECT(width, height).y, FLAME_RECT(width, height).w, FLAME_RECT(width, height).h);
     ctx.fillStyle = GOLD;
     ctx.font = 'bold 20px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(`🔥${save.streak.count}`, FLAME_RECT.x + FLAME_RECT.w / 2, FLAME_RECT.y + FLAME_RECT.h / 2 + 1);
+    ctx.fillText(`🔥${save.streak.count}`, FLAME_RECT(width, height).x + FLAME_RECT(width, height).w / 2, FLAME_RECT(width, height).y + FLAME_RECT(width, height).h / 2 + 1);
     ctx.restore();
   }
   // Shard balance (top right, display only).
   ctx.save();
   ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
   ctx.lineWidth = 1.5;
-  ctx.strokeRect(BALANCE_RECT.x, BALANCE_RECT.y, BALANCE_RECT.w, BALANCE_RECT.h);
+  ctx.strokeRect(BALANCE_RECT(width, height).x, BALANCE_RECT(width, height).y, BALANCE_RECT(width, height).w, BALANCE_RECT(width, height).h);
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 20px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(`◆ ${save ? (save.shardBalance ?? 0) : 0}`, BALANCE_RECT.x + BALANCE_RECT.w / 2, BALANCE_RECT.y + BALANCE_RECT.h / 2 + 1);
+  ctx.fillText(`◆ ${save ? (save.shardBalance ?? 0) : 0}`, BALANCE_RECT(width, height).x + BALANCE_RECT(width, height).w / 2, BALANCE_RECT(width, height).y + BALANCE_RECT(width, height).h / 2 + 1);
   ctx.restore();
   // Coins purse (top right, next to the shard balance, display only).
   ctx.save();
   ctx.strokeStyle = 'rgba(251, 191, 36, 0.55)';
   ctx.lineWidth = 1.5;
-  ctx.strokeRect(COINS_RECT.x, COINS_RECT.y, COINS_RECT.w, COINS_RECT.h);
+  ctx.strokeRect(COINS_RECT(width, height).x, COINS_RECT(width, height).y, COINS_RECT(width, height).w, COINS_RECT(width, height).h);
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 20px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(`🪙 ${save ? (save.coins ?? 0) : 0}`, COINS_RECT.x + COINS_RECT.w / 2, COINS_RECT.y + COINS_RECT.h / 2 + 1);
+  ctx.fillText(`🪙 ${save ? (save.coins ?? 0) : 0}`, COINS_RECT(width, height).x + COINS_RECT(width, height).w / 2, COINS_RECT(width, height).y + COINS_RECT(width, height).h / 2 + 1);
   ctx.restore();
   // Pilot level chip (top right, next to the coins — the account level
   // gates weapons, chips and the third chip slot).
   ctx.save();
   ctx.strokeStyle = 'rgba(192, 132, 252, 0.65)';
   ctx.lineWidth = 1.5;
-  ctx.strokeRect(PILOT_RECT.x, PILOT_RECT.y, PILOT_RECT.w, PILOT_RECT.h);
+  ctx.strokeRect(PILOT_RECT(width, height).x, PILOT_RECT(width, height).y, PILOT_RECT(width, height).w, PILOT_RECT(width, height).h);
   ctx.fillStyle = '#c084fc';
   ctx.font = 'bold 20px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(`Lv ${save?.pilot?.level ?? 1}`, PILOT_RECT.x + PILOT_RECT.w / 2, PILOT_RECT.y + PILOT_RECT.h / 2 + 1);
+  ctx.fillText(`Lv ${save?.pilot?.level ?? 1}`, PILOT_RECT(width, height).x + PILOT_RECT(width, height).w / 2, PILOT_RECT(width, height).y + PILOT_RECT(width, height).h / 2 + 1);
   ctx.restore();
   bigTitle(ctx, 'LUMEN DRIFT', 240, width, CYAN, 72);
   ctx.textAlign = 'center';
@@ -5965,13 +6227,13 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   ctx.globalAlpha = pulse;
   glow(ctx, GOLD, 22);
   ctx.fillStyle = GOLD;
-  ctx.fillRect(PLAY_RECT.x, PLAY_RECT.y, PLAY_RECT.w, PLAY_RECT.h);
+  ctx.fillRect(PLAY_RECT(width, height).x, PLAY_RECT(width, height).y, PLAY_RECT(width, height).w, PLAY_RECT(width, height).h);
   noGlow(ctx);
   ctx.fillStyle = INK;
   ctx.font = 'bold 32px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('▶  PLAY', PLAY_RECT.x + PLAY_RECT.w / 2, PLAY_RECT.y + PLAY_RECT.h / 2 + 1);
+  ctx.fillText('▶  PLAY', PLAY_RECT(width, height).x + PLAY_RECT(width, height).w / 2, PLAY_RECT(width, height).y + PLAY_RECT(width, height).h / 2 + 1);
   ctx.restore();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
@@ -6001,11 +6263,11 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
   // a brand-new player sees nothing but PLAY).
   if (hasPlayed) {
     const tabs = [
-      [HANGAR_TAB_RECT, 'HANGAR', CYAN],
-      [SHOP_TAB_RECT, 'SHOP', GOLD],
-      [PROFILE_TAB_RECT, 'PROFILE', '#c084fc'],
-      [MISSIONS_TAB_RECT, 'MISSIONS', GOLD],
-      [SCORES_TAB_RECT, 'SCORES', '#e2e8f0'],
+      [HANGAR_TAB_RECT(width, height), 'HANGAR', CYAN],
+      [SHOP_TAB_RECT(width, height), 'SHOP', GOLD],
+      [PROFILE_TAB_RECT(width, height), 'PROFILE', '#c084fc'],
+      [MISSIONS_TAB_RECT(width, height), 'MISSIONS', GOLD],
+      [SCORES_TAB_RECT(width, height), 'SCORES', '#e2e8f0'],
     ];
     for (const [rect, label, color] of tabs) {
       ctx.save();
@@ -6031,7 +6293,7 @@ function drawTitle(ctx, state, best, width, height, skin = SKINS[0], lifetimeSha
 function drawPanelShell(ctx, width, height, title, color) {
   ctx.fillStyle = 'rgba(11, 16, 38, 0.62)';
   ctx.fillRect(0, 0, width, height);
-  const card = PANEL_CARD;
+  const card = PANEL_CARD(width, height);
   ctx.fillStyle = 'rgba(20, 27, 61, 0.97)';
   ctx.fillRect(card.x, card.y, card.w, card.h);
   ctx.strokeStyle = color;
@@ -6048,12 +6310,12 @@ function drawPanelShell(ctx, width, height, title, color) {
   ctx.save();
   ctx.strokeStyle = '#e2e8f0';
   ctx.lineWidth = 2;
-  ctx.strokeRect(PANEL_CLOSE_RECT.x, PANEL_CLOSE_RECT.y, PANEL_CLOSE_RECT.w, PANEL_CLOSE_RECT.h);
+  ctx.strokeRect(PANEL_CLOSE_RECT(width, height).x, PANEL_CLOSE_RECT(width, height).y, PANEL_CLOSE_RECT(width, height).w, PANEL_CLOSE_RECT(width, height).h);
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 22px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('✕', PANEL_CLOSE_RECT.x + PANEL_CLOSE_RECT.w / 2, PANEL_CLOSE_RECT.y + PANEL_CLOSE_RECT.h / 2 + 1);
+  ctx.fillText('✕', PANEL_CLOSE_RECT(width, height).x + PANEL_CLOSE_RECT(width, height).w / 2, PANEL_CLOSE_RECT(width, height).y + PANEL_CLOSE_RECT(width, height).h / 2 + 1);
   ctx.restore();
   ctx.textBaseline = 'alphabetic';
 }
@@ -6126,7 +6388,7 @@ function drawStats(ctx, save, width, height) {
 function drawMissionsPanel(ctx, save, width, height) {
   drawPanelShell(ctx, width, height, 'DAILY MISSIONS', GOLD);
   if (!save) return;
-  const rows = layoutMissionRows();
+  const rows = layoutMissionRows(width, height);
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
   save.missions.list.forEach((m, i) => {
@@ -6193,9 +6455,9 @@ function drawSettingsPanel(ctx, save, width, height, extra = {}) {
   drawPanelShell(ctx, width, height, 'SETTINGS', CYAN);
   const settings = save?.settings ?? { muted: false, reduceShake: false };
   const rows = [
-    { rect: SETTINGS_SOUND_RECT, label: 'SOUND', on: !settings.muted, note: settings.muted ? 'muted — tap to turn on' : 'on — tap to mute' },
-    { rect: SETTINGS_FULLSCREEN_RECT, label: 'FULLSCREEN', on: extra.fullscreenOn ?? false, note: 'tap to toggle' },
-    { rect: SETTINGS_SHAKE_RECT, label: 'REDUCE SHAKE', on: !!settings.reduceShake, note: settings.reduceShake ? 'shake softened' : 'full shake on hits' },
+    { rect: SETTINGS_SOUND_RECT(width, height), label: 'SOUND', on: !settings.muted, note: settings.muted ? 'muted — tap to turn on' : 'on — tap to mute' },
+    { rect: SETTINGS_FULLSCREEN_RECT(width, height), label: 'FULLSCREEN', on: extra.fullscreenOn ?? false, note: 'tap to toggle' },
+    { rect: SETTINGS_SHAKE_RECT(width, height), label: 'REDUCE SHAKE', on: !!settings.reduceShake, note: settings.reduceShake ? 'shake softened' : 'full shake on hits' },
   ];
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
@@ -6265,7 +6527,7 @@ function drawRewardPanel(ctx, save, width, height) {
   const claimable = save.dailyReward
     && save.dailyReward.pendingReward > 0
     && save.dailyReward.lastClaimDate !== localDate();
-  const r = CLAIM_RECT;
+  const r = CLAIM_RECT(width, height);
   ctx.save();
   if (claimable) {
     glow(ctx, GOLD, 18);
@@ -6312,7 +6574,7 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null, ext
     shield: false,
   };
   drawShip(ctx, preview, skin, extra.shipShape ?? equippedShip(save)?.shape ?? 'skiff');
-  for (const [rect, dir] of [[HANGAR_SKIN_LEFT, -1], [HANGAR_SKIN_RIGHT, 1]]) {
+  for (const [rect, dir] of [[HANGAR_SKIN_LEFT(width, height), -1], [HANGAR_SKIN_RIGHT(width, height), 1]]) {
     ctx.save();
     ctx.strokeStyle = CYAN;
     ctx.lineWidth = 2;
@@ -6386,7 +6648,7 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null, ext
     500, 204,
   );
   // One row per part: name, effect, level pips, buy button.
-  for (const row of layoutHangarParts()) {
+  for (const row of layoutHangarParts(width, height)) {
     const level = save ? hangarLevel(save, row.part.id) : 0;
     const cost = hangarNextCost(row.part, level);
     const affordable = cost !== null && balance >= cost;
@@ -6443,7 +6705,7 @@ function drawHangar(ctx, save, width, height, skin = SKINS[0], state = null, ext
     ctx.restore();
   }
   // Back button, bottom centre.
-  drawButton(ctx, HANGAR_BACK_RECT, '◀  BACK  [H]');
+  drawButton(ctx, HANGAR_BACK_RECT(width, height), '◀  BACK  [H]');
 }
 
 // An outlined button with a centred label (pause menu, game-over exits,
@@ -6461,8 +6723,8 @@ function drawButton(ctx, rect, label) {
   ctx.restore();
 }
 
-function drawPlayAgain(ctx) {
-  const r = PLAY_AGAIN_RECT;
+function drawPlayAgain(ctx, width, height) {
+  const r = PLAY_AGAIN_RECT(width, height);
   ctx.save();
   ctx.fillStyle = GOLD;
   ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -6493,7 +6755,7 @@ function drawUpgrade(ctx, state, offers, width, height, age = 0) {
   ctx.fillStyle = '#e2e8f0';
   ctx.font = '20px sans-serif';
   ctx.fillText(`Level ${state.level} reached — choose one upgrade.`, width / 2, 212);
-  const cards = layoutUpgradeCards(offers);
+  const cards = layoutUpgradeCards(offers, width, height);
   for (let i = 0; i < cards.length; i += 1) {
     const card = cards[i];
     const up = card.upgrade;
@@ -6585,11 +6847,11 @@ function drawPaused(ctx, width, height) {
   ctx.fillText('DRAG steer  •  ◆ collect shards  •  DASH dodge mines', width / 2, 330);
   // Pause is an exit, not a trap: resume, restart, hangar, or menu —
   // including during endless, where the run can be left at any time.
-  drawButton(ctx, PAUSE_RESUME_RECT, 'RESUME  [P]');
-  drawButton(ctx, PAUSE_RESTART_RECT, 'RESTART  [R]');
-  drawButton(ctx, PAUSE_HANGAR_RECT, 'HANGAR  [H]');
+  drawButton(ctx, PAUSE_RESUME_RECT(width, height), 'RESUME  [P]');
+  drawButton(ctx, PAUSE_RESTART_RECT(width, height), 'RESTART  [R]');
+  drawButton(ctx, PAUSE_HANGAR_RECT(width, height), 'HANGAR  [H]');
   // No key hint on MENU: M is the global mute toggle.
-  drawButton(ctx, PAUSE_MENU_RECT, 'MENU');
+  drawButton(ctx, PAUSE_MENU_RECT(width, height), 'MENU');
 }
 
 function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
@@ -6676,31 +6938,33 @@ function drawOver(ctx, state, best, width, height, summary = null, extra = {}) {
   } else {
     ctx.fillText(`NEXT GOAL: beat your best ${best}`, width / 2, y);
   }
-  drawPlayAgain(ctx);
+  drawPlayAgain(ctx, width, height);
   // The endless trap fix: from a death screen the player can go straight
   // to the hangar to spend the shards they just earned.
-  drawButton(ctx, OVER_HANGAR_RECT, 'HANGAR  [H]');
+  drawButton(ctx, OVER_HANGAR_RECT(width, height), 'HANGAR  [H]');
   ctx.fillStyle = '#94a3b8';
   ctx.font = '17px sans-serif';
   ctx.fillText('R retry  •  H hangar  •  Esc menu', width / 2, 672);
 }
 
 function drawClear(ctx, state, best, width, height, summary = null, extra = {}) {
+  // Stage clear, kept short: title, coins, next-stage line, then only
+  // the lines that fired (achievements, boss drop), then the buttons.
+  // No gate ring here — it sat at cy = height*0.20, on top of the title
+  // at y 140. (The gate still draws during PLAY and on the title.)
+  // Cut: the flavor line, the top-scores line, the missions line and
+  // the key-hint footer — the buttons say what they do.
   panel(ctx, width, height);
-  drawGate(ctx, state, width, height);
   const stage = summary?.stage ?? state.stage ?? 1;
   const coins = summary?.coins ?? 0;
   const firstClear = summary?.firstClear ?? false;
   bigTitle(ctx, `STAGE ${stage} CLEAR!`, 140, width, GREEN, 56);
   ctx.textAlign = 'center';
-  ctx.fillStyle = '#fef9c3';
-  ctx.font = 'bold 26px sans-serif';
-  ctx.fillText(`You cleared stage ${stage} — the storm bows to you.`, width / 2, 196);
   ctx.fillStyle = GOLD;
   ctx.font = 'bold 24px sans-serif';
   ctx.fillText(
     `+${coins} COINS${firstClear ? '  •  FIRST CLEAR!' : '  •  replay reward'}`,
-    width / 2, 236,
+    width / 2, 206,
   );
   ctx.fillStyle = '#e2e8f0';
   ctx.font = 'bold 22px sans-serif';
@@ -6708,54 +6972,38 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
     stage >= 100
       ? 'ALL 100 STAGES CLEAR — YOU ARE THE STORM!'
       : `STAGE ${stage + 1} UNLOCKED!`,
-    width / 2, 272,
+    width / 2, 244,
   );
-  let y = 296;
-  if (summary && summary.rank > 0) {
-    ctx.fillStyle = GOLD;
-    ctx.font = 'bold 20px sans-serif';
-    ctx.fillText(
-      summary.rank === 1
-        ? '#1 ON TOP SCORES — a new top score!'
-        : `#${summary.rank} ON TOP SCORES — just ${summary.gapToFirst} points from #1!`,
-      width / 2, y,
-    );
-    y += 26;
-  }
-  if (summary && summary.completed.length) {
-    const total = summary.completed.reduce((n, m) => n + m.reward, 0);
-    ctx.fillStyle = '#34d399';
-    ctx.font = 'bold 20px sans-serif';
-    ctx.fillText(`✓ MISSIONS +${total} shards`, width / 2, y);
-    y += 26;
-  }
   // Newly unlocked achievements (coins claimed from the profile —
-  // never auto-paid) and the boss chip drop, if any.
+  // never auto-paid) and the boss chip drop, if any. At most three
+  // lines (two achievements + drop), the last ending near y 352,
+  // clear of NEXT at y 384.
+  let y = 282;
   const unlocked = summary?.achievements ?? [];
   if (unlocked.length) {
     ctx.fillStyle = '#c084fc';
     ctx.font = 'bold 20px sans-serif';
     const first = unlocked[0];
     ctx.fillText(`🏆 ACHIEVEMENT: ${first.name} +${first.reward} 🪙`, width / 2, y);
-    y += 26;
+    y += 28;
     if (unlocked.length > 1) {
       const second = unlocked[1];
       const more = unlocked.length > 2 ? `  (+${unlocked.length - 2} more)` : '';
       ctx.fillText(`🏆 ACHIEVEMENT: ${second.name} +${second.reward} 🪙${more}`, width / 2, y);
-      y += 26;
+      y += 28;
     }
   }
   if (summary && summary.bossDrop) {
     ctx.fillStyle = '#38bdf8';
     ctx.font = 'bold 20px sans-serif';
     ctx.fillText(`🎁 BOSS DROP: ${summary.bossDrop}`, width / 2, y);
-    y += 26;
+    y += 28;
   }
   // NEXT is the gold primary (only while a next stage exists); REPLAY,
   // STAGES and HANGAR are the outlined exits. CONTINUE — ENDLESS shows
   // only once endless is unlocked.
   if (stage < 100) {
-    const r = CLEAR_NEXT_RECT;
+    const r = CLEAR_NEXT_RECT(width, height);
     ctx.save();
     ctx.fillStyle = GOLD;
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -6767,12 +7015,12 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
     ctx.restore();
   }
   ctx.textBaseline = 'alphabetic';
-  drawButton(ctx, CLEAR_REPLAY_RECT, '↻  REPLAY  [R]');
-  drawButton(ctx, CLEAR_STAGES_RECT, 'STAGES');
-  drawButton(ctx, CLEAR_HANGAR_RECT, 'HANGAR  [H]');
+  drawButton(ctx, CLEAR_REPLAY_RECT(width, height), '↻  REPLAY  [R]');
+  drawButton(ctx, CLEAR_STAGES_RECT(width, height), 'STAGES');
+  drawButton(ctx, CLEAR_HANGAR_RECT(width, height), 'HANGAR  [H]');
   const save = extra.save ?? null;
   if (save && save.endlessUnlocked) {
-    const r = CLEAR_ENDLESS_RECT;
+    const r = CLEAR_ENDLESS_RECT(width, height);
     ctx.save();
     ctx.fillStyle = GREEN;
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -6784,9 +7032,6 @@ function drawClear(ctx, state, best, width, height, summary = null, extra = {}) 
     ctx.restore();
     ctx.textBaseline = 'alphabetic';
   }
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '17px sans-serif';
-  ctx.fillText('N next  •  R replay  •  H hangar  •  E endless', width / 2, 692);
 }
 
 function drawStages(ctx, save, width, height, page = 0, extra = {}) {
@@ -6805,7 +7050,7 @@ function drawStages(ctx, save, width, height, page = 0, extra = {}) {
   ctx.fillStyle = '#a5f3fc';
   ctx.font = 'bold 19px sans-serif';
   ctx.fillText(`SHIP ${shipName}  Lv ${shipLevelNow}   •   ${cleared > 0 ? `STAGE ${cleared} CLEARED` : 'NO STAGE CLEARED YET'}`, width / 2, 138);
-  const layout = layoutStageTiles(page);
+  const layout = layoutStageTiles(page, width, height);
   const lo = layout.page * STAGES_PER_PAGE + 1;
   const hi = lo + STAGES_PER_PAGE - 1;
   // Band label with page arrows — the band's theme name and accent.
@@ -6921,7 +7166,7 @@ function drawShop(ctx, save, width, height, extra = {}) {
   ctx.fillText(coinsLine, width / 2, 100);
   // Section tabs: one section visible at a time.
   const tabLabels = { ships: 'SHIPS', weapons: 'WEAPONS', chips: 'CHIPS' };
-  for (const [key, rect] of Object.entries(SHOP_SECTION_RECTS)) {
+  for (const [key, rect] of Object.entries(SHOP_SECTION_RECTS(width, height))) {
     const active = key === section;
     ctx.save();
     ctx.fillStyle = active ? GOLD : 'rgba(20, 27, 61, 0.96)';
@@ -6941,9 +7186,9 @@ function drawShop(ctx, save, width, height, extra = {}) {
     ctx.font = '17px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillText('Weapons unlock with pilot level — switching weapons is free.', width / 2, 110);
+    ctx.fillText('Weapons unlock with pilot level — switching weapons is free.', width / 2, 122);
     const equippedWeaponId = equippedWeapon(save);
-    for (const card of layoutShopWeapons(weapons)) {
+    for (const card of layoutShopWeapons(weapons, width, height)) {
       const def = card.weapon;
       const level = Math.max(1, weaponLevel(save, def.id));
       const owned = !!(save?.weapons?.owned && save.weapons.owned[def.id]);
@@ -7028,10 +7273,10 @@ function drawShop(ctx, save, width, height, extra = {}) {
     ctx.font = '17px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillText('Chips slot into your loadout — tap SLOT to equip, tap a slotted chip to remove it.', width / 2, 110);
+    ctx.fillText('Chips slot into your loadout — tap SLOT to equip, tap a slotted chip to remove it.', width / 2, 122);
     const slots = save?.chips?.slots ?? [null, null];
     const freeSlot = slots.some((s) => s == null);
-    for (const card of layoutShopChips(chips)) {
+    for (const card of layoutShopChips(chips, width, height)) {
       const def = card.chip;
       const owned = !!(save?.chips?.owned && save.chips.owned[def.id]);
       const slotted = slots.includes(def.id);
@@ -7102,8 +7347,8 @@ function drawShop(ctx, save, width, height, extra = {}) {
     ctx.font = '17px sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillText('Ships level up with coins too — higher stages demand a stronger ship.', width / 2, 110);
-    for (const card of layoutShopCards()) {
+    ctx.fillText('Ships level up with coins too — higher stages demand a stronger ship.', width / 2, 122);
+    for (const card of layoutShopCards(width, height)) {
       const def = card.ship;
       const level = shipLevel(save, def.id);
       const owned = level > 0;
@@ -7194,14 +7439,14 @@ function drawShop(ctx, save, width, height, extra = {}) {
     }
   }
   ctx.textBaseline = 'alphabetic';
-  drawButton(ctx, SHOP_BACK_RECT, '◀  BACK  [H]');
+  drawButton(ctx, SHOP_BACK_RECT(width, height), '◀  BACK  [H]');
 }
 
 // --- Profile: pilot level + XP bar, equipped loadout, Attribute
 // Overview, Collection, Achievements (claimable from here).
 function drawProfile(ctx, save, width, height, extra = {}) {
   const profile = extra.profile ?? profileFromSave(save, extra.profileOpts ?? {});
-  const layout = layoutProfileSections(profile);
+  const layout = layoutProfileSections(profile, width, height);
   panel(ctx, width, height);
   bigTitle(ctx, 'PROFILE', 64, width, '#c084fc', 46);
 
@@ -7400,7 +7645,7 @@ function drawProfile(ctx, save, width, height, extra = {}) {
   ctx.restore();
 
   ctx.textBaseline = 'alphabetic';
-  drawButton(ctx, PROFILE_BACK_RECT, '◀  BACK  [H]');
+  drawButton(ctx, PROFILE_BACK_RECT(width, height), '◀  BACK  [H]');
 }
 
 function createRenderer(canvas) {
@@ -7457,8 +7702,10 @@ function createRenderer(canvas) {
     ctx.save();
     ctx.translate(ox, oy);
     ctx.scale(scale, scale);
-    // Hit shake: the field jolts ~3 px for 0.1 s. The HUD and overlays
-    // are drawn after the matching restore(), so they stay steady.
+    // Hit shake: the field jolts ~3 px for 0.1 s. The HUD is drawn
+    // after the matching restore() (re-applying the letterbox transform
+    // without the shake), so it stays steady; menus draw in fullscreen
+    // menu space instead (see the tail of draw()).
     // REDUCE SHAKE (settings) softens it to a 1 px nudge.
     ctx.save();
     if (state.shakeTime > 0) {
@@ -7564,23 +7811,43 @@ function createRenderer(canvas) {
       }
     }
     ctx.globalAlpha = 1;
-    ctx.restore();
+    ctx.restore(); // shake — the field is done
+    ctx.restore(); // letterbox — the field is done; HUD and menus draw outside it
 
-    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) drawHud(ctx, state, best, FIELD.width, theme, { weaponLabel: extra.weaponLabel });
-    if (screen === SCREEN_TITLE) drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo });
-    if (screen === SCREEN_HANGAR) drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape, loadout: extra.loadout });
-    if (screen === SCREEN_STAGES) drawStages(ctx, save, FIELD.width, FIELD.height, extra.stagesPage ?? 0, { ship: extra.ship });
-    if (screen === SCREEN_SHOP) drawShop(ctx, save, FIELD.width, FIELD.height, { section: extra.section, weapons: extra.weapons, chips: extra.chips });
-    if (screen === SCREEN_PROFILE) drawProfile(ctx, save, FIELD.width, FIELD.height, { profile: extra.profile, profileOpts: extra.profileOpts });
-    if (screen === SCREEN_PAUSED) drawPaused(ctx, FIELD.width, FIELD.height);
-    if (screen === SCREEN_OVER) drawOver(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
-    if (screen === SCREEN_CLEAR) drawClear(ctx, state, best, FIELD.width, FIELD.height, summary, { save });
-    if (screen === SCREEN_STATS) drawStats(ctx, save, FIELD.width, FIELD.height);
-    if (screen === SCREEN_MISSIONS) drawMissionsPanel(ctx, save, FIELD.width, FIELD.height);
-    if (screen === SCREEN_SETTINGS) drawSettingsPanel(ctx, save, FIELD.width, FIELD.height, { fullscreenOn: extra.fullscreenOn ?? false });
-    if (screen === SCREEN_REWARD) drawRewardPanel(ctx, save, FIELD.width, FIELD.height);
-    if (screen === SCREEN_UPGRADE) drawUpgrade(ctx, state, offers, FIELD.width, FIELD.height, upgradeAge);
-    ctx.restore();
+    // The HUD stays in field space (letterboxed, like the entities), so
+    // the score, hearts and progress bar sit exactly where the world is.
+    // Its top-right cluster ends at hudRight: the DOM fullscreen/pause
+    // buttons occupy the screen's top-right corner (the fullscreen
+    // button's left edge is at CSS width - 126), so the cluster stops
+    // 14 px left of them, converted back into field units — at every
+    // screen size.
+    const hudRight = Math.max(200, Math.min(FIELD.width - 18, (width - 140 - ox) / scale));
+    if (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_UPGRADE) {
+      ctx.save();
+      ctx.translate(ox, oy);
+      ctx.scale(scale, scale);
+      drawHud(ctx, state, best, FIELD.width, theme, { weaponLabel: extra.weaponLabel, hudRight });
+      ctx.restore();
+    }
+    // Menus fill the whole CSS box: beginMenu stretches the 1280x720
+    // design onto (width, height), so on a wider phone the title, stage
+    // select, shop, profile, hangar, panels and end screens span the
+    // screen instead of sitting inset in the letterbox. At 1280x720 the
+    // stretch is 1:1, so the layout is identical to before. The gate
+    // ring and the starfield stay in field space (drawn above).
+    if (screen === SCREEN_TITLE) { beginMenu(ctx, width, height); drawTitle(ctx, state, best, FIELD.width, FIELD.height, skin, lifetimeShards, { save, streakInfo }); endMenu(ctx); }
+    if (screen === SCREEN_HANGAR) { beginMenu(ctx, width, height); drawHangar(ctx, save, FIELD.width, FIELD.height, skin, state, { ship: extra.ship, shipShape: extra.shipShape, loadout: extra.loadout }); endMenu(ctx); }
+    if (screen === SCREEN_STAGES) { beginMenu(ctx, width, height); drawStages(ctx, save, FIELD.width, FIELD.height, extra.stagesPage ?? 0, { ship: extra.ship }); endMenu(ctx); }
+    if (screen === SCREEN_SHOP) { beginMenu(ctx, width, height); drawShop(ctx, save, FIELD.width, FIELD.height, { section: extra.section, weapons: extra.weapons, chips: extra.chips }); endMenu(ctx); }
+    if (screen === SCREEN_PROFILE) { beginMenu(ctx, width, height); drawProfile(ctx, save, FIELD.width, FIELD.height, { profile: extra.profile, profileOpts: extra.profileOpts }); endMenu(ctx); }
+    if (screen === SCREEN_PAUSED) { beginMenu(ctx, width, height); drawPaused(ctx, FIELD.width, FIELD.height); endMenu(ctx); }
+    if (screen === SCREEN_OVER) { beginMenu(ctx, width, height); drawOver(ctx, state, best, FIELD.width, FIELD.height, summary, { save }); endMenu(ctx); }
+    if (screen === SCREEN_CLEAR) { beginMenu(ctx, width, height); drawClear(ctx, state, best, FIELD.width, FIELD.height, summary, { save }); endMenu(ctx); }
+    if (screen === SCREEN_STATS) { beginMenu(ctx, width, height); drawStats(ctx, save, FIELD.width, FIELD.height); endMenu(ctx); }
+    if (screen === SCREEN_MISSIONS) { beginMenu(ctx, width, height); drawMissionsPanel(ctx, save, FIELD.width, FIELD.height); endMenu(ctx); }
+    if (screen === SCREEN_SETTINGS) { beginMenu(ctx, width, height); drawSettingsPanel(ctx, save, FIELD.width, FIELD.height, { fullscreenOn: extra.fullscreenOn ?? false }); endMenu(ctx); }
+    if (screen === SCREEN_REWARD) { beginMenu(ctx, width, height); drawRewardPanel(ctx, save, FIELD.width, FIELD.height); endMenu(ctx); }
+    if (screen === SCREEN_UPGRADE) { beginMenu(ctx, width, height); drawUpgrade(ctx, state, offers, FIELD.width, FIELD.height, upgradeAge); endMenu(ctx); }
     noGlow(ctx);
   }
 
@@ -7613,7 +7880,7 @@ function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
 }
 
 // ---- src/shots.js ----
-// Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win|profile.
+// Lumen Drift — the screenshot scenes behind ?shot=start|play|end|win|profile|shop.
 // Each scene plays the real rules forward from a fresh world for a fixed
 // number of steps, steered by a simple autopilot (chase the nearest shard,
 // keep clear of mines and storm shards), so the frame is what a real game
@@ -7625,6 +7892,8 @@ function applyTouchButtons(dashBtn, pauseBtn, screen, isTouch) {
 // - win: stage 1 clears at its target (500 points).
 // - profile: the profile screen over a demo save (Lv 3 pilot, two ships,
 //   a mortar, two chips, two achievements unlocked, one claimed).
+// - shop: the ship shop over the same demo save (1,250 coins, 12 stages
+//   cleared) — the section tabs and cards draw from the live save.
 
 const START_SECONDS = 6;
 const PLAY_TARGET = 340;
@@ -7716,6 +7985,22 @@ function stageShot(name, world) {
     for (let i = 0; i < 20; i += 1) world.step(STEP, { x: 0, y: 0 }, null, false);
     return { screen: SCREEN_OVER, best: state.score };
   }
+  if (name === 'shop') {
+    // The ship shop over the same demo save as 'profile': 1,250 coins,
+    // 12 stages cleared, two ships owned — the section tabs, the coins
+    // line and the six ship cards all draw from the live save. The
+    // section defaults to SHIPS (extra.section can switch it).
+    const save = freshSave(localDate());
+    save.coins = 1250;
+    save.highestCleared = 12;
+    save.pilot = { xp: 320, level: 3 };
+    save.ships = { owned: { spark: { level: 3 }, comet: { level: 1 } }, equipped: 'comet' };
+    save.weapons = { owned: { blaster: { level: 2 }, mortar: { level: 1 } }, equipped: 'mortar' };
+    save.chips = { owned: { 'piercing-rounds': true, 'golden-touch': true }, slots: ['piercing-rounds', null] };
+    save.lifetime.shards = 500;
+    save.lifetime.runs = 31;
+    return { screen: SCREEN_SHOP, best: 0, extra: { save } };
+  }
   if (name === 'profile') {
     // A demo save with real progress: Lv 3 pilot, two ships, a mortar,
     // two chips (one slotted), two achievements unlocked, one claimed.
@@ -7751,7 +8036,7 @@ function stageShot(name, world) {
 // continue into endless mode), plus the panels over Home — top scores,
 // daily missions, settings and daily reward.
 //
-// ?seed=N fixes the storm's pattern. ?shot=start|play|end|win|profile (with
+// ?seed=N fixes the storm's pattern. ?shot=start|play|end|win|profile|shop (with
 // &seed=N) stages that scene instead of running the loop, paints it twice
 // and sets window.__shotReady for a screenshot. ?debug=win starts a live
 // game one shard away from the stage-1 target, for testing the clear path.
@@ -7878,6 +8163,13 @@ function runGame() {
   let stagesPage = 0;
   // Which shop section is showing: ships, weapons or chips.
   let shopSection = 'ships';
+  // The canvas's CSS-pixel size this frame, for menu hit-testing:
+  // menu rects live in CSS-pixel space (render.js menuScale), so taps
+  // on menu screens are read with input.takeTapCss() and tested against
+  // rects built for (menuW, menuH). Play still uses field coordinates
+  // (input.takeTap / the steering pointer).
+  let menuW = FIELD.width;
+  let menuH = FIELD.height;
 
   // Debug hook for testing the clear path: one shard away from the
   // stage-1 target. (Stage is 1 by default.)
@@ -8160,7 +8452,7 @@ function runGame() {
   // only — never auto-paid). Failures are announced, never silent.
   function tryClaimAchievement(index) {
     const profile = buildProfile();
-    const rows = layoutProfileSections(profile).achievements.rows;
+    const rows = layoutProfileSections(profile, menuW, menuH).achievements.rows;
     const row = rows[index];
     if (!row) return;
     const def = row.achievement;
@@ -8184,7 +8476,7 @@ function runGame() {
   // equip it — whichever the button offered. Failures are announced,
   // never silent.
   function tryShopAction(index) {
-    const cards = layoutShopCards();
+    const cards = layoutShopCards(menuW, menuH);
     const card = cards[index];
     if (!card) return;
     const def = card.ship;
@@ -8230,7 +8522,7 @@ function runGame() {
   // One tap on a weapon card's action button: buy it, level it up, or
   // equip it — whichever the button offered. Weapon switching is free.
   function tryShopWeaponAction(index) {
-    const cards = layoutShopWeapons(WEAPONS);
+    const cards = layoutShopWeapons(WEAPONS, menuW, menuH);
     const card = cards[index];
     if (!card) return;
     const def = card.weapon;
@@ -8276,7 +8568,7 @@ function runGame() {
   // One tap on a chip card's action button: buy it, slot it into the
   // first free slot, or unslot it when it is already equipped.
   function tryShopChipAction(index) {
-    const cards = layoutShopChips(CHIPS);
+    const cards = layoutShopChips(CHIPS, menuW, menuH);
     const card = cards[index];
     if (!card) return;
     const def = card.chip;
@@ -8411,6 +8703,9 @@ function runGame() {
     window.__lumen.screenName = screen;
     const elapsed = Math.min(MAX_FRAME, (now - last) / 1000);
     last = now;
+    const canvasRect = canvas.getBoundingClientRect();
+    menuW = Math.max(320, Math.floor(canvasRect.width));
+    menuH = Math.max(240, Math.floor(canvasRect.height));
 
     if (input.consume(ACTION_MUTE)) {
       const muted = audio.toggleMute();
@@ -8425,22 +8720,22 @@ function runGame() {
       // bottom tab bar (after the first run) opens hangar / missions /
       // scores. The skin selector lives in the hangar now.
       world.step(STEP, { x: 0, y: 0 }, null, false);
-      const tap = input.takeTap();
-      if (inRect(tap, GEAR_RECT)) {
+      const tap = input.takeTapCss();
+      if (inRect(tap, GEAR_RECT(menuW, menuH))) {
         openPanel(SCREEN_SETTINGS, 'Settings');
-      } else if (inRect(tap, FLAME_RECT) && save.streak.count > 0) {
+      } else if (inRect(tap, FLAME_RECT(menuW, menuH)) && save.streak.count > 0) {
         openPanel(SCREEN_REWARD, 'Daily reward');
-      } else if (inRect(tap, PLAY_RECT)) {
+      } else if (inRect(tap, PLAY_RECT(menuW, menuH))) {
         enterStages();
-      } else if (inRect(tap, HANGAR_TAB_RECT) && save.lifetime.runs > 0) {
+      } else if (inRect(tap, HANGAR_TAB_RECT(menuW, menuH)) && save.lifetime.runs > 0) {
         enterHangar();
-      } else if (inRect(tap, SHOP_TAB_RECT) && save.lifetime.runs > 0) {
+      } else if (inRect(tap, SHOP_TAB_RECT(menuW, menuH)) && save.lifetime.runs > 0) {
         enterShop();
-      } else if (inRect(tap, PROFILE_TAB_RECT) && save.lifetime.runs > 0) {
+      } else if (inRect(tap, PROFILE_TAB_RECT(menuW, menuH)) && save.lifetime.runs > 0) {
         enterProfile();
-      } else if (inRect(tap, MISSIONS_TAB_RECT) && save.lifetime.runs > 0) {
+      } else if (inRect(tap, MISSIONS_TAB_RECT(menuW, menuH)) && save.lifetime.runs > 0) {
         openPanel(SCREEN_MISSIONS, 'Daily missions');
-      } else if (inRect(tap, SCORES_TAB_RECT) && save.lifetime.runs > 0) {
+      } else if (inRect(tap, SCORES_TAB_RECT(menuW, menuH)) && save.lifetime.runs > 0) {
         openPanel(SCREEN_STATS, 'Top scores');
       } else if (input.consume('KeyT')) {
         openPanel(SCREEN_STATS, 'Top scores');
@@ -8458,23 +8753,23 @@ function runGame() {
       // the hangar, or its first 400 ms), swallow everything — a stale
       // tap must never buy a part.
       if (!input.gateOpen()) {
-        input.takeTap();
+        input.takeTapCss();
         input.clearPressed();
       } else {
-        const tap = input.takeTap();
-        if (inRect(tap, HANGAR_BACK_RECT)) {
+        const tap = input.takeTapCss();
+        if (inRect(tap, HANGAR_BACK_RECT(menuW, menuH))) {
           screen = SCREEN_TITLE;
           input.clearPressed();
           input.clearTap();
           announce('Lumen Drift. Press Enter or click to launch.');
-        } else if (inRect(tap, HANGAR_SKIN_LEFT)) {
+        } else if (inRect(tap, HANGAR_SKIN_LEFT(menuW, menuH))) {
           cycleSkin(-1);
           input.clearPressed();
-        } else if (inRect(tap, HANGAR_SKIN_RIGHT)) {
+        } else if (inRect(tap, HANGAR_SKIN_RIGHT(menuW, menuH))) {
           cycleSkin(1);
           input.clearPressed();
         } else {
-          const rows = layoutHangarParts();
+          const rows = layoutHangarParts(menuW, menuH);
           const bought = rows.findIndex((row) => inRect(tap, row.buy));
           if (bought >= 0) tryBuyHangar(bought);
           else if (input.consume(ACTION_PICK_1)) tryBuyHangar(0);
@@ -8499,11 +8794,11 @@ function runGame() {
       // input gate is closed, swallow everything — a stale tap must
       // never start a stage.
       if (!input.gateOpen()) {
-        input.takeTap();
+        input.takeTapCss();
         input.clearPressed();
       } else {
-        const tap = input.takeTap();
-        const layout = layoutStageTiles(stagesPage);
+        const tap = input.takeTapCss();
+        const layout = layoutStageTiles(stagesPage, menuW, menuH);
         const tile = layout.tiles.findIndex((t) => inRect(tap, t));
         if (inRect(tap, layout.back)) {
           screen = SCREEN_TITLE;
@@ -8543,29 +8838,29 @@ function runGame() {
       // equip / slot. BACK (or H / Esc) returns to the title. Same
       // input-gate discipline as the hangar: no stale tap may spend coins.
       if (!input.gateOpen()) {
-        input.takeTap();
+        input.takeTapCss();
         input.clearPressed();
       } else {
-        const tap = input.takeTap();
-        if (inRect(tap, SHOP_BACK_RECT)) {
+        const tap = input.takeTapCss();
+        if (inRect(tap, SHOP_BACK_RECT(menuW, menuH))) {
           screen = SCREEN_TITLE;
           input.clearPressed();
           input.clearTap();
           announce('Lumen Drift. Press Enter or click to launch.');
-        } else if (inRect(tap, SHOP_SECTION_RECTS.ships)) {
+        } else if (inRect(tap, SHOP_SECTION_RECTS(menuW, menuH).ships)) {
           shopSection = 'ships';
           input.clearPressed();
           audio.click();
-        } else if (inRect(tap, SHOP_SECTION_RECTS.weapons)) {
+        } else if (inRect(tap, SHOP_SECTION_RECTS(menuW, menuH).weapons)) {
           shopSection = 'weapons';
           input.clearPressed();
           audio.click();
-        } else if (inRect(tap, SHOP_SECTION_RECTS.chips)) {
+        } else if (inRect(tap, SHOP_SECTION_RECTS(menuW, menuH).chips)) {
           shopSection = 'chips';
           input.clearPressed();
           audio.click();
         } else if (shopSection === 'weapons') {
-          const cards = layoutShopWeapons(WEAPONS);
+          const cards = layoutShopWeapons(WEAPONS, menuW, menuH);
           const acted = cards.findIndex((card) => inRect(tap, card.action));
           if (acted >= 0) tryShopWeaponAction(acted);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
@@ -8575,7 +8870,7 @@ function runGame() {
             announce('Lumen Drift. Press Enter or click to launch.');
           }
         } else if (shopSection === 'chips') {
-          const cards = layoutShopChips(CHIPS);
+          const cards = layoutShopChips(CHIPS, menuW, menuH);
           const acted = cards.findIndex((card) => inRect(tap, card.action));
           if (acted >= 0) tryShopChipAction(acted);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
@@ -8585,7 +8880,7 @@ function runGame() {
             announce('Lumen Drift. Press Enter or click to launch.');
           }
         } else {
-          const cards = layoutShopCards();
+          const cards = layoutShopCards(menuW, menuH);
           const acted = cards.findIndex((card) => inRect(tap, card.action));
           if (acted >= 0) tryShopAction(acted);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH')) {
@@ -8601,17 +8896,17 @@ function runGame() {
       // coins (once each). BACK (or P / H / Esc) returns to the title.
       // Same input-gate discipline as the shop: no stale tap may claim.
       if (!input.gateOpen()) {
-        input.takeTap();
+        input.takeTapCss();
         input.clearPressed();
       } else {
-        const tap = input.takeTap();
-        if (inRect(tap, PROFILE_BACK_RECT)) {
+        const tap = input.takeTapCss();
+        if (inRect(tap, PROFILE_BACK_RECT(menuW, menuH))) {
           screen = SCREEN_TITLE;
           input.clearPressed();
           input.clearTap();
           announce('Lumen Drift. Press Enter or click to launch.');
         } else {
-          const rows = layoutProfileSections(buildProfile()).achievements.rows;
+          const rows = layoutProfileSections(buildProfile(), menuW, menuH).achievements.rows;
           const claimed = rows.findIndex((row) => inRect(tap, row.claim));
           if (claimed >= 0) tryClaimAchievement(claimed);
           else if (input.consume(ACTION_PAUSE) || input.consume('KeyH') || input.consume('KeyP')) {
@@ -8629,10 +8924,10 @@ function runGame() {
       // also counts as a confirm (input adds ACTION_CONFIRM on every
       // canvas press); checking close first would close the panel
       // instead of claiming / rerolling / toggling.
-      const tap = input.takeTap();
+      const tap = input.takeTapCss();
       let handled = false;
       if (screen === SCREEN_MISSIONS) {
-        const rows = layoutMissionRows();
+        const rows = layoutMissionRows(menuW, menuH);
         const rerolled = rows.findIndex((row) => inRect(tap, row.reroll));
         if (rerolled >= 0 && save.missions.list[rerolled]) {
           const result = rerollMission(save, save.missions.list[rerolled].id);
@@ -8646,23 +8941,23 @@ function runGame() {
           handled = true;
         }
       } else if (screen === SCREEN_SETTINGS) {
-        if (inRect(tap, SETTINGS_SOUND_RECT)) {
+        if (inRect(tap, SETTINGS_SOUND_RECT(menuW, menuH))) {
           save.settings.muted = !save.settings.muted;
           audio.setMuted(save.settings.muted);
           saveSave(window.localStorage, save);
           announce(save.settings.muted ? 'Sound muted.' : 'Sound on.');
           handled = true;
-        } else if (inRect(tap, SETTINGS_FULLSCREEN_RECT)) {
+        } else if (inRect(tap, SETTINGS_FULLSCREEN_RECT(menuW, menuH))) {
           toggleFullscreen();
           handled = true;
-        } else if (inRect(tap, SETTINGS_SHAKE_RECT)) {
+        } else if (inRect(tap, SETTINGS_SHAKE_RECT(menuW, menuH))) {
           save.settings.reduceShake = !save.settings.reduceShake;
           saveSave(window.localStorage, save);
           announce(save.settings.reduceShake ? 'Screen shake reduced.' : 'Full screen shake on.');
           handled = true;
         }
       } else if (screen === SCREEN_REWARD) {
-        if (inRect(tap, CLAIM_RECT)) {
+        if (inRect(tap, CLAIM_RECT(menuW, menuH))) {
           const claimed = claimDailyReward(save, today);
           if (claimed.claimed) {
             saveSave(window.localStorage, save);
@@ -8678,8 +8973,8 @@ function runGame() {
         // into the next screen.
         input.clearPressed();
         input.clearTap();
-      } else if (inRect(tap, PANEL_CLOSE_RECT)
-        || (tap && !inRect(tap, PANEL_CARD))
+      } else if (inRect(tap, PANEL_CLOSE_RECT(menuW, menuH))
+        || (tap && !inRect(tap, PANEL_CARD(menuW, menuH)))
         || input.consume(ACTION_PAUSE)
         || input.consume('KeyT')) {
         screen = SCREEN_TITLE;
@@ -8748,7 +9043,7 @@ function runGame() {
       // appear, or the steering finger is still down), swallow every
       // tap and pick key — this is what stops the stale-tap auto-pick.
       if (!input.gateOpen()) {
-        input.takeTap();
+        input.takeTapCss();
         input.clearPressed();
       } else {
         let picked = -1;
@@ -8756,9 +9051,9 @@ function runGame() {
         else if (input.consume(ACTION_PICK_2)) picked = 1;
         else if (input.consume(ACTION_PICK_3)) picked = 2;
         else {
-          const tap = input.takeTap();
+          const tap = input.takeTapCss();
           if (tap) {
-            const cards = layoutUpgradeCards(offers);
+            const cards = layoutUpgradeCards(offers, menuW, menuH);
             picked = cards.findIndex((card) =>
               tap.x >= card.x && tap.x <= card.x + card.w
               && tap.y >= card.y && tap.y <= card.y + card.h);
@@ -8774,17 +9069,17 @@ function runGame() {
       // that taps a button also counts as a confirm (input adds
       // ACTION_CONFIRM on every canvas press), and checking resume
       // first would resume the game instead of opening the hangar.
-      const tap = input.takeTap();
-      if (inRect(tap, PAUSE_RESUME_RECT)) {
+      const tap = input.takeTapCss();
+      if (inRect(tap, PAUSE_RESUME_RECT(menuW, menuH))) {
         screen = SCREEN_PLAY;
         input.clearPressed();
         input.clearTap();
         announce('Resumed.');
-      } else if (inRect(tap, PAUSE_RESTART_RECT)) {
+      } else if (inRect(tap, PAUSE_RESTART_RECT(menuW, menuH))) {
         startGame();
-      } else if (inRect(tap, PAUSE_HANGAR_RECT)) {
+      } else if (inRect(tap, PAUSE_HANGAR_RECT(menuW, menuH))) {
         enterHangar();
-      } else if (inRect(tap, PAUSE_MENU_RECT)) {
+      } else if (inRect(tap, PAUSE_MENU_RECT(menuW, menuH))) {
         // No key for MENU here: KeyM is the global mute toggle, so the
         // menu is the button (keyboard players go H, H: hangar, back).
         screen = SCREEN_TITLE;
@@ -8807,15 +9102,15 @@ function runGame() {
       // the score, the rank and the near-miss line first. H (or the
       // HANGAR button) banks the run and goes to the hangar to spend —
       // the endless trap is closed from this screen.
-      const tap = input.takeTap();
+      const tap = input.takeTapCss();
       if (input.consume(ACTION_RESTART)) {
         startGame();
       } else if (input.consume('KeyH')) {
         enterHangar();
-      } else if (inRect(tap, PLAY_AGAIN_RECT)) {
+      } else if (inRect(tap, PLAY_AGAIN_RECT(menuW, menuH))) {
         input.clearPressed();
         startGame();
-      } else if (inRect(tap, OVER_HANGAR_RECT)) {
+      } else if (inRect(tap, OVER_HANGAR_RECT(menuW, menuH))) {
         input.clearPressed();
         enterHangar();
       }
@@ -8824,7 +9119,7 @@ function runGame() {
       // STAGES opens the select, HANGAR banks the coins and goes to
       // spend, E (or the green button) keeps the run going, endless —
       // only once endless is unlocked. Keys: N next, R replay, H hangar.
-      const tap = input.takeTap();
+      const tap = input.takeTapCss();
       const stage = lastSummary?.stage ?? world.state.stage ?? 1;
       if (input.consume('KeyN') && stage < 100) {
         startStage(stage + 1);
@@ -8834,19 +9129,19 @@ function runGame() {
         continueEndless();
       } else if (input.consume('KeyH')) {
         enterHangar();
-      } else if (inRect(tap, CLEAR_NEXT_RECT) && stage < 100) {
+      } else if (inRect(tap, CLEAR_NEXT_RECT(menuW, menuH)) && stage < 100) {
         input.clearPressed();
         startStage(stage + 1);
-      } else if (inRect(tap, CLEAR_REPLAY_RECT)) {
+      } else if (inRect(tap, CLEAR_REPLAY_RECT(menuW, menuH))) {
         input.clearPressed();
         startStage(stage);
-      } else if (inRect(tap, CLEAR_STAGES_RECT)) {
+      } else if (inRect(tap, CLEAR_STAGES_RECT(menuW, menuH))) {
         input.clearPressed();
         enterStages();
-      } else if (inRect(tap, CLEAR_HANGAR_RECT)) {
+      } else if (inRect(tap, CLEAR_HANGAR_RECT(menuW, menuH))) {
         input.clearPressed();
         enterHangar();
-      } else if (save.endlessUnlocked && inRect(tap, CLEAR_ENDLESS_RECT)) {
+      } else if (save.endlessUnlocked && inRect(tap, CLEAR_ENDLESS_RECT(menuW, menuH))) {
         input.clearPressed();
         continueEndless();
       }
